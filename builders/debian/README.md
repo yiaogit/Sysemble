@@ -1,7 +1,8 @@
-# Debian builder (P0-a + P0-b + P0-c1 + P0-d1)
+# Debian builder (P0-a + P0-b + P0-c1 + P0-d1 + P0-d2)
 
 `build.sh` reads the `plan.json` produced by `sysemble plan --json` and turns
-it into a bootable Debian disk image:
+it into bootable Debian disk images and/or a live ISO, selected by
+`plan.target.outputs`:
 
 - **P0-a**: plan validation, dry run, and rootfs bootstrap with
   [mmdebstrap](https://mmdebstrap.de/) (native or `debian:trixie` Docker).
@@ -28,10 +29,19 @@ it into a bootable Debian disk image:
   1024 MB, and no `desktop` object. The XFCE example
   (`examples/debian-xfce.yaml`) plans `xfce4` + `lightdm` and therefore boots
   graphically.
+- **P0-d2**: `target.outputs` containing `iso` builds a **UEFI El Torito live
+  ISO** (`live.iso`) with live-boot and `live-media-path=/live`. An ISO-only plan
+  (`["iso"]`, no `qcow2`/`raw`) skips the disk/partition/ESP/GRUB-disk pipeline
+  entirely; `["iso","qcow2"]` builds both. The ISO adds
+  `live-boot`/`live-boot-initramfs-tools` to `--include`, stages
+  `live/{vmlinuz,initrd.img,filesystem.squashfs}`, builds an 8 MiB FAT
+  `efi.img` with `grub-mkstandalone` + `mcopy`, and packs it with `xorriso`.
+  Its artifact uses `boot.mode="iso"`/`boot.iso="live.iso"`; an ISO-only
+  manifest omits `partitions`.
 
-The authoritative acceptance is the GitHub Actions `boot-smoke` job on
-`ubuntu-latest`. The development host is macOS arm64, where no real native
-build can run; see [Local checks](#local-checks).
+The authoritative acceptance is the GitHub Actions `boot-smoke` (disk) and
+`live-smoke` (ISO) jobs on `ubuntu-latest`. The development host is macOS
+arm64, where no real native build can run; see [Local checks](#local-checks).
 
 ## Interface
 
@@ -44,10 +54,10 @@ builders/debian/build.sh --plan <plan.json> --out <dir> \
 |---|---|
 | `--plan <path>` | Required. `plan.json` from `sysemble plan --json`. |
 | `--out <dir>` | Required. Output directory; created if missing. Must not be `/` or an existing file. |
-| `--dry-run` | Validate the plan, print the stages/packages/estimates, write only `<out>/plan.copy.json`, exit 0. Output is unchanged by P0-c. |
-| `--execute` | Explicit alias for the default build mode (no `--dry-run`): build rootfs + GPT/UEFI disk images + artifact. Mutually exclusive with `--dry-run`. |
+| `--dry-run` | Validate the plan, print the stages/packages/estimates, write only `<out>/plan.copy.json`, exit 0. Disk stage lines stay compatible; ISO plans show a live stage. |
+| `--execute` | Explicit alias for the default build mode (no `--dry-run`): build the rootfs plus the outputs requested by `target.outputs` (live ISO and/or GPT/UEFI disk images) and `artifact.json`. Mutually exclusive with `--dry-run`. |
 | `--engine native` | Default. Build on this Linux host (`uname -s` = Linux, euid 0, and the tools below in `PATH`). |
-| `--engine docker` | Bootstrap the rootfs inside `debian:trixie`; needs `docker` CLI and a reachable daemon. P0-c GPT/GRUB/UEFI assembly is **not** implemented for Docker, so `--execute` with `--engine docker` is rejected (exit 2). |
+| `--engine docker` | Bootstrap the rootfs inside `debian:trixie`; needs `docker` CLI and a reachable daemon. Disk/ISO assembly is **not** implemented for Docker, so `--execute` with `--engine docker` is rejected (exit 2). |
 | `-h`, `--help` | Print usage and exit 0. |
 
 `--opt value` and `--opt=value` are both accepted. Missing or unknown
@@ -57,26 +67,39 @@ arguments print usage and exit 2.
 
 ```
 <out>/
-  rootfs/                 # mmdebstrap rootfs
+  rootfs/                 # mmdebstrap rootfs (live-boot packages for ISO)
+  live.iso                # UEFI El Torito live ISO        (ISO plans)
+  iso/                    # ISO tree, kept for diagnosis  (ISO plans)
+    live/vmlinuz          # highest rootfs/boot/vmlinuz-*
+    live/initrd.img       # highest rootfs/boot/initrd.img-*
+    live/filesystem.squashfs
+    boot/grub/efi.img     # 8 MiB FAT with EFI/BOOT/BOOTX64.EFI
   disk.img                # raw GPT: p1 ESP (vfat32) + p2 root (ext4)
   disk.qcow2              # qemu-img convert -O qcow2 of disk.img
   esp/                    # ESP staging tree
     EFI/BOOT/BOOTX64.EFI  # grub-mkstandalone, config embedded
-    boot/grub/grub.cfg    # copy of the embedded config
-  grub.cfg                # the GRUB config (artifact boot.grub.config)
-  artifact.json           # sysemble/artifact/v1 manifest (boot.mode = uefi;
-                          #   desktop + graphical fields when a DM is planned)
+    boot/grub/grub.cfg    # copy of the embedded config (disk builds)
+  grub.cfg                # disk GRUB config, or the live ISO config in
+                          #   iso-only mode (artifact boot.grub.config / ISO cfg)
+  artifact.json           # sysemble/artifact/v1 manifest (boot.mode = iso or
+                          #   uefi; desktop + graphical fields when a DM is planned)
   build.log               # full build output (tee)
   plan.copy.json          # byte-identical copy of the input plan
 ```
 
-`<out>/esp.img` (the FAT32 image merged into `disk.img`) is a temporary
-intermediate and is removed after `dd` succeeds.
+ISO-only builds produce only `rootfs/`, `live.iso`, `iso/`, `artifact.json`,
+`build.log`, `plan.copy.json`, plus the `esp/`/`grub.cfg` staging files.
+`<out>/esp.img` (the FAT32 image merged into `disk.img`) and `<out>/efi.img`
+(the temporary 8 MiB live EFI image) are intermediates and are removed after
+their consumers succeed. For an iso+disk plan the live ISO uses a private
+`<out>/iso-staging/` tree so it cannot overwrite the disk `esp/` and
+`grub.cfg`.
 
-On failure, `rootfs/`, `disk.img`, `esp/`, `grub.cfg`, and `build.log` are kept
-for diagnosis; `esp.img`, a half-written `disk.qcow2`, and the artifact temp
-file are removed. `disk.img` is deliberately kept by P0-c: it may already hold a
-valid GPT/ext4 partition when a later GRUB/mcopy/dd/qemu-img step failed.
+On failure, `rootfs/`, `disk.img` (if built), the `iso/` tree, `esp/`,
+`grub.cfg`, and `build.log` are kept for diagnosis; `esp.img`, `efi.img`, a
+half-written `disk.qcow2` or `live.iso`, and the artifact temp file are removed.
+`disk.img` is deliberately kept by P0-c: it may already hold a valid GPT/ext4
+partition when a later GRUB/mcopy/dd/qemu-img step failed.
 
 ### Exit codes
 
@@ -85,7 +108,7 @@ valid GPT/ext4 partition when a later GRUB/mcopy/dd/qemu-img step failed.
 | 0 | Dry run succeeded, or a complete native image build finished. |
 | 1 | Invalid plan: malformed JSON, failed plan validation, or `plan.spec` missing for a real native build. |
 | 2 | Usage or I/O error, including an unsafe `--out`, `--dry-run` + `--execute`, or `--engine docker` + `--execute`. |
-| 3 | Native engine unavailable: not Linux, not root, or missing `mmdebstrap` / `mkfs.ext4` / `qemu-img` / `sgdisk` / `mkfs.vfat` / `mcopy` / `grub-mkstandalone` / `dd`. |
+| 3 | Native engine unavailable: not Linux, not root, or a tool required by the requested outputs is missing. ISO-only needs `mmdebstrap`, `mkfs.vfat`, `mcopy`, `grub-mkstandalone`, `mksquashfs`, and `xorriso`; disk builds add `mkfs.ext4`, `qemu-img`, `sgdisk`, and `dd`. |
 | 4 | Docker engine unavailable: no `docker` CLI, or `docker info` failed/timed out. |
 | 5 | No JSON parser: neither `jq` nor `python3` is available. |
 | 6 | A build step failed, `<out>/rootfs` (or an output image) already exists, an artifact input is missing, or the rootfs has no kernel/initrd. |
@@ -98,8 +121,10 @@ the script exits 3. It never calls `sudo`.
 ```console
 $ bash builders/debian/build.sh \
     --plan /tmp/min-plan.json --out /tmp/sysemble-dry --dry-run
-Sysemble Debian builder - dry run (P0-a)
+Sysemble Debian builder - dry run (P0-d2)
   ...
+  outputs:    qcow2
+  build mode: disk
 Stages (planned):
   [1/6] validate          plan structure is valid
   [2/6] fetch base        debian/trixie
@@ -111,11 +136,12 @@ Stages (planned):
 Dry run complete: no image was built.
 ```
 
-The dry-run text is intentionally unchanged from P0-a/P0-b (P0-c regression
-C1). The dry run **does not check the engine**, so it works on macOS/Windows
-hosts without Linux, root, mmdebstrap, the UEFI toolchain, or Docker. It
-validates the plan first and leaves nothing behind except
-`<out>/plan.copy.json`.
+The six-stage block is unchanged for disk plans (P0-a/P0-c regression); an
+ISO plan adds a `build mode: iso` line, lists the builder-added live packages,
+and describes the live ISO in stage 6. The dry run **does not check the
+engine**, so it works on macOS/Windows hosts without Linux, root, mmdebstrap,
+the UEFI/ISO toolchain, or Docker. It validates the plan first and leaves
+nothing behind except `<out>/plan.copy.json`.
 
 ## Plan input
 
@@ -155,27 +181,29 @@ for the same plan. If neither tool exists, the script exits 5 before creating
 
 ## Native engine (`--execute`)
 
-Preflight requires all of:
+Preflight requires `uname -s` = `Linux`, euid 0, and the tools needed by the
+requested outputs:
 
-1. `uname -s` is `Linux`;
-2. effective uid is 0;
-3. `mmdebstrap` (rootfs bootstrap);
-4. `mkfs.ext4` (e2fsprogs with `-d` and `-E offset=` support);
-5. `qemu-img` (qemu-utils);
-6. `sgdisk` (gdisk, GPT partition table);
-7. `mkfs.vfat` (dosfstools, FAT32 ESP);
-8. `mcopy` (mtools, ESP population);
-9. `grub-mkstandalone` (grub-efi-amd64-bin, BOOTX64.EFI);
-10. `dd` (coreutils, ESP merge).
+| Stage | Required tools |
+|---|---|
+| All builds | `mmdebstrap` (rootfs bootstrap) |
+| Shared boot image | `mkfs.vfat` (dosfstools), `mcopy` (mtools), `grub-mkstandalone` (grub-efi-amd64-bin) |
+| Disk only (or iso+disk) | `mkfs.ext4` (e2fsprogs with `-d` and `-E offset=`), `qemu-img`, `sgdisk` (gdisk), `dd` |
+| ISO only (or iso+disk) | `mksquashfs` (squashfs-tools), `xorriso` |
 
 On Debian/Ubuntu the package set is:
 
 ```
+# disk builds
 mmdebstrap e2fsprogs qemu-utils gdisk dosfstools mtools \
 grub-efi-amd64-bin grub-common
+# add for live ISO builds
+xorriso squashfs-tools
 ```
 
-The build then runs:
+ISO-only plans do not require `sgdisk`, `mkfs.ext4`, `qemu-img`, or `dd`; the
+preflight reports only the missing tools for the selected mode. The build then
+runs:
 
 ```bash
 DEBIAN_FRONTEND=noninteractive \
@@ -201,6 +229,33 @@ rm -f <out>/esp.img
 
 qemu-img convert -O qcow2 <out>/disk.img <out>/disk.qcow2
 ```
+
+An ISO plan additionally (and, when ISO-only, instead) runs:
+
+```bash
+# P0-d2 live ISO (UEFI El Torito)
+mksquashfs <out>/rootfs <out>/iso/live/filesystem.squashfs -comp zstd -noappend
+cp <out>/rootfs/boot/vmlinuz-<ver>      <out>/iso/live/vmlinuz
+cp <out>/rootfs/boot/initrd.img-<ver>   <out>/iso/live/initrd.img
+
+grub-mkstandalone -O x86_64-efi -o <out>/esp/EFI/BOOT/BOOTX64.EFI \
+  --modules="part_gpt part_msdos fat iso9660 normal linux search search_fs_file configfile serial terminal echo test" \
+  "boot/grub/grub.cfg=<out>/grub.cfg"
+mkfs.vfat -C -n EFI <out>/efi.img 8192
+mcopy -i <out>/efi.img -s <out>/esp/EFI ::/
+cp <out>/efi.img <out>/iso/boot/grub/efi.img
+xorriso -as mkisofs -R -J -joliet-long -V SYMBLE -o <out>/live.iso \
+  -eltorito-alt-boot -e boot/grub/efi.img -no-emul-boot \
+  -isohybrid-gpt-basdat <out>/iso
+rm -f <out>/efi.img
+```
+
+The ISO `--include` list additionally gains
+`,live-boot,live-boot-initramfs-tools` (deduplicated against the plan); the
+customize hook runs `update-initramfs -u -k all` in the chroot so the
+live-boot hook is definitely present in the initrd. For an iso+disk plan the
+GRUB config/ESP live under `<out>/iso-staging/`, so the disk `esp/` and
+`grub.cfg` remain the P0-c artifacts.
 
 For a graphical plan the `--include` list gains
 `,xserver-xorg,procps,accountsservice` and the customize hook also
@@ -285,6 +340,71 @@ found under `rootfs/boot` with `sort -V` (for example `6.12.3-amd64`). The same
 text is written to `<out>/grub.cfg`, staged at
 `<out>/esp/boot/grub/grub.cfg`, and embedded into `BOOTX64.EFI` by
 `grub-mkstandalone`; no external `/boot/grub` directory is needed at boot time.
+
+### Live ISO assembly (P0-d2)
+
+`plan.target.outputs` is interpreted by `plan_build_mode()`:
+
+| Outputs | Mode | What runs |
+|---|---|---|
+| contains `iso`, no `qcow2`/`raw` | `iso` | only the live ISO stage; no disk/partition/ESP/GRUB-disk work |
+| contains `iso` and `qcow2`/`raw` | `iso-disk` | the P0-c/d1 disk stage and the live ISO stage |
+| no `iso` | `disk` | frozen P0-c/d1 disk stage (also the default when no plan outputs are loaded) |
+
+The ISO tree is:
+
+```
+<out>/iso/
+  live/vmlinuz                 # composed from rootfs/boot/vmlinuz-<ver>
+  live/initrd.img              # composed from rootfs/boot/initrd.img-<ver>
+  live/filesystem.squashfs     # mksquashfs <out>/rootfs ... -comp zstd -noappend
+  boot/grub/efi.img            # 8 MiB FAT: EFI/BOOT/BOOTX64.EFI
+```
+
+The live GRUB config (`iso_grub_cfg_text()`) is frozen as:
+
+```grub
+# P0-d2 live ISO: source kernel=vmlinuz-<ver> initrd=initrd.img-<ver>
+set timeout=3
+serial --unit=0 --speed=115200
+terminal_input serial
+terminal_output serial
+menuentry "Sysemble Live" {
+  search --no-floppy --file --set=root /live/vmlinuz
+  linux /live/vmlinuz boot=live live-media-path=/live console=ttyS0 systemd.unit=multi-user.target systemd.journald.forward_to_console=1
+  initrd /live/initrd.img
+}
+```
+
+The comment records the actual rootfs kernel/initrd versions; the boot lines
+use the stable live paths. A desktop plan switches the cmdline to
+`graphical.target` (same journald forwarding) and adds `desktop` +
+`boot.graphical=true`/`memory_mb=2048` to the artifact.
+
+The EFI image is built with `grub-mkstandalone -O x86_64-efi` using the frozen
+ISO module list (`part_gpt part_msdos fat iso9660 normal linux search
+search_fs_file configfile serial terminal echo test`) and the embedded
+`boot/grub/grub.cfg=<cfg>` argument, then formatted with
+`mkfs.vfat -C -n EFI <out>/efi.img 8192`, populated with
+`mcopy -i <out>/efi.img -s <out>/esp/EFI ::/`, and copied to
+`iso/boot/grub/efi.img`. `xorriso -as mkisofs` then writes the UEFI El Torito
+ISO:
+
+```bash
+xorriso -as mkisofs -R -J -joliet-long -V SYMBLE -o <out>/live.iso \
+  -eltorito-alt-boot -e boot/grub/efi.img -no-emul-boot \
+  -isohybrid-gpt-basdat <out>/iso
+```
+
+The ISO adds `live-boot`/`live-boot-initramfs-tools` to `--include`
+(deduplicated against plan packages; `artifact.packages` stays the plan list)
+and the customize hook runs `update-initramfs -u -k all` so the live-boot hook
+is present in `initrd.img`. For an iso+disk plan the live GRUB config and ESP
+live under `<out>/iso-staging/` to keep the disk `grub.cfg`/`esp/` intact.
+
+`tools/boot-check.sh` reads `boot.mode="iso"`, attaches `boot.iso` with
+`-cdrom` (no disk), and asserts firmware, GRUB, kernel, systemd, login, and the
+live markers (`live-boot`/`live-media`/`squashfs`).
 
 ### Desktop inference (P0-d1)
 
@@ -375,6 +495,22 @@ root=/dev/vda2 rw console=ttyS0 rootfstype=ext4 systemd.unit=graphical.target sy
 The frozen partition layout means the root filesystem is always GPT partition 2
 of the virtio disk (`/dev/vda2`).
 
+A live ISO uses a different boot chain (OVMF -> El Torito efi.img -> GRUB ->
+`/live/vmlinuz`); its cmdline is:
+
+```
+boot=live live-media-path=/live console=ttyS0 systemd.unit=multi-user.target systemd.journald.forward_to_console=1
+```
+
+and for a desktop plan:
+
+```
+boot=live live-media-path=/live console=ttyS0 systemd.unit=graphical.target systemd.journald.forward_to_console=1
+```
+
+`live.iso` carries its own kernel, initrd, GRUB config, and squashfs, so
+`boot.kernel`/`boot.initrd` are not part of the ISO manifest.
+
 ### `artifact.json`
 
 `artifact.json` is `sysemble/artifact/v1`, written atomically (temp file +
@@ -412,7 +548,31 @@ rename) only after every image and GRUB output exists. A P0-c build emits:
 }
 ```
 
-- `boot.mode` is `"uefi"`. P0-b artifacts (and any artifact without
+An ISO-only build emits the P0-d2 shape instead (no `partitions`):
+
+```json
+{
+  "apiVersion": "sysemble/artifact/v1",
+  "createdAt": "2026-11-23T12:51:57Z",
+  "spec": "minimal-debian-live",
+  "base": {"kind": "debian", "release": "trixie", "pin": "2026-11-01"},
+  "arch": "x86_64",
+  "packages": ["apt", "ca-certificates", "..."],
+  "rootfs": {"path": "rootfs", "size_mb": 420},
+  "images": [
+    {"path": "live.iso", "format": "iso", "size_mb": 780, "sha256": "..."}
+  ],
+  "boot": {
+    "mode": "iso",
+    "iso": "live.iso",
+    "cmdline": "boot=live live-media-path=/live console=ttyS0 systemd.unit=multi-user.target systemd.journald.forward_to_console=1",
+    "memory_mb": 1024
+  },
+  "builder": {"name": "build.sh", "version": "0.1.0"}
+}
+```
+
+- `boot.mode` is `"iso"` or `"uefi"`. P0-b artifacts (and any artifact without
   `boot.mode`) default to `"kernel"`.
 - `desktop` is present only for a UEFI build whose package list contains a
   display manager. It has exactly two fields: `session` (`plasma`/`gnome`/
@@ -431,9 +591,15 @@ rename) only after every image and GRUB output exists. A P0-c build emits:
   partition role. The filesystem created inside p2 is 1 MiB smaller
   (3582 MiB on the 4096 MB floor) so it stays clear of the backup GPT; the
   partition itself still spans the rest of the disk.
-- `images` still contains exactly the raw and qcow2 images with actual file
-  sizes rounded up to MiB and SHA-256 digests (`sha256sum`, `shasum -a 256`, or
-  `openssl dgst -sha256`).
+- An ISO artifact lists `live.iso` with `"format": "iso"`; ISO-only builds
+  have exactly that one image and omit `partitions`. An iso+disk artifact keeps
+  `boot.mode="iso"` (the ISO is the primary boot path) and adds the raw/qcow2
+  images plus the P0-c `partitions` array.
+- A desktop ISO plan keeps the P0-d1 `desktop` object and
+  `boot.graphical=true`/`memory_mb=2048`; no-DM ISO artifacts omit both
+  `desktop` and `boot.graphical`.
+- `images` still contains actual file sizes rounded up to MiB and SHA-256
+  digests (`sha256sum`, `shasum -a 256`, or `openssl dgst -sha256`).
 - The artifact helper falls back to the historical P0-b direct-kernel shape (no
   `boot.mode`, no `disk`, no `grub`, no `partitions`, no `desktop`, no
   `graphical`/`memory_mb`, `/dev/vda` cmdline) when neither GRUB output exists,
@@ -443,15 +609,22 @@ rename) only after every image and GRUB output exists. A P0-c build emits:
 
 - `mmdebstrap` failure: the partial `rootfs/` (if any) and `build.log` are
   kept; no disk images are created.
-- Any later failure (missing kernel/initrd, `truncate`, `sgdisk`,
+- Any later disk failure (missing kernel/initrd, `truncate`, `sgdisk`,
   `mkfs.ext4`, `mkfs.vfat`, GRUB config rendering, `grub-mkstandalone`,
   `mcopy`, `dd`, `qemu-img`, hashing, manifest write): `rootfs/`, `disk.img`,
   `esp/`, `grub.cfg`, and `build.log` are kept; `esp.img`, a half-written
   `disk.qcow2`, and `.artifact.json.tmp` are removed by the EXIT trap.
-- `<out>/rootfs`, `<out>/disk.img`, or `<out>/disk.qcow2` already existing:
-  refuse to overwrite and exit 6. Stale `esp/`, `esp.img`, or `grub.cfg` left
-  by an interrupted attempt are removed before the retry (they can only be
-  derived intermediates once the rootfs and disk images are absent). Because
+- Any ISO failure (`mksquashfs`, kernel/initrd copy, ISO GRUB rendering,
+  `grub-mkstandalone`, `mkfs.vfat`, `mcopy`, `xorriso`, hashing, manifest
+  write): `rootfs/`, the whole `iso/` tree, `esp/`, `grub.cfg`, and
+  `build.log` are kept; a half-written `live.iso`, the temporary `efi.img`,
+  and `.artifact.json.tmp` are removed. The squashfs is kept so a failed
+  xorriso invocation can be diagnosed without re-bootstrapping.
+- `<out>/rootfs`, `<out>/live.iso`, or (for disk outputs) `<out>/disk.img` /
+  `<out>/disk.qcow2` already existing: refuse to overwrite and exit 6. Stale
+  `esp/`, `esp.img`, `grub.cfg`, `iso/`, `iso-staging/`, or `efi.img` left by
+  an interrupted attempt are removed before the retry (they can only be
+  derived intermediates once the rootfs and final images are absent). Because
   `disk.img` is intentionally kept after a failure, retrying into the same
   `<out>` requires removing it (and `rootfs/`, if present) manually first.
 - Interrupts (`HUP`/`INT`/`TERM`) run the same EXIT cleanup.
@@ -464,8 +637,9 @@ unreachable daemon prints a diagnostic and exits 4.
 
 Docker mode is still **P0-a scope**: it installs mmdebstrap in a
 `debian:trixie` container and bootstraps `/out/rootfs`, then stops with a
-warning. It does **not** produce `disk.img`, `disk.qcow2`, `esp/`, or
-`artifact.json`; that assembly path is native-only and **P0-c unverified**.
+warning. It does **not** produce `disk.img`, `disk.qcow2`, `esp/`, `live.iso`,
+or `artifact.json`; that assembly path is native-only and **P0-c/P0-d2
+unverified**.
 Passing `--execute` with `--engine docker` is rejected with exit 2 instead of
 returning a rootfs-only "success". Do not use Docker mode for the boot-smoke
 acceptance.
@@ -489,7 +663,7 @@ acceptance.
 - `plan.copy.json`, `grub.cfg`, and `artifact.json` are written with a temporary
   file plus rename, so pre-existing symlinks/hardlinks cannot redirect writes
   outside `<out>`.
-- The rootfs target and existing disk images are never deleted or overwritten.
+- The rootfs target and existing disk/ISO images are never deleted or overwritten.
 - Temporary files live in `$TMPDIR` (or `/tmp`) under `sysemble-build.*` and are
   removed by an EXIT trap. The trap only deletes paths matching that prefix.
 - On failure, cleanup only deletes derived intermediates created by this build;
@@ -497,12 +671,13 @@ acceptance.
 - No loop devices, mounts, or host block devices are used.
 - Docker mode bind-mounts only `<out>`; no Docker socket or host directories.
 
-## Not implemented in P0-d1
+## Not implemented through P0-d2
 
-- Calamares or any installer flow; desktop *configuration* (theme, apps,
-  users, autologin) beyond installing the session packages and letting the
-  display manager start; first boot after installation (P0-d2/P0-d3).
-- ISO/squashfs/PXE assembly, persistence, secure boot signing, dm-verity.
+- Calamares or any installer flow (P0-d3); desktop *configuration* (theme,
+  apps, users, autologin) beyond installing the session packages and letting
+  the display manager start; first boot after installation.
+- BIOS boot, persistence, secure boot signing, dm-verity, and PXE assembly.
+  (P0-d2 implements UEFI live ISO assembly but not installation to disk.)
 - Cross-architecture UEFI: `grub-mkstandalone -O x86_64-efi` is x86_64 only;
   `target.arch` is validated but the native build uses the host toolchain.
 - System configuration beyond `/etc/hostname` and the serial getty enable:
@@ -518,7 +693,7 @@ acceptance.
   path is covered by offline tests with a fake toolchain; the real path is only
   exercised by CI.
 
-## Known risks (tracked by P0-c/P0-d1)
+## Known risks (tracked by P0-c/P0-d1/P0-d2)
 
 1. `grub-mkstandalone`'s module set or embedded-config argument may need
    adjustment on the CI runner; the build.log from the first CI run is the
@@ -539,7 +714,25 @@ acceptance.
    `display-manager.service` symlink during `mmdebstrap` (lightdm/sddm/gdm3 do
    this in their postinst). If the CI boot log reaches multi-user without a DM,
    the customize hook must enable it explicitly.
-8. QEMU runs with TCG on GitHub-hosted runners; Xorg on `-vga virtio` may be
+8. P0-d2 `live-boot` + `live-media-path=/live` behavior on Debian trixie must
+   be verified by the `live-smoke` job. `live-boot` +
+   `live-boot-initramfs-tools` are installed explicitly and the customize hook
+   regenerates the initramfs with `update-initramfs -u -k all`; if the CI log
+   still shows the initramfs emergency shell, inspect the initrd contents and
+   the live-boot hook.
+9. The corrected cmdline (P0-d2 workplan §9) uses `live-media-path=/live`:
+   live-boot discovers `/live/filesystem.squashfs` on the boot medium itself.
+   The CI boot log is the authority; on failure inspect whether live-boot
+   detected the CD-ROM and the `/live` directory.
+10. OVMF booting the El Torito EFI image is sensitive to the `efi.img` layout
+    and the `-e boot/grub/efi.img`/`-isohybrid-gpt-basdat` options. The ISO
+    tree and `build.log` are kept on failure; verify the FAT image contains
+    `EFI/BOOT/BOOTX64.EFI` and that xorriso reports the EFI boot entry.
+11. The ISO is 8 MiB FAT and UEFI-only: no BIOS El Torito entry, no Secure
+    Boot signing, no persistence partition. Squashfs zstd needs the Debian
+    kernel's zstd support (it has it); TCG live boot can be slower than disk,
+    hence the 600 s boot-check timeout.
+12. QEMU runs with TCG on GitHub-hosted runners; Xorg on `-vga virtio` may be
    slow or fail to start. `systemd.journald.forward_to_console=1` is what makes
    the LightDM/Xorg failure (or success) visible in `boot.log`; the P0-d1
    workplan allows falling back to `-vga std` or `nomodeset` if needed.
@@ -557,25 +750,39 @@ bash -n builders/debian/lib.sh
 bash -n builders/debian/tests/artifact_test.sh
 bash -n builders/debian/tests/build_exec_test.sh
 
-# Plan fixture / dry-run regression (output unchanged from P0-b)
+# Plan fixture / dry-run regression
 bash builders/debian/build.sh \
   --plan builders/debian/testdata/plan.example.json \
   --out /tmp/sysemble-dry --dry-run
 
-# Offline artifact manifest tests (fixture rootfs + real sha256)
-bash builders/debian/tests/artifact_test.sh        # 74 checks
+# Live ISO plan (the P0-d2 example) dry run
+cargo run -q -p sysemble-cli -- plan examples/minimal-debian-live.yaml > /tmp/live-plan.json
+bash builders/debian/build.sh --plan /tmp/live-plan.json --out /tmp/p0d2-dry --dry-run
 
-# Offline native --execute command-sequence test (fake UEFI toolchain)
-bash builders/debian/tests/build_exec_test.sh      # 116 checks
+# Offline artifact manifest tests (fixture rootfs + real sha256)
+bash builders/debian/tests/artifact_test.sh        # 107 checks
+
+# Offline native --execute command-sequence tests (fake disk + ISO toolchain)
+bash builders/debian/tests/build_exec_test.sh      # 212 checks
 
 # On macOS, without --dry-run, the native preflight is expected to exit 3
 bash builders/debian/build.sh \
-  --plan builders/debian/testdata/plan.example.json \
-  --out /tmp/sysemble-native
+  --plan builders/debian/testdata/plan.iso.json \
+  --out /tmp/sysemble-native-iso
 ```
 
-`builders/debian/testdata/plan.example.json` is a self-contained fixture used
-by these checks. The real-plan dry-run uses the CLI:
+`builders/debian/testdata/` contains the contract-shaped fixtures:
+
+| Fixture | Outputs | Use |
+|---|---|---|
+| `plan.example.json` | `["qcow2","iso"]` | CLI/fixture dry-run checks |
+| `plan.disk.json` | `["qcow2"]` | P0-c/P0-d1 disk regression |
+| `plan.no-desktop.json` | `["qcow2"]` | P0-d1 no-DM regression |
+| `plan.iso.json` | `["iso"]` | P0-d2 iso-only build tests |
+| `plan.iso-disk.json` | `["qcow2","iso"]` | P0-d2 iso+disk build tests |
+| `plan.iso-desktop.json` | `["iso"]` | P0-d2 desktop ISO (sddm/plasma) tests |
+
+The real-plan dry run uses the CLI:
 
 ```bash
 cargo run -q -p sysemble-cli -- plan examples/minimal-debian.yaml > /tmp/min-plan.json
@@ -584,18 +791,20 @@ bash builders/debian/build.sh --plan /tmp/min-plan.json --out /tmp/sysemble-dry 
 
 The tests do **not** prove that the real commands work: they prove command
 assembly, argument order/content, GRUB config text, hook text, artifact shape,
-log tee, and failure cleanup. The authoritative real build is the CI
-`boot-smoke` job.
+log tee, mode-aware preflight, and failure cleanup. The authoritative real
+builds are the CI `boot-smoke` (disk) and `live-smoke` (ISO) jobs.
 
-On a macOS host without the UEFI toolchain, `build.sh --execute` exits 3 and
-reports every missing item, including `sgdisk`, `mkfs.vfat`, `mcopy`,
-`grub-mkstandalone`, and `dd`.
+On a macOS host without the UEFI/ISO toolchain, `build.sh --execute` exits 3
+and reports every missing item for the requested mode. For an ISO-only plan
+that is `mksquashfs` and `xorriso` plus the shared `mkfs.vfat`, `mcopy`, and
+`grub-mkstandalone`; `sgdisk`, `mkfs.ext4`, `qemu-img`, and `dd` are not
+required.
 
 ## CI contract
 
-The P0-c CI job installs `mmdebstrap qemu-system-x86 qemu-utils e2fsprogs gdisk
+The disk jobs install `mmdebstrap qemu-system-x86 qemu-utils e2fsprogs gdisk
 dosfstools mtools grub-efi-amd64-bin grub-common ovmf` on `ubuntu-latest`, then
-runs:
+run:
 
 ```bash
 cargo run -p sysemble-cli -- plan examples/minimal-debian.yaml > plan.json
@@ -608,13 +817,30 @@ Expected evidence on success: `rootfs/`, `disk.img` (GPT + ESP + GRUB EFI),
 `boot.log` containing the firmware banner, `GRUB`, `Linux version`,
 `systemd[1]`/`Reached target`, and `login:`.
 
+The P0-d2 `live-smoke` job adds `xorriso squashfs-tools`, plans
+`examples/minimal-debian-live.yaml`, and runs the same build/boot-check pair:
+
+```bash
+cargo run -p sysemble-cli -- plan examples/minimal-debian-live.yaml > plan.json
+sudo -E bash builders/debian/build.sh --plan plan.json --out /tmp/out --execute
+bash tools/boot-check.sh --artifact /tmp/out/artifact.json --timeout 600
+```
+
+Expected evidence: only `live.iso` (plus `rootfs/`, `iso/`, `esp/`,
+`grub.cfg`, `artifact.json`, `build.log`); boot-check attaches the ISO with
+`-cdrom` and asserts firmware, GRUB, kernel, systemd, login, and `live-boot`/
+`live-media`/`squashfs` (any of the live markers).
+
 ## Files
 
 | File | Role |
 |---|---|
-| `build.sh` | CLI, output directory handling, dry run, native GPT/ESP/GRUB/UEFI pipeline, docker rootfs bootstrap. |
-| `lib.sh` | JSON backends, record parsing, plan validation, preflight, disk sizing, GRUB rendering, P0-d1 desktop inference/runtime packages/boot evidence unit, artifact helpers, usage text. |
-| `tests/artifact_test.sh` | Offline fixture tests for `artifact_json` (UEFI no-DM + graphical desktop + P0-b fallback), desktop inference, boot evidence unit text, kernel/initrd selection, hashing, and disk sizing. |
-| `tests/build_exec_test.sh` | Offline fake-toolchain end-to-end test of the native `--execute` P0-c/P0-d1 command sequence, arguments, GRUB config, desktop/no-desktop cmdlines, boot evidence unit installation, and failure cleanup. |
-| `testdata/plan.example.json` | Contract-shaped fixture used by the checks above (KDE plan, has a DM). |
+| `build.sh` | CLI, output directory handling, dry run, mode-aware native GPT/ESP/GRUB/UEFI and live ISO pipelines, docker rootfs bootstrap. |
+| `lib.sh` | JSON backends, record parsing, plan validation, mode-aware preflight, disk sizing, disk/ISO GRUB rendering, P0-d1 desktop inference/runtime packages/boot evidence unit, P0-d2 ISO artifact helpers, usage text. |
+| `tests/artifact_test.sh` | Offline fixture tests for `artifact_json` (UEFI no-DM + graphical + P0-b fallback), `artifact_iso_json` (iso-only, graphical, iso+disk), ISO GRUB text, plan output mode selection, desktop inference, boot evidence unit, kernel/initrd selection, hashing, and disk sizing. |
+| `tests/build_exec_test.sh` | Offline fake-toolchain end-to-end tests of the native `--execute` disk and ISO command sequences, arguments, GRUB configs, include lists, mode-aware preflight, artifacts, and failure cleanup. |
+| `testdata/plan.example.json` | Contract-shaped KDE plan with a display manager (`["qcow2","iso"]`). |
+| `testdata/plan.disk.json` | Same KDE plan with `["qcow2"]` for the P0-c/P0-d1 disk regression. |
 | `testdata/plan.no-desktop.json` | Minimal fixture without a display manager for the P0-d1 no-DM regression. |
+| `testdata/plan.iso.json` | Minimal 14-package live plan with `["iso"]`. |
+| `testdata/plan.iso-disk.json` | Minimal 14-package plan with `["qcow2","iso"]`. |

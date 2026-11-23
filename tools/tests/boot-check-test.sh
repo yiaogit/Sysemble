@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# Sysemble boot-check tests (P0-b kernel mode + P0-c UEFI mode + P0-d1 desktop).
+# Sysemble boot-check tests (P0-b kernel mode + P0-c UEFI mode + P0-d1 desktop
+# + P0-d2 live ISO).
 #
 # Exercises tools/boot-check.sh without QEMU:
 #   - offline assertion mode (--log-from) on canned good/bad/empty logs
 #   - kernel mode: 3 assertions, -kernel/-initrd argv (P0-b regression)
 #   - UEFI mode: 5 assertions, OVMF pflash argv, VARS copy/cleanup, exit 3
 #   - graphical mode: 8 assertions, -vga virtio, boot.memory_mb, desktop fields
+#   - ISO mode: 6 assertions, -cdrom argv with no disk, live-medium marker,
+#     iso graphical mode: 9 assertions
 #   - artifact validation and usage errors
 #   - QEMU availability, fake-QEMU success, fake-QEMU timeout
 #
@@ -495,6 +498,214 @@ LOG
 SCRIPT
   if [ "$mode" = "hang" ]; then
     # A real booted VM never exits; boot-check must stop it after 8 matches.
+    printf 'exec sleep 30\n' >>"$path"
+  else
+    printf 'exit 0\n' >>"$path"
+  fi
+  chmod +x "$path"
+}
+
+# ---------------------------------------------------------------------------
+# ISO fixtures (P0-d2)
+# ---------------------------------------------------------------------------
+
+# Live ISO artifact from docs/plan/P0-d2-workplan.md section 2: an iso-only
+# output list, boot.mode=iso, boot.iso, and no raw disk. The ISO is attached
+# read-only with -cdrom, so only the artifact directory must be writable.
+make_iso_fixture() {
+  local dir=$1
+
+  mkdir -p "$dir/fw"
+  : >"$dir/live.iso"
+  printf 'OVMF-CODE-FIXTURE\n' >"$dir/fw/OVMF_CODE_4M.fd"
+  printf 'OVMF-VARS-FIXTURE\n' >"$dir/fw/OVMF_VARS_4M.fd"
+
+  cat >"$dir/artifact.json" <<'EOF'
+{
+  "apiVersion": "sysemble/artifact/v1",
+  "createdAt": "2026-11-23T12:00:00Z",
+  "spec": "minimal-debian-live",
+  "base": {"kind": "debian", "release": "trixie", "pin": "2026-11-01"},
+  "arch": "x86_64",
+  "packages": ["linux-image-amd64", "live-boot", "live-boot-initramfs-tools"],
+  "rootfs": {"path": "rootfs", "size_mb": 1},
+  "images": [
+    {"path": "live.iso", "format": "iso", "size_mb": 780, "sha256": "00"}
+  ],
+  "boot": {
+    "mode": "iso",
+    "iso": "live.iso",
+    "memory_mb": 1024,
+    "cmdline": "boot=live live-media-path=/live console=ttyS0 systemd.unit=multi-user.target systemd.journald.forward_to_console=1",
+    "grub": {"efi": "iso/boot/grub/efi.img", "config": "iso/boot/grub/grub.cfg"}
+  },
+  "builder": {"name": "build.sh", "version": "0.1.0"}
+}
+EOF
+}
+
+# Desktop live ISO (future P0-d3 shape): same ISO plus boot.graphical=true,
+# 2 GB, and the desktop fields.
+make_iso_graphical_fixture() {
+  local dir=$1
+
+  make_iso_fixture "$dir"
+
+  cat >"$dir/artifact.json" <<'EOF'
+{
+  "apiVersion": "sysemble/artifact/v1",
+  "createdAt": "2026-11-23T12:00:00Z",
+  "spec": "minimal-debian-live",
+  "base": {"kind": "debian", "release": "trixie", "pin": "2026-11-01"},
+  "arch": "x86_64",
+  "packages": ["linux-image-amd64", "live-boot", "live-boot-initramfs-tools", "lightdm", "xfce4"],
+  "rootfs": {"path": "rootfs", "size_mb": 1},
+  "images": [
+    {"path": "live.iso", "format": "iso", "size_mb": 780, "sha256": "00"}
+  ],
+  "desktop": {"session": "xfce", "display_manager": "lightdm"},
+  "boot": {
+    "mode": "iso",
+    "graphical": true,
+    "iso": "live.iso",
+    "memory_mb": 2048,
+    "cmdline": "boot=live live-media-path=/live console=ttyS0 systemd.unit=graphical.target systemd.journald.forward_to_console=1",
+    "grub": {"efi": "iso/boot/grub/efi.img", "config": "iso/boot/grub/grub.cfg"}
+  },
+  "builder": {"name": "build.sh", "version": "0.1.0"}
+}
+EOF
+}
+
+# Healthy live boot: firmware + GRUB + kernel + squashfs + live-media-path
+# + systemd + login. The live markers are `squashfs` and `live-media`, so the
+# evidence detail lists both.
+write_iso_good_log() {
+  cat >"$1" <<'EOF'
+[    0.000000] efi: EFI v2.70 by EDK II
+GRUB loading..
+Booting `Sysemble Live'
+[    0.000000] Linux version 6.12.0-amd64 (debian-kernel@lists.debian.org)
+[    0.200000] SQUASHFS: version 4.0 (2009/01/31) Phillip Lougher
+[    0.300000] Kernel command line: boot=live live-media-path=/live console=ttyS0 systemd.unit=multi-user.target
+[    0.123456] systemd[1]: Detected virtualization qemu.
+[    1.234567] systemd[1]: Reached target Local Filesystem.
+[    2.345678] Debian GNU/Linux 13 sysemble ttyS0
+sysemble login:
+EOF
+}
+
+# Same boot but the live medium was never recognised: firmware, GRUB, kernel,
+# systemd, and login all pass, so only boot.live may fail.
+write_iso_no_live_log() {
+  cat >"$1" <<'EOF'
+[    0.000000] efi: EFI v2.70 by EDK II
+GRUB loading..
+Booting `Sysemble Live'
+[    0.000000] Linux version 6.12.0-amd64 (debian-kernel@lists.debian.org)
+[    0.123456] systemd[1]: Detected virtualization qemu.
+[    1.234567] systemd[1]: Reached target Local Filesystem.
+[    2.345678] Debian GNU/Linux 13 sysemble ttyS0
+sysemble login:
+EOF
+}
+
+# Desktop live boot: all six live assertions plus LightDM, Xorg, and the
+# graphical target (9 in total). Its live markers are `live-boot` and `overlay`
+# (a second marker set, distinct from the plain log's live-media + squashfs).
+write_iso_graphical_good_log() {
+  cat >"$1" <<'EOF'
+[    0.000000] efi: EFI v2.70 by EDK II
+GRUB loading..
+Booting `Sysemble Live'
+[    0.000000] Linux version 6.12.0-amd64 (debian-kernel@lists.debian.org)
+[    0.200000] live-boot: mounting /dev/sr0 on /run/live/medium
+[    0.300000] overlay: upperdir=/run/live/overlay/upper, workdir=/run/live/overlay/work
+[    0.123456] systemd[1]: Detected virtualization qemu.
+[    1.234567] systemd[1]: Reached target Local Filesystem.
+[    2.000000] systemd[1]: Starting LightDM Display Manager...
+[    2.100000] X.Org X Server 21.1.7
+[    2.200000] systemd[1]: Reached target Graphical Interface.
+[    2.345678] Debian GNU/Linux 13 sysemble ttyS0
+sysemble login:
+EOF
+}
+
+# Fake ISO qemu: records argv, copies the writable pflash VARS file aside, and
+# emits the six-assertion live log. 'hang' keeps running so the test proves the
+# early-stop monitor waits for boot.live as well.
+write_fake_qemu_iso() {
+  local path=$1
+  local mode=${2:-exit}
+
+  cat >"$path" <<'SCRIPT'
+#!/bin/sh
+printf '%s\n' "$@" >"$FAKE_QEMU_ARGS"
+for arg in "$@"; do
+  case "$arg" in
+    if=pflash*readonly=on*) ;;
+    if=pflash*file=*)
+      cp "${arg##*file=}" "$FAKE_QEMU_VARS_COPY" 2>/dev/null || exit 9
+      ;;
+  esac
+done
+cat <<'LOG'
+[    0.000000] efi: EFI v2.70 by EDK II
+GRUB loading..
+Booting `Sysemble Live'
+[    0.000000] Linux version 6.12.0-amd64 (debian-kernel@lists.debian.org)
+[    0.200000] SQUASHFS: version 4.0 (2009/01/31) Phillip Lougher
+[    0.300000] Kernel command line: boot=live live-media-path=/live console=ttyS0 systemd.unit=multi-user.target
+[    0.123456] systemd[1]: Detected virtualization qemu.
+[    1.234567] systemd[1]: Reached target Local Filesystem.
+[    2.345678] Debian GNU/Linux 13 sysemble ttyS0
+sysemble login:
+LOG
+SCRIPT
+  if [ "$mode" = "hang" ]; then
+    # A real booted VM never exits; boot-check must stop it after 6 matches.
+    printf 'exec sleep 30\n' >>"$path"
+  else
+    printf 'exit 0\n' >>"$path"
+  fi
+  chmod +x "$path"
+}
+
+# Fake desktop ISO qemu: same argv/VARS bookkeeping, nine-assertion log, and a
+# 'hang' mode that proves the monitor requires the desktop triple as well.
+write_fake_qemu_iso_graphical() {
+  local path=$1
+  local mode=${2:-exit}
+
+  cat >"$path" <<'SCRIPT'
+#!/bin/sh
+printf '%s\n' "$@" >"$FAKE_QEMU_ARGS"
+for arg in "$@"; do
+  case "$arg" in
+    if=pflash*readonly=on*) ;;
+    if=pflash*file=*)
+      cp "${arg##*file=}" "$FAKE_QEMU_VARS_COPY" 2>/dev/null || exit 9
+      ;;
+  esac
+done
+cat <<'LOG'
+[    0.000000] efi: EFI v2.70 by EDK II
+GRUB loading..
+Booting `Sysemble Live'
+[    0.000000] Linux version 6.12.0-amd64 (debian-kernel@lists.debian.org)
+[    0.200000] live-boot: mounting /dev/sr0 on /run/live/medium
+[    0.300000] overlay: upperdir=/run/live/overlay/upper, workdir=/run/live/overlay/work
+[    0.123456] systemd[1]: Detected virtualization qemu.
+[    1.234567] systemd[1]: Reached target Local Filesystem.
+[    2.000000] systemd[1]: Starting LightDM Display Manager...
+[    2.100000] X.Org X Server 21.1.7
+[    2.200000] systemd[1]: Reached target Graphical Interface.
+[    2.345678] Debian GNU/Linux 13 sysemble ttyS0
+sysemble login:
+LOG
+SCRIPT
+  if [ "$mode" = "hang" ]; then
+    # A real booted VM never exits; boot-check must stop it after 9 matches.
     printf 'exec sleep 30\n' >>"$path"
   else
     printf 'exit 0\n' >>"$path"
@@ -1303,7 +1514,7 @@ test_unknown_boot_mode() {
 
   check_eq "exit code" 2 "$RC"
   check_empty "stdout" "$(cat "$OUT_FILE")"
-  check_contains "diagnostic" "must be 'kernel' or 'uefi'" "$(cat "$ERR_FILE")"
+  check_contains "diagnostic" "must be 'kernel', 'uefi', or 'iso'" "$(cat "$ERR_FILE")"
   check_no_file "no evidence" "$CASE_DIR/boot-evidence.json"
   end_case
 }
@@ -1664,6 +1875,265 @@ test_desktop_field_validation() {
   end_case
 }
 
+# ---------------------------------------------------------------------------
+# ISO mode (P0-d2)
+# ---------------------------------------------------------------------------
+
+test_iso_good_log_offline() {
+  local evidence=""
+  local stderr_text=""
+  local hash=""
+  local ids=""
+
+  begin_case "ISO canned good log -> exit 0, six passes"
+  make_iso_fixture "$CASE_DIR"
+  evidence="$CASE_DIR/boot-evidence.json"
+  write_iso_good_log "$CASE_DIR/good-iso.log"
+  ids="boot.firmware,boot.grub,boot.kernel,boot.systemd,boot.login,boot.live"
+
+  invoke_boot_check "$BASH_BIN" "$BOOT_CHECK" \
+    --artifact "$CASE_DIR/artifact.json" \
+    --log-from "$CASE_DIR/good-iso.log" --json
+
+  check_eq "exit code" 0 "$RC"
+  check_file "evidence file" "$evidence"
+  check_no_file "boot.log absent in offline mode" "$CASE_DIR/boot.log"
+  check_eq "stdout is valid JSON" 1 "$(json_valid "$OUT_FILE" && echo 1 || echo 0)"
+  check_eq "evidence API version" "sysemble/boot-evidence/v1" "$(json_query "$evidence" apiVersion)"
+  check_eq "result" "pass" "$(json_query "$evidence" result)"
+  check_eq "assertion count" 6 "$(json_query "$evidence" assertion_count)"
+  check_eq "assertion ids and order" "$ids" "$(json_query "$evidence" assertion_ids)"
+  check_eq "boot.firmware" "pass" "$(json_query "$evidence" assertion_result boot.firmware)"
+  check_eq "boot.grub" "pass" "$(json_query "$evidence" assertion_result boot.grub)"
+  check_eq "boot.kernel" "pass" "$(json_query "$evidence" assertion_result boot.kernel)"
+  check_eq "boot.systemd" "pass" "$(json_query "$evidence" assertion_result boot.systemd)"
+  check_eq "boot.login" "pass" "$(json_query "$evidence" assertion_result boot.login)"
+  check_eq "boot.live" "pass" "$(json_query "$evidence" assertion_result boot.live)"
+  check_contains "live detail lists both markers" \
+    'matched `live-media` and `squashfs`' "$(json_query "$evidence" assertion_detail boot.live)"
+  hash=$(json_query "$evidence" log_sha256)
+  check_eq "log sha256 matches file" "$(file_sha256 "$CASE_DIR/good-iso.log")" "$hash"
+  stderr_text=$(cat "$ERR_FILE")
+  check_contains "human summary on stderr" "boot.live: pass" "$stderr_text"
+  check_contains "boot mode summary" "boot mode: iso" "$stderr_text"
+  end_case
+}
+
+test_iso_missing_live_offline() {
+  local evidence=""
+
+  begin_case "ISO log without live marker -> boot.live fail, exit 1"
+  make_iso_fixture "$CASE_DIR"
+  evidence="$CASE_DIR/boot-evidence.json"
+  write_iso_no_live_log "$CASE_DIR/no-live.log"
+
+  invoke_boot_check "$BASH_BIN" "$BOOT_CHECK" \
+    --artifact "$CASE_DIR/artifact.json" \
+    --log-from "$CASE_DIR/no-live.log" --json
+
+  check_eq "exit code" 1 "$RC"
+  check_eq "result" "fail" "$(json_query "$evidence" result)"
+  check_eq "assertion count" 6 "$(json_query "$evidence" assertion_count)"
+  check_eq "boot.firmware still evaluated" "pass" "$(json_query "$evidence" assertion_result boot.firmware)"
+  check_eq "boot.grub still evaluated" "pass" "$(json_query "$evidence" assertion_result boot.grub)"
+  check_eq "boot.login still evaluated" "pass" "$(json_query "$evidence" assertion_result boot.login)"
+  check_eq "boot.live" "fail" "$(json_query "$evidence" assertion_result boot.live)"
+  check_contains "live detail" \
+    'no `live-boot`, `live-media`, `squashfs`, or `overlay`' \
+    "$(json_query "$evidence" assertion_detail boot.live)"
+  end_case
+}
+
+test_iso_qemu_arguments() {
+  local evidence=""
+  local args_file=""
+  local vars_copy=""
+  local expected=""
+  local actual=""
+  local real_case_dir=""
+  local vars_path=""
+  local duration=0
+
+  begin_case "ISO argv: q35 + two pflash drives + -cdrom, no disk, early stop"
+  make_iso_fixture "$CASE_DIR"
+  evidence="$CASE_DIR/boot-evidence.json"
+  args_file="$CASE_DIR/qemu-args.txt"
+  vars_copy="$CASE_DIR/vars-copy.bin"
+  real_case_dir=$(cd "$CASE_DIR" && pwd -P)
+  write_fake_qemu_iso "$CASE_DIR/fake-qemu" hang
+
+  expected=$(printf '%s\n' \
+    '-machine' 'q35' \
+    '-m' '1024' \
+    '-smp' '2' \
+    '-nographic' \
+    '-no-reboot' \
+    '-drive' "if=pflash,format=raw,readonly=on,file=$real_case_dir/fw/OVMF_CODE_4M.fd" \
+    '-drive' 'if=pflash,format=raw,file=<VARS>' \
+    '-cdrom' "$real_case_dir/live.iso")
+
+  SECONDS=0
+  RC=0
+  FAKE_QEMU_ARGS="$args_file" FAKE_QEMU_VARS_COPY="$vars_copy" \
+    "$BASH_BIN" "$BOOT_CHECK" \
+    --artifact "$CASE_DIR/artifact.json" \
+    --qemu "$CASE_DIR/fake-qemu" --firmware "$real_case_dir/fw/OVMF_CODE_4M.fd" \
+    --timeout 10 --json >"$OUT_FILE" 2>"$ERR_FILE" || RC=$?
+  duration=$SECONDS
+
+  actual=$(normalize_uefi_args "$args_file")
+  check_eq "exit code" 0 "$RC"
+  check_eq "qemu argv" "$expected" "$actual"
+  check_eq "memory arg" "1024" "$(awk '/^-m$/{getline; print; exit}' "$args_file")"
+  check_eq "cdrom arg" "$real_case_dir/live.iso" \
+    "$(awk '/^-cdrom$/{getline; print; exit}' "$args_file")"
+  check_eq "only the two pflash drives" 2 "$(grep -c '^-drive$' "$args_file" || true)"
+  check_eq "no virtio disk drive" 0 "$(grep -c 'if=virtio' "$args_file" || true)"
+  check_eq "no raw disk path" 0 "$(grep -c 'disk.img' "$args_file" || true)"
+  check_eq "no -kernel flag" 0 "$(grep -c '^-kernel$' "$args_file" || true)"
+  check_eq "no -initrd flag" 0 "$(grep -c '^-initrd$' "$args_file" || true)"
+  check_eq "no -append flag" 0 "$(grep -c '^-append$' "$args_file" || true)"
+  # 6 matches including boot.live, not 5: the fake qemu would sleep 30s if the
+  # monitor stopped early.
+  check_le "early stop duration" 6 "$duration"
+  check_eq "result" "pass" "$(json_query "$evidence" result)"
+  check_eq "assertion count" 6 "$(json_query "$evidence" assertion_count)"
+  check_eq "boot.live" "pass" "$(json_query "$evidence" assertion_result boot.live)"
+  check_eq "evidence log" "boot.log" "$(json_query "$evidence" log)"
+  check_eq "VARS template copied for QEMU" "OVMF-VARS-FIXTURE" "$(cat "$vars_copy" 2>/dev/null)"
+  vars_path=$(find_uefi_vars_arg "$args_file")
+  check_contains "VARS copy in boot-check temp dir" "/sysemble-boot." "$vars_path"
+  check_no_file "VARS copy removed on exit" "$vars_path"
+  end_case
+}
+
+test_iso_missing_iso_field() {
+  begin_case "ISO artifact without boot.iso -> exit 2"
+  make_iso_fixture "$CASE_DIR"
+  write_iso_good_log "$CASE_DIR/good-iso.log"
+  delete_artifact_field "$CASE_DIR/artifact.json" "$CASE_DIR/no-iso.json" "boot.iso"
+
+  invoke_boot_check "$BASH_BIN" "$BOOT_CHECK" \
+    --artifact "$CASE_DIR/no-iso.json" \
+    --log-from "$CASE_DIR/good-iso.log" --json
+
+  check_eq "exit code" 2 "$RC"
+  check_empty "stdout" "$(cat "$OUT_FILE")"
+  check_contains "diagnostic" "boot.iso is required when boot.mode=iso" "$(cat "$ERR_FILE")"
+  check_no_file "no evidence" "$CASE_DIR/boot-evidence.json"
+  end_case
+}
+
+test_iso_missing_iso_file() {
+  begin_case "ISO artifact with missing ISO file -> exit 2"
+  make_iso_fixture "$CASE_DIR"
+  write_iso_good_log "$CASE_DIR/good-iso.log"
+  set_artifact_field "$CASE_DIR/artifact.json" "$CASE_DIR/missing-iso.json" \
+    boot.iso "does-not-exist.iso"
+
+  invoke_boot_check "$BASH_BIN" "$BOOT_CHECK" \
+    --artifact "$CASE_DIR/missing-iso.json" \
+    --log-from "$CASE_DIR/good-iso.log" --json
+
+  check_eq "exit code" 2 "$RC"
+  check_empty "stdout" "$(cat "$OUT_FILE")"
+  check_contains "diagnostic names boot.iso" "boot.iso" "$(cat "$ERR_FILE")"
+  check_contains "diagnostic says missing" "does not exist" "$(cat "$ERR_FILE")"
+  check_no_file "no evidence" "$CASE_DIR/boot-evidence.json"
+  end_case
+}
+
+test_iso_graphical_good_log_offline() {
+  local evidence=""
+  local stderr_text=""
+  local ids=""
+
+  begin_case "ISO graphical canned good log -> exit 0, nine passes"
+  make_iso_graphical_fixture "$CASE_DIR"
+  evidence="$CASE_DIR/boot-evidence.json"
+  write_iso_graphical_good_log "$CASE_DIR/good-iso-graphical.log"
+  ids="boot.firmware,boot.grub,boot.kernel,boot.systemd,boot.login,boot.live"
+  ids="$ids,boot.display_manager,boot.xorg,boot.graphical"
+
+  invoke_boot_check "$BASH_BIN" "$BOOT_CHECK" \
+    --artifact "$CASE_DIR/artifact.json" \
+    --log-from "$CASE_DIR/good-iso-graphical.log" --json
+
+  check_eq "exit code" 0 "$RC"
+  check_eq "result" "pass" "$(json_query "$evidence" result)"
+  check_eq "assertion count" 9 "$(json_query "$evidence" assertion_count)"
+  check_eq "assertion ids and order" "$ids" "$(json_query "$evidence" assertion_ids)"
+  check_eq "boot.live" "pass" "$(json_query "$evidence" assertion_result boot.live)"
+  check_contains "live detail uses the alternate markers" \
+    'matched `live-boot` and `overlay`' "$(json_query "$evidence" assertion_detail boot.live)"
+  check_eq "boot.display_manager" "pass" "$(json_query "$evidence" assertion_result boot.display_manager)"
+  check_eq "boot.xorg" "pass" "$(json_query "$evidence" assertion_result boot.xorg)"
+  check_eq "boot.graphical" "pass" "$(json_query "$evidence" assertion_result boot.graphical)"
+  stderr_text=$(cat "$ERR_FILE")
+  check_contains "graphical mode summary" \
+    "graphical: -vga virtio, -m 2048 (9 assertions)" "$stderr_text"
+  check_contains "live summary on stderr" "boot.live: pass" "$stderr_text"
+  end_case
+}
+
+test_iso_graphical_qemu_arguments() {
+  local evidence=""
+  local args_file=""
+  local vars_copy=""
+  local expected=""
+  local actual=""
+  local real_case_dir=""
+  local vars_path=""
+  local duration=0
+
+  begin_case "ISO graphical argv: -vga virtio, -cdrom, no disk, early stop at 9"
+  make_iso_graphical_fixture "$CASE_DIR"
+  evidence="$CASE_DIR/boot-evidence.json"
+  args_file="$CASE_DIR/qemu-args.txt"
+  vars_copy="$CASE_DIR/vars-copy.bin"
+  real_case_dir=$(cd "$CASE_DIR" && pwd -P)
+  write_fake_qemu_iso_graphical "$CASE_DIR/fake-qemu" hang
+
+  expected=$(printf '%s\n' \
+    '-machine' 'q35' \
+    '-m' '2048' \
+    '-smp' '2' \
+    '-nographic' \
+    '-no-reboot' \
+    '-vga' 'virtio' \
+    '-drive' "if=pflash,format=raw,readonly=on,file=$real_case_dir/fw/OVMF_CODE_4M.fd" \
+    '-drive' 'if=pflash,format=raw,file=<VARS>' \
+    '-cdrom' "$real_case_dir/live.iso")
+
+  SECONDS=0
+  RC=0
+  FAKE_QEMU_ARGS="$args_file" FAKE_QEMU_VARS_COPY="$vars_copy" \
+    "$BASH_BIN" "$BOOT_CHECK" \
+    --artifact "$CASE_DIR/artifact.json" \
+    --qemu "$CASE_DIR/fake-qemu" --firmware "$real_case_dir/fw/OVMF_CODE_4M.fd" \
+    --timeout 10 --json >"$OUT_FILE" 2>"$ERR_FILE" || RC=$?
+  duration=$SECONDS
+
+  actual=$(normalize_uefi_args "$args_file")
+  check_eq "exit code" 0 "$RC"
+  check_eq "qemu argv" "$expected" "$actual"
+  check_eq "memory arg" "2048" "$(awk '/^-m$/{getline; print; exit}' "$args_file")"
+  check_eq "vga arg" "virtio" "$(awk '/^-vga$/{getline; print; exit}' "$args_file")"
+  check_eq "cdrom arg" "$real_case_dir/live.iso" \
+    "$(awk '/^-cdrom$/{getline; print; exit}' "$args_file")"
+  check_eq "no virtio disk drive" 0 "$(grep -c 'if=virtio' "$args_file" || true)"
+  check_eq "only the two pflash drives" 2 "$(grep -c '^-drive$' "$args_file" || true)"
+  # 9 matches, not 6: -vga virtio plus the desktop triple.
+  check_le "early stop duration" 6 "$duration"
+  check_eq "result" "pass" "$(json_query "$evidence" result)"
+  check_eq "assertion count" 9 "$(json_query "$evidence" assertion_count)"
+  check_eq "boot.live" "pass" "$(json_query "$evidence" assertion_result boot.live)"
+  check_eq "boot.graphical" "pass" "$(json_query "$evidence" assertion_result boot.graphical)"
+  vars_path=$(find_uefi_vars_arg "$args_file")
+  check_no_file "VARS copy removed on exit" "$vars_path"
+  end_case
+}
+
 # Runs last: every offline/QEMU path above has had a chance to leak. boot-check
 # must keep its OVMF VARS copy under $TMPDIR, never in the caller's working
 # directory (the repo root when this suite runs from there).
@@ -1718,6 +2188,15 @@ test_graphical_qemu_arguments
 test_non_graphical_qemu_defaults
 test_kernel_mode_ignores_graphical
 test_desktop_field_validation
+
+test_iso_good_log_offline
+test_iso_missing_live_offline
+test_iso_qemu_arguments
+test_iso_missing_iso_field
+test_iso_missing_iso_file
+test_iso_graphical_good_log_offline
+test_iso_graphical_qemu_arguments
+
 test_repo_root_has_no_leftovers
 
 printf '\n----------------------------------------------------------------\n'

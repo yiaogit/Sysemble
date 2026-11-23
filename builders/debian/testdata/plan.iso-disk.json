@@ -1,0 +1,44 @@
+{
+  "apiVersion": "sysemble/plan/v1",
+  "spec": "debian-minimal-both",
+  "base": {
+    "kind": "debian",
+    "release": "trixie",
+    "pin": "2026-11-01"
+  },
+  "target": {
+    "arch": "x86_64",
+    "outputs": [
+      "qcow2",
+      "iso"
+    ]
+  },
+  "packages": [
+    "apt",
+    "ca-certificates",
+    "console-setup",
+    "dbus",
+    "e2fsprogs",
+    "initramfs-tools",
+    "kmod",
+    "linux-image-amd64",
+    "locales",
+    "sudo",
+    "systemd",
+    "systemd-sysv",
+    "tzdata",
+    "udev"
+  ],
+  "modules": [
+    {
+      "id": "base-debian",
+      "version": "0.1.0"
+    }
+  ],
+  "estimates": {
+    "image_mb": 1024,
+    "build_minutes": 9,
+    "disk_mb": 4096
+  },
+  "warnings": []
+}

@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# P0-c/P0-d1 native `--execute` command-sequence test.
+# P0-c/P0-d1/P0-d2 native `--execute` command-sequence test.
 #
 # macOS has no Linux, root, mmdebstrap, sgdisk, mkfs.ext4, mkfs.vfat, mcopy,
-# grub-mkstandalone, dd (as a controllable fake), or qemu-img, so this test
-# fakes only the *tools* and runs the real build.sh end to end. It verifies:
+# grub-mkstandalone, mksquashfs, xorriso, dd (as a controllable fake), or
+# qemu-img, so this test fakes only the *tools* and runs the real build.sh end
+# to end. It verifies:
 #   - the rootfs -> sgdisk -> mkfs.ext4 -> mkfs.vfat -> grub-mkstandalone ->
-#     mcopy -> dd -> qemu-img call order
+#     mcopy -> dd -> qemu-img disk call order
 #   - the frozen GPT partition arguments, ext4 offset/label, ESP size, dd seek
-#   - the generated grub.cfg (hd0,gpt2), root=/dev/vda2, console=ttyS0, and
-#     the actual kernel/initrd versions
+#   - the generated disk grub.cfg (hd0,gpt2), root=/dev/vda2, console=ttyS0,
+#     and the actual kernel/initrd versions
 #   - the grub-mkstandalone module list and embedded config argument
 #   - the UEFI artifact fields: mode/disk/grub/partitions/cmdline/images
 #   - P0-d1: a DM plan (KDE: sddm+plasma-desktop) produces the graphical
@@ -20,9 +21,20 @@
 #     build adds none of them
 #   - P0-d1: a no-DM plan keeps graphical=false, memory_mb=1024, no desktop
 #     object, and the frozen multi-user cmdline; grub.cfg agrees
+#   - P0-d2 iso-only: skips sgdisk/mkfs.ext4/qemu-img/dd and runs
+#     mksquashfs -> grub-mkstandalone -> mkfs.vfat -> mcopy -> xorriso; the
+#     artifact is boot.mode=iso with live.iso and no partitions; --include has
+#     live-boot + live-boot-initramfs-tools; grub.cfg has the live search/
+#     live-media-path lines and the actual kernel/initrd versions
+#   - P0-d2 desktop ISO: desktop/graphical/2048 fields, desktop + live runtime
+#     packages, boot evidence unit, no partitions
+#   - P0-d2 iso+disk: both pipelines run and one ISO-mode artifact records all
+#     images + partitions
+#   - P0-d2 failure cleanup: xorriso failure exits 6, removes live.iso/efi.img,
+#     keeps rootfs/iso/build.log
 #   - failure cleanup keeps rootfs + disk.img + build.log, removes esp.img and
 #     partial qcow2 (GRUB and qemu-img failure paths)
-#   - preflight reports every missing P0-c tool
+#   - preflight reports every missing tool for the requested output mode
 #
 # It does NOT prove the real commands work; the authoritative check is the CI
 # boot-smoke job on ubuntu-latest.
@@ -39,9 +51,15 @@ TEST_DIR=$(cd "$TEST_DIR" && pwd)
 BUILDER_DIR=$(cd "$TEST_DIR/.." && pwd)
 BUILD_SH="$BUILDER_DIR/build.sh"
 # KDE fixture: a display manager (sddm) + session (plasma-desktop) -> graphical.
-PLAN="$BUILDER_DIR/testdata/plan.example.json"
+# plan.disk.json is plan.example.json with target.outputs=["qcow2"]: the P0-c/d1
+# disk regression must not build an ISO even though the KDE spec also lists it.
+PLAN="$BUILDER_DIR/testdata/plan.disk.json"
 # Minimal fixture with no display manager -> frozen P0-c multi-user behavior.
 PLAN_NODM="$BUILDER_DIR/testdata/plan.no-desktop.json"
+# P0-d2: iso-only and iso+disk fixtures (14 packages, no display manager).
+PLAN_ISO="$BUILDER_DIR/testdata/plan.iso.json"
+PLAN_ISO_DISK="$BUILDER_DIR/testdata/plan.iso-disk.json"
+PLAN_ISO_DESKTOP="$BUILDER_DIR/testdata/plan.iso-desktop.json"
 
 # shellcheck source=builders/debian/lib.sh
 . "$BUILDER_DIR/lib.sh"
@@ -52,6 +70,11 @@ if [ ! -f "$PLAN" ]; then
 fi
 if [ ! -f "$PLAN_NODM" ]; then
   printf 'FAIL: no-desktop fixture plan not found: %s\n' "$PLAN_NODM" >&2
+  exit 1
+fi
+if [ ! -f "$PLAN_ISO" ] || [ ! -f "$PLAN_ISO_DISK" ] || [ ! -f "$PLAN_ISO_DESKTOP" ]; then
+  printf 'FAIL: P0-d2 ISO fixture plan not found: %s / %s / %s\n' \
+    "$PLAN_ISO" "$PLAN_ISO_DISK" "$PLAN_ISO_DESKTOP" >&2
   exit 1
 fi
 if ! command -v python3 >/dev/null 2>&1; then
@@ -133,6 +156,21 @@ artifact_boot_cmdline() {
 
 grub_kernel_cmdline() {
   sed -n 's/^  linux \/boot\/[^ ]* //p' "$1" | head -n 1
+}
+
+iso_grub_kernel_cmdline() {
+  sed -n 's/^  linux \/live\/vmlinuz //p' "$1" | head -n 1
+}
+
+assert_no_call() {
+  local tool=$1
+  local label=$2
+
+  if [ -f "$FAKE_LOG/calls.log" ] && grep -q "^$tool " "$FAKE_LOG/calls.log"; then
+    fail "$label (unexpected '$tool' call)"
+  else
+    pass "$label"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -321,28 +359,37 @@ set -eu
 : "${FAKE_LOG:?FAKE_LOG is required}"
 printf 'mkfs.vfat %s\n' "$*" >>"$FAKE_LOG/calls.log"
 
-if [ "$#" -ne 7 ] ||
-  [ "${1:-}" != "-F" ] || [ "${2:-}" != "32" ] ||
-  [ "${3:-}" != "-C" ] || [ "${4:-}" != "-n" ] || [ "${5:-}" != "ESP" ] ||
-  [ "${7:-}" != "524288" ]; then
-  echo "fake mkfs.vfat: expected -F 32 -C -n ESP <img> 524288, got: $*" >&2
+img=""
+size=""
+if [ "$#" -eq 7 ] &&
+  [ "${1:-}" = "-F" ] && [ "${2:-}" = "32" ] &&
+  [ "${3:-}" = "-C" ] && [ "${4:-}" = "-n" ] && [ "${5:-}" = "ESP" ] &&
+  [ "${7:-}" = "524288" ]; then
+  # P0-c disk ESP: -F 32 -C -n ESP <img> 524288 (512 MiB).
+  img=${6}
+  size=536870912
+  if [ "${FAKE_VFAT_BAD_SIZE:-0}" = "1" ]; then
+    # 513 MiB: one MiB too large to fit GPT partition 1.
+    size=537919488
+  fi
+elif [ "$#" -eq 5 ] &&
+  [ "${1:-}" = "-C" ] && [ "${2:-}" = "-n" ] && [ "${3:-}" = "EFI" ] &&
+  [ "${5:-}" = "8192" ]; then
+  # P0-d2 live EFI image: -C -n EFI <img> 8192 (8 MiB).
+  img=${4}
+  size=8388608
+else
+  echo "fake mkfs.vfat: unexpected argv: $*" >&2
   exit 1
 fi
 
-img=${6}
 case "$img" in
   /*) ;;
   *)
-    echo "fake mkfs.vfat: expected an absolute esp.img path, got '$img'" >&2
+    echo "fake mkfs.vfat: expected an absolute image path, got '$img'" >&2
     exit 1
     ;;
 esac
-# Match the real mkfs.vfat -C file: exactly 524288 KiB = 512 MiB.
-size=536870912
-if [ "${FAKE_VFAT_BAD_SIZE:-0}" = "1" ]; then
-  # 513 MiB: one MiB too large to fit GPT partition 1.
-  size=537919488
-fi
 truncate -s "$size" "$img"
 echo "fake mkfs.vfat: $img ($((size / 1024 / 1024)) MiB)"
 SH
@@ -368,7 +415,6 @@ for arg in "$@"; do
     boot/grub/grub.cfg=*) embedded=$arg; source=${arg#boot/grub/grub.cfg=} ;;
   esac
 done
-# -o is the value after the -o flag.
 prev=""
 for arg in "$@"; do
   if [ "$prev" = "-o" ]; then
@@ -377,21 +423,34 @@ for arg in "$@"; do
   prev=$arg
 done
 
-expected="part_gpt part_msdos fat ext2 normal linux search search_fs_uuid configfile serial terminal echo test"
-if [ "$modules" != "$expected" ]; then
+expected_disk="part_gpt part_msdos fat ext2 normal linux search search_fs_uuid configfile serial terminal echo test"
+expected_iso="part_gpt part_msdos fat iso9660 normal linux search search_fs_file configfile serial terminal echo test"
+if [ "$modules" = "$expected_disk" ]; then
+  if ! grep -Fq 'set root=(hd0,gpt2)' "$source"; then
+    echo "fake grub-mkstandalone: disk grub.cfg lacks (hd0,gpt2)" >&2
+    exit 1
+  fi
+  if ! grep -Fq 'root=/dev/vda2' "$source"; then
+    echo "fake grub-mkstandalone: disk grub.cfg lacks root=/dev/vda2" >&2
+    exit 1
+  fi
+elif [ "$modules" = "$expected_iso" ]; then
+  for pattern in \
+    'search --no-floppy --file --set=root /live/vmlinuz' \
+    'boot=live' \
+    'live-media-path=/live' \
+    'initrd /live/initrd.img'; do
+    if ! grep -Fq "$pattern" "$source"; then
+      echo "fake grub-mkstandalone: ISO grub.cfg lacks '$pattern'" >&2
+      exit 1
+    fi
+  done
+else
   echo "fake grub-mkstandalone: unexpected --modules: '$modules'" >&2
   exit 1
 fi
 if [ -z "$embedded" ] || [ -z "$source" ] || [ ! -f "$source" ]; then
   echo "fake grub-mkstandalone: embedded grub.cfg argument is missing or unreadable" >&2
-  exit 1
-fi
-if ! grep -Fq 'set root=(hd0,gpt2)' "$source"; then
-  echo "fake grub-mkstandalone: embedded grub.cfg lacks (hd0,gpt2)" >&2
-  exit 1
-fi
-if ! grep -Fq 'root=/dev/vda2' "$source"; then
-  echo "fake grub-mkstandalone: embedded grub.cfg lacks root=/dev/vda2" >&2
   exit 1
 fi
 if [ -z "$out" ]; then
@@ -437,10 +496,8 @@ if [ ! -f "$src/BOOT/BOOTX64.EFI" ]; then
   echo "fake mcopy: staging BOOTX64.EFI is missing under $src" >&2
   exit 1
 fi
-if [ ! -f "$stage_root/boot/grub/grub.cfg" ]; then
-  echo "fake mcopy: staging grub.cfg is missing under $stage_root" >&2
-  exit 1
-fi
+# A disk ESP also stages boot/grub/grub.cfg; the live efi.img only needs
+# EFI/BOOT/BOOTX64.EFI (the config is embedded by grub-mkstandalone).
 
 echo "fake mcopy: $src -> $img ::/"
 SH
@@ -513,6 +570,82 @@ fi
 
 printf 'QCOW2\n' >"$qcow"
 echo "fake qemu-img: $raw -> $qcow"
+SH
+
+cat >"$FAKEBIN/mksquashfs" <<'SH'
+#!/bin/sh
+set -eu
+: "${FAKE_LOG:?FAKE_LOG is required}"
+printf 'mksquashfs %s\n' "$*" >>"$FAKE_LOG/calls.log"
+
+if [ "$#" -ne 5 ] || [ "${3:-}" != "-comp" ] || [ "${4:-}" != "zstd" ] || [ "${5:-}" != "-noappend" ]; then
+  echo "fake mksquashfs: expected <rootfs> <squashfs> -comp zstd -noappend, got: $*" >&2
+  exit 1
+fi
+src=${1}
+dest=${2}
+if [ ! -d "$src" ]; then
+  echo "fake mksquashfs: rootfs source is not a directory: $src" >&2
+  exit 1
+fi
+case "$dest" in
+  */iso/live/filesystem.squashfs) ;;
+  *)
+    echo "fake mksquashfs: unexpected destination: $dest" >&2
+    exit 1
+    ;;
+esac
+mkdir -p "${dest%/*}"
+printf 'fake squashfs\n' >"$dest"
+echo "fake mksquashfs: $src -> $dest"
+SH
+
+cat >"$FAKEBIN/xorriso" <<'SH'
+#!/bin/sh
+set -eu
+: "${FAKE_LOG:?FAKE_LOG is required}"
+printf 'xorriso %s\n' "$*" >>"$FAKE_LOG/calls.log"
+
+if [ "${1:-}" != "-as" ] || [ "${2:-}" != "mkisofs" ]; then
+  echo "fake xorriso: expected -as mkisofs, got: $*" >&2
+  exit 1
+fi
+
+out=""
+tree=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "-o" ]; then
+    out=$arg
+  fi
+  prev=$arg
+  tree=$arg
+done
+if [ -z "$out" ]; then
+  echo "fake xorriso: -o output path is missing" >&2
+  exit 1
+fi
+expected="-as mkisofs -R -J -joliet-long -V SYMBLE -o $out -eltorito-alt-boot -e boot/grub/efi.img -no-emul-boot -isohybrid-gpt-basdat $tree"
+if [ "$*" != "$expected" ]; then
+  echo "fake xorriso: unexpected argv: $*" >&2
+  echo "fake xorriso: expected: $expected" >&2
+  exit 1
+fi
+for rel in live/filesystem.squashfs live/vmlinuz live/initrd.img boot/grub/efi.img; do
+  if [ ! -f "$tree/$rel" ]; then
+    echo "fake xorriso: ISO tree is missing $rel" >&2
+    exit 1
+  fi
+done
+
+if [ "${FAKE_XORRISO_FAIL:-0}" = "1" ]; then
+  printf 'partial ISO\n' >"$out"
+  echo "fake xorriso: injected failure" >&2
+  exit 1
+fi
+
+printf 'fake ISO\n' >"$out"
+echo "fake xorriso: $tree -> $out"
 SH
 
 chmod +x "$FAKEBIN"/*
@@ -613,6 +746,114 @@ check(
     ],
     "partitions",
 )
+check(re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", doc["createdAt"]) is not None, "createdAt")
+check(doc["builder"] == {"name": "build.sh", "version": "0.1.0"}, "builder")
+PY
+}
+
+# P0-d2 live ISO artifact checker.
+# Usage: validate_iso_artifact <json> <out_dir> <spec> <package_count> <plain|graphical> <include_disk 0|1>
+validate_iso_artifact() {
+  python3 - "$1" "$2" "$3" "$4" "$5" "$6" <<'PY'
+import json
+import os
+import re
+import sys
+
+path, out, expected_spec, expected_packages, mode, include_disk = (
+    sys.argv[1],
+    sys.argv[2],
+    sys.argv[3],
+    sys.argv[4],
+    sys.argv[5],
+    int(sys.argv[6]),
+)
+ISO_CMDLINE = (
+    "boot=live live-media-path=/live console=ttyS0 "
+    "systemd.unit=multi-user.target systemd.journald.forward_to_console=1"
+)
+ISO_GRAPHICAL_CMDLINE = (
+    "boot=live live-media-path=/live console=ttyS0 "
+    "systemd.unit=graphical.target systemd.journald.forward_to_console=1"
+)
+
+with open(path, "r", encoding="utf-8") as fh:
+    doc = json.load(fh)
+
+def check(condition, message):
+    if not condition:
+        sys.exit("FAIL: " + message)
+
+expected_keys = {
+    "apiVersion", "createdAt", "spec", "base", "arch", "packages",
+    "rootfs", "images", "boot", "builder",
+}
+if mode == "graphical":
+    expected_keys.add("desktop")
+if include_disk:
+    expected_keys.add("partitions")
+check(set(doc) == expected_keys, "top-level keys for ISO artifact")
+check(doc["apiVersion"] == "sysemble/artifact/v1", "apiVersion")
+check(doc["spec"] == expected_spec, "spec")
+check(doc["arch"] == "x86_64", "arch")
+check(doc["base"]["kind"] == "debian", "base.kind")
+check(doc["base"]["release"] == "trixie", "base.release")
+check(doc["base"]["pin"] == "2026-11-01", "base.pin")
+check(len(doc["packages"]) == int(expected_packages), "packages count")
+check("live-boot" not in doc["packages"], "artifact.packages keeps the plan list")
+check("live-boot-initramfs-tools" not in doc["packages"], "artifact.packages keeps the plan list")
+check(doc["rootfs"]["path"] == "rootfs", "rootfs.path")
+check(doc["rootfs"]["size_mb"] >= 1, "rootfs.size_mb")
+
+by_format = {image["format"]: image for image in doc["images"]}
+if include_disk:
+    check(len(doc["images"]) == 3, "images count (iso + raw + qcow2)")
+    check(set(by_format) == {"iso", "raw", "qcow2"}, "image formats")
+    check(by_format["raw"]["path"] == "disk.img", "raw image path")
+    check(by_format["qcow2"]["path"] == "disk.qcow2", "qcow2 image path")
+    check(by_format["raw"]["size_mb"] == 4096, "raw size is the 4096 MB P0-c floor")
+else:
+    check(len(doc["images"]) == 1, "iso-only images count")
+    check(set(by_format) == {"iso"}, "iso-only image format")
+check(by_format["iso"]["path"] == "live.iso", "iso image path is live.iso")
+for image in doc["images"]:
+    check(
+        isinstance(image["sha256"], str)
+        and re.fullmatch(r"[0-9a-f]{64}", image["sha256"]) is not None,
+        "sha256 " + image["format"],
+    )
+    expected_mb = (os.path.getsize(os.path.join(out, image["path"])) + 1048575) // 1048576
+    check(image["size_mb"] == expected_mb, "size_mb " + image["format"])
+    check(os.path.isfile(os.path.join(out, image["path"])), "image exists " + image["path"])
+
+boot = doc["boot"]
+expected_boot = {"mode", "iso", "cmdline", "memory_mb"}
+if mode == "graphical":
+    expected_boot.add("graphical")
+check(set(boot) == expected_boot, "boot object keys for ISO mode")
+check(boot["mode"] == "iso", "boot.mode is iso")
+check(boot["iso"] == "live.iso", "boot.iso is live.iso")
+check(boot["memory_mb"] == (2048 if mode == "graphical" else 1024), "boot.memory_mb")
+expected_cmdline = ISO_GRAPHICAL_CMDLINE if mode == "graphical" else ISO_CMDLINE
+check(boot["cmdline"] == expected_cmdline, "boot.cmdline is the frozen ISO cmdline")
+if mode == "graphical":
+    check(boot["graphical"] is True, "boot.graphical is true")
+    check(doc["desktop"]["display_manager"] in {"gdm", "sddm", "lightdm"}, "desktop")
+    check(doc["desktop"]["session"] in {"plasma", "gnome", "xfce", "unknown"}, "desktop.session")
+else:
+    check("graphical" not in boot, "non-desktop ISO boot omits graphical")
+    check("desktop" not in doc, "non-desktop ISO artifact has no desktop object")
+
+if include_disk:
+    check(
+        doc["partitions"] == [
+            {"index": 1, "role": "esp", "size_mb": 512, "fs": "vfat32"},
+            {"index": 2, "role": "root", "size_mb": 3584, "fs": "ext4"},
+        ],
+        "partitions",
+    )
+else:
+    check("partitions" not in doc, "iso-only artifact omits partitions")
 check(re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", doc["createdAt"]) is not None, "createdAt")
 check(doc["builder"] == {"name": "build.sh", "version": "0.1.0"}, "builder")
 PY
@@ -1039,6 +1280,279 @@ assert_contains "requires Linux" "$PREFLIGHT_LOG" "preflight reports a non-Linux
 assert_contains "requires root" "$PREFLIGHT_LOG" "preflight reports a non-root euid"
 for tool in mmdebstrap mkfs.ext4 qemu-img sgdisk mkfs.vfat mcopy grub-mkstandalone dd; do
   assert_contains "'$tool' on PATH" "$PREFLIGHT_LOG" "preflight reports missing '$tool'"
+done
+
+# ---------------------------------------------------------------------------
+# Case 10: ISO-only --execute builds only the live ISO (P0-d2)
+# ---------------------------------------------------------------------------
+
+OUT_ISO="$TMP_DIR/out-iso"
+LOG_ISO="$TMP_DIR/run-iso.log"
+FAKE_LOG="$TMP_DIR/fake-iso"
+export FAKE_LOG
+mkdir -p "$FAKE_LOG"
+export FAKE_XORRISO_FAIL=0
+
+if run_build "$PLAN_ISO" "$OUT_ISO" "$LOG_ISO" --execute; then
+  pass "iso-only --execute exits 0 with the fake live ISO toolchain"
+else
+  cat "$LOG_ISO" >&2
+  fail "iso-only --execute did not exit 0"
+fi
+
+if [ -f "$OUT_ISO/artifact.json" ]; then
+  pass "iso-only artifact.json exists"
+  if validate_iso_artifact "$OUT_ISO/artifact.json" "$OUT_ISO" "minimal-debian-live" 14 plain 0; then
+    pass "iso-only artifact shape: live.iso image, boot.mode=iso, no partitions"
+  else
+    fail "iso-only artifact.json validation failed"
+  fi
+else
+  fail "iso-only artifact.json was not written"
+fi
+
+assert_eq "minimal-debian-live" "$(cat "$OUT_ISO/rootfs/etc/hostname" 2>/dev/null || true)" \
+  "iso-only customize hook writes plan.spec to /etc/hostname"
+assert_file "$OUT_ISO/live.iso" "iso-only build produces live.iso"
+assert_file "$OUT_ISO/iso/live/filesystem.squashfs" "ISO tree contains live/filesystem.squashfs"
+assert_file "$OUT_ISO/iso/live/vmlinuz" "ISO tree contains live/vmlinuz"
+assert_file "$OUT_ISO/iso/live/initrd.img" "ISO tree contains live/initrd.img"
+assert_file "$OUT_ISO/iso/boot/grub/efi.img" "ISO tree contains boot/grub/efi.img"
+assert_file "$OUT_ISO/esp/EFI/BOOT/BOOTX64.EFI" "ISO build keeps the GRUB EFI staging tree"
+assert_file "$OUT_ISO/grub.cfg" "ISO build keeps grub.cfg for diagnosis"
+assert_file "$OUT_ISO/build.log" "ISO build keeps build.log"
+assert_absent "$OUT_ISO/efi.img" "successful ISO build removes the intermediate efi.img"
+assert_absent "$OUT_ISO/esp.img" "ISO-only build never creates esp.img"
+assert_absent "$OUT_ISO/disk.img" "ISO-only build never creates disk.img"
+assert_absent "$OUT_ISO/disk.qcow2" "ISO-only build never creates disk.qcow2"
+
+CALLS_ISO="$FAKE_LOG/calls.log"
+if [ -f "$CALLS_ISO" ]; then
+  pass "ISO fake tools recorded calls"
+else
+  fail "ISO fake tools did not record calls"
+fi
+
+assert_no_call sgdisk "iso-only build does not call sgdisk"
+assert_no_call mkfs.ext4 "iso-only build does not call mkfs.ext4"
+assert_no_call qemu-img "iso-only build does not call qemu-img"
+assert_no_call dd "iso-only build does not call dd"
+
+ISO_ABS=$(cd "$OUT_ISO" && pwd -P)
+assert_contains "mksquashfs $ISO_ABS/rootfs $ISO_ABS/iso/live/filesystem.squashfs -comp zstd -noappend" \
+  "$CALLS_ISO" "mksquashfs uses the frozen source, destination, zstd, and -noappend"
+assert_contains "grub-mkstandalone -O x86_64-efi -o $ISO_ABS/esp/EFI/BOOT/BOOTX64.EFI" \
+  "$CALLS_ISO" "grub-mkstandalone writes the ISO BOOTX64.EFI"
+assert_contains "--modules=part_gpt part_msdos fat iso9660 normal linux search search_fs_file configfile serial terminal echo test" \
+  "$CALLS_ISO" "grub-mkstandalone receives the frozen ISO module list"
+assert_contains "boot/grub/grub.cfg=$ISO_ABS/grub.cfg" \
+  "$CALLS_ISO" "grub-mkstandalone embeds the ISO grub.cfg"
+assert_contains "mkfs.vfat -C -n EFI $ISO_ABS/efi.img 8192" \
+  "$CALLS_ISO" "mkfs.vfat creates an 8 MiB EFI image"
+assert_contains "mcopy -i $ISO_ABS/efi.img -s $ISO_ABS/esp/EFI ::/" \
+  "$CALLS_ISO" "mcopy populates the EFI image from the ISO staging tree"
+assert_contains "xorriso -as mkisofs -R -J -joliet-long -V SYMBLE -o $ISO_ABS/live.iso -eltorito-alt-boot -e boot/grub/efi.img -no-emul-boot -isohybrid-gpt-basdat $ISO_ABS/iso" \
+  "$CALLS_ISO" "xorriso receives the frozen UEFI El Torito ISO arguments"
+assert_contains "live-boot,live-boot-initramfs-tools" "$CALLS_ISO" \
+  "iso-only mmdebstrap --include adds live-boot and live-boot-initramfs-tools"
+
+MM_LINE=$(grep -n '^mmdebstrap ' "$CALLS_ISO" 2>/dev/null | head -1 | cut -d: -f1 || true)
+SQ_LINE=$(grep -n '^mksquashfs ' "$CALLS_ISO" 2>/dev/null | head -1 | cut -d: -f1 || true)
+GI_LINE=$(grep -n '^grub-mkstandalone ' "$CALLS_ISO" 2>/dev/null | head -1 | cut -d: -f1 || true)
+VI_LINE=$(grep -n '^mkfs.vfat ' "$CALLS_ISO" 2>/dev/null | head -1 | cut -d: -f1 || true)
+CI_LINE=$(grep -n '^mcopy ' "$CALLS_ISO" 2>/dev/null | head -1 | cut -d: -f1 || true)
+XI_LINE=$(grep -n '^xorriso ' "$CALLS_ISO" 2>/dev/null | head -1 | cut -d: -f1 || true)
+if [ -n "$MM_LINE" ] && [ -n "$SQ_LINE" ] && [ -n "$GI_LINE" ] &&
+  [ -n "$VI_LINE" ] && [ -n "$CI_LINE" ] && [ -n "$XI_LINE" ] &&
+  [ "$MM_LINE" -lt "$SQ_LINE" ] && [ "$SQ_LINE" -lt "$GI_LINE" ] &&
+  [ "$GI_LINE" -lt "$VI_LINE" ] && [ "$VI_LINE" -lt "$CI_LINE" ] &&
+  [ "$CI_LINE" -lt "$XI_LINE" ]; then
+  pass "ISO call order is rootfs -> mksquashfs -> grub -> mkfs.vfat -> mcopy -> xorriso ($MM_LINE<$SQ_LINE<$GI_LINE<$VI_LINE<$CI_LINE<$XI_LINE)"
+else
+  fail "ISO call order is wrong (mmdebstrap=$MM_LINE mksquashfs=$SQ_LINE grub=$GI_LINE mkfs.vfat=$VI_LINE mcopy=$CI_LINE xorriso=$XI_LINE)"
+fi
+assert_contains "chroot $ISO_ABS/rootfs update-initramfs -u -k all" "$CALLS_ISO" \
+  "ISO customize hook regenerates the initramfs inside the chroot"
+
+assert_contains "menuentry \"Sysemble Live\"" "$OUT_ISO/grub.cfg" "ISO grub.cfg has the live menu entry"
+assert_contains "search --no-floppy --file --set=root /live/vmlinuz" "$OUT_ISO/grub.cfg" \
+  "ISO grub.cfg searches for /live/vmlinuz"
+assert_contains "boot=live" "$OUT_ISO/grub.cfg" "ISO grub.cfg passes boot=live"
+assert_contains "live-media-path=/live" "$OUT_ISO/grub.cfg" \
+  "ISO grub.cfg passes live-media-path=/live"
+assert_contains "linux /live/vmlinuz boot=live live-media-path=/live console=ttyS0 systemd.unit=multi-user.target systemd.journald.forward_to_console=1" \
+  "$OUT_ISO/grub.cfg" "ISO grub.cfg linux line is the frozen live cmdline"
+assert_contains "initrd /live/initrd.img" "$OUT_ISO/grub.cfg" \
+  "ISO grub.cfg loads the stable live initrd path"
+assert_contains "source kernel=vmlinuz-6.12.3 initrd=initrd.img-6.12.3" "$OUT_ISO/grub.cfg" \
+  "ISO grub.cfg records the actual kernel/initrd versions"
+assert_not_contains "set root=(hd0,gpt2)" "$OUT_ISO/grub.cfg" \
+  "ISO grub.cfg does not use the disk root"
+assert_eq "$(artifact_boot_cmdline "$OUT_ISO/artifact.json")" "$(iso_grub_kernel_cmdline "$OUT_ISO/grub.cfg")" \
+  "ISO artifact boot.cmdline matches the grub.cfg kernel line byte for byte"
+
+assert_contains "fake mksquashfs:" "$OUT_ISO/build.log" "build.log tees mksquashfs output"
+assert_contains "fake xorriso:" "$OUT_ISO/build.log" "build.log tees xorriso output"
+assert_contains "stage 5/6: assemble live ISO" "$OUT_ISO/build.log" "build.log records the live ISO stage"
+assert_contains "live ISO runtime: add live-boot,live-boot-initramfs-tools" "$OUT_ISO/build.log" \
+  "build.log records the live-boot runtime packages"
+
+# ---------------------------------------------------------------------------
+# Case 10b: a desktop ISO plan keeps the P0-d1 desktop fields but no partitions
+# ---------------------------------------------------------------------------
+
+OUT_ISOD="$TMP_DIR/out-iso-desktop"
+LOG_ISOD="$TMP_DIR/run-iso-desktop.log"
+FAKE_LOG="$TMP_DIR/fake-iso-desktop"
+export FAKE_LOG
+mkdir -p "$FAKE_LOG"
+
+if run_build "$PLAN_ISO_DESKTOP" "$OUT_ISOD" "$LOG_ISOD" --execute; then
+  pass "desktop iso-only --execute exits 0 with the fake live ISO toolchain"
+else
+  cat "$LOG_ISOD" >&2
+  fail "desktop iso-only --execute did not exit 0"
+fi
+
+if [ -f "$OUT_ISOD/artifact.json" ]; then
+  if validate_iso_artifact "$OUT_ISOD/artifact.json" "$OUT_ISOD" "debian-live-kde" 43 graphical 0; then
+    pass "desktop ISO artifact keeps desktop/graphical/2048 and omits partitions"
+  else
+    fail "desktop ISO artifact validation failed"
+  fi
+else
+  fail "desktop ISO artifact.json was not written"
+fi
+
+CALLS_ISOD="$FAKE_LOG/calls.log"
+assert_contains "xserver-xorg,procps,accountsservice,live-boot,live-boot-initramfs-tools" \
+  "$CALLS_ISOD" "desktop ISO --include adds desktop then live runtime packages"
+assert_contains "linux /live/vmlinuz boot=live live-media-path=/live console=ttyS0 systemd.unit=graphical.target systemd.journald.forward_to_console=1" \
+  "$OUT_ISOD/grub.cfg" "desktop ISO grub.cfg targets graphical.target"
+assert_contains "desktop: session=plasma, display_manager=sddm (graphical boot, 2048 MB)" \
+  "$OUT_ISOD/build.log" "desktop ISO build.log records the inferred desktop"
+assert_file "$OUT_ISOD/rootfs/etc/systemd/system/sysemble-boot-evidence.service" \
+  "desktop ISO build installs the boot evidence unit"
+assert_absent "$OUT_ISOD/efi.img" "desktop ISO build removes the intermediate efi.img"
+assert_absent "$OUT_ISOD/disk.img" "desktop ISO build creates no disk.img"
+
+# ---------------------------------------------------------------------------
+# Case 11: xorriso failure exits 6, removes live.iso/efi.img, keeps logs + ISO tree
+# ---------------------------------------------------------------------------
+
+OUT_ISOF="$TMP_DIR/out-iso-xorriso-fail"
+LOG_ISOF="$TMP_DIR/run-iso-xorriso-fail.log"
+FAKE_LOG="$TMP_DIR/fake-iso-xorriso-fail"
+export FAKE_LOG
+mkdir -p "$FAKE_LOG"
+# Unrelated pre-existing files must survive an iso-only failure: the EXIT trap
+# only owns this mode's intermediates.
+mkdir -p "$OUT_ISOF"
+printf 'unrelated raw\n' >"$OUT_ISOF/disk.img"
+printf 'unrelated qcow2\n' >"$OUT_ISOF/disk.qcow2"
+export FAKE_XORRISO_FAIL=1
+
+RC_ISOF=0
+if run_build "$PLAN_ISO" "$OUT_ISOF" "$LOG_ISOF" --execute; then
+  RC_ISOF=0
+else
+  RC_ISOF=$?
+fi
+export FAKE_XORRISO_FAIL=0
+assert_eq "6" "$RC_ISOF" "xorriso failure exits 6"
+assert_absent "$OUT_ISOF/live.iso" "xorriso failure removes the partial live.iso"
+assert_absent "$OUT_ISOF/efi.img" "xorriso failure removes the intermediate efi.img"
+assert_absent "$OUT_ISOF/artifact.json" "xorriso failure writes no artifact.json"
+assert_file "$OUT_ISOF/build.log" "xorriso failure keeps build.log"
+assert_file "$OUT_ISOF/iso/live/filesystem.squashfs" "xorriso failure keeps the squashfs for diagnosis"
+assert_file "$OUT_ISOF/grub.cfg" "xorriso failure keeps grub.cfg for diagnosis"
+assert_file "$OUT_ISOF/disk.img" "iso-only failure leaves an unrelated disk.img untouched"
+assert_file "$OUT_ISOF/disk.qcow2" "iso-only failure leaves an unrelated disk.qcow2 untouched"
+if [ -d "$OUT_ISOF/rootfs" ]; then
+  pass "xorriso failure keeps rootfs/"
+else
+  fail "xorriso failure removed rootfs/"
+fi
+assert_contains "xorriso failed" "$OUT_ISOF/build.log" "build.log records the xorriso error"
+assert_contains "fake xorriso: injected failure" "$OUT_ISOF/build.log" \
+  "build.log tees the failing xorriso output"
+
+# ---------------------------------------------------------------------------
+# Case 12: iso+disk plan builds both images and one ISO-mode artifact
+# ---------------------------------------------------------------------------
+
+OUT_BOTH="$TMP_DIR/out-iso-disk"
+LOG_BOTH="$TMP_DIR/run-iso-disk.log"
+FAKE_LOG="$TMP_DIR/fake-iso-disk"
+export FAKE_LOG
+mkdir -p "$FAKE_LOG"
+
+if run_build "$PLAN_ISO_DISK" "$OUT_BOTH" "$LOG_BOTH" --execute; then
+  pass "iso+disk --execute exits 0 with the fake toolchain"
+else
+  cat "$LOG_BOTH" >&2
+  fail "iso+disk --execute did not exit 0"
+fi
+
+if [ -f "$OUT_BOTH/artifact.json" ]; then
+  if validate_iso_artifact "$OUT_BOTH/artifact.json" "$OUT_BOTH" "debian-minimal-both" 14 plain 1; then
+    pass "iso+disk artifact records live.iso + disk images + partitions in ISO mode"
+  else
+    fail "iso+disk artifact.json validation failed"
+  fi
+else
+  fail "iso+disk artifact.json was not written"
+fi
+
+assert_file "$OUT_BOTH/live.iso" "iso+disk build produces live.iso"
+assert_file "$OUT_BOTH/disk.img" "iso+disk build produces disk.img"
+assert_file "$OUT_BOTH/disk.qcow2" "iso+disk build produces disk.qcow2"
+assert_file "$OUT_BOTH/iso-staging/grub.cfg" "iso+disk build keeps a separate ISO grub.cfg"
+assert_file "$OUT_BOTH/esp/boot/grub/grub.cfg" "iso+disk disk ESP keeps its own grub.cfg"
+assert_absent "$OUT_BOTH/efi.img" "iso+disk build removes the intermediate efi.img"
+assert_contains "set root=(hd0,gpt2)" "$OUT_BOTH/grub.cfg" \
+  "iso+disk disk grub.cfg keeps the GPT root"
+assert_not_contains "search --no-floppy" "$OUT_BOTH/grub.cfg" \
+  "iso+disk disk grub.cfg is not the live config"
+assert_contains "search --no-floppy --file --set=root /live/vmlinuz" "$OUT_BOTH/iso-staging/grub.cfg" \
+  "iso+disk ISO grub.cfg is separate from the disk config"
+assert_contains "sgdisk" "$FAKE_LOG/calls.log" "iso+disk build still runs sgdisk"
+assert_contains "xorriso" "$FAKE_LOG/calls.log" "iso+disk build still runs xorriso"
+
+# ---------------------------------------------------------------------------
+# Case 13: native_preflight is trimmed to the requested outputs
+# ---------------------------------------------------------------------------
+
+ISO_PREFLIGHT_LOG="$TMP_DIR/preflight-iso.log"
+RC_ISOP=0
+(
+  PATH="$EMPTY_PATH"
+  PLAN_OUTPUTS_VALUES=(iso)
+  native_preflight
+) >"$ISO_PREFLIGHT_LOG" 2>&1 || RC_ISOP=$?
+assert_eq "1" "$RC_ISOP" "iso preflight fails when tools are missing"
+assert_contains "requires Linux" "$ISO_PREFLIGHT_LOG" "iso preflight reports a non-Linux host"
+assert_contains "requires root" "$ISO_PREFLIGHT_LOG" "iso preflight reports a non-root euid"
+for tool in mmdebstrap mkfs.vfat mcopy grub-mkstandalone mksquashfs xorriso; do
+  assert_contains "'$tool' on PATH" "$ISO_PREFLIGHT_LOG" "iso preflight reports missing '$tool'"
+done
+for tool in mkfs.ext4 qemu-img sgdisk; do
+  assert_not_contains "'$tool' on PATH" "$ISO_PREFLIGHT_LOG" \
+    "iso-only preflight does not require '$tool'"
+done
+assert_not_contains "'dd' on PATH" "$ISO_PREFLIGHT_LOG" "iso-only preflight does not require dd"
+
+BOTH_PREFLIGHT_LOG="$TMP_DIR/preflight-iso-disk.log"
+RC_BOTHP=0
+(
+  PATH="$EMPTY_PATH"
+  PLAN_OUTPUTS_VALUES=(qcow2 iso)
+  native_preflight
+) >"$BOTH_PREFLIGHT_LOG" 2>&1 || RC_BOTHP=$?
+assert_eq "1" "$RC_BOTHP" "iso+disk preflight fails when tools are missing"
+for tool in mksquashfs xorriso sgdisk mkfs.ext4 qemu-img; do
+  assert_contains "'$tool' on PATH" "$BOTH_PREFLIGHT_LOG" \
+    "iso+disk preflight requires '$tool'"
 done
 
 # ---------------------------------------------------------------------------

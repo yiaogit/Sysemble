@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# P0-c/P0-d1 artifact manifest tests.
+# P0-c/P0-d1/P0-d2 artifact manifest tests.
 #
 # Runs entirely offline: no Linux, root, mmdebstrap, mkfs.ext4, mkfs.vfat,
-# sgdisk, mcopy, grub-mkstandalone, qemu-img or qemu is required. It builds a
-# fixture rootfs plus a fake ESP/GRUB tree, sources lib.sh (which defines
-# functions only), and calls the pure artifact_json()/compute_disk_size_mb()/
-# grub_cfg_text()/desktop-detection helpers. The result is validated with
+# sgdisk, mcopy, grub-mkstandalone, mksquashfs, xorriso, qemu-img or qemu is
+# required. It builds fixture rootfs/images, sources lib.sh (which defines
+# functions only), and calls the pure artifact_json()/artifact_iso_json()/
+# plan_build_mode()/compute_disk_size_mb()/grub_cfg_text()/
+# iso_grub_cfg_text()/desktop-detection helpers. The result is validated with
 # python3 (jq fallback).
 #
 # Covered:
@@ -15,6 +16,12 @@
 #     graphical.target + journald-forwarding cmdline
 #   - DM/session detection priority and the unknown-session fallback
 #   - graphical boot evidence unit text (Xorg + real DM process marker)
+#   - P0-d2 iso-only artifact: mode/iso/cmdline/images, no partitions
+#   - P0-d2 desktop ISO artifact: desktop/graphical/2048, no partitions
+#   - P0-d2 iso+disk artifact: ISO boot mode, all three images, partitions
+#   - P0-d2 runtime package deduplication against plan.packages
+#   - P0-d2 plan output mode selection (iso / iso-disk / disk)
+#   - P0-d2 live GRUB config (search/live-media-path/boot=live, actual versions)
 #   - P0-b kernel fallback when the GRUB outputs are absent (mode defaults)
 #   - images raw+qcow2 with sha256/size, kernel/initrd selection
 #   - missing kernel/initrd still fail (build.sh maps that to exit 6)
@@ -237,6 +244,295 @@ if grub_cfg_text "/boot/$KERNEL_NAME" "$INITRD_NAME" >/dev/null 2>&1; then
 else
   pass "grub_cfg_text rejects a kernel path instead of a basename"
 fi
+
+# ---------------------------------------------------------------------------
+# P0-d2 live ISO GRUB config rendering
+# ---------------------------------------------------------------------------
+
+ISO_GRUB="$TMP_DIR/grub-iso.cfg"
+ISO_GRAPHICAL_GRUB="$TMP_DIR/grub-iso-graphical.cfg"
+if iso_grub_cfg_text "$KERNEL_NAME" "$INITRD_NAME" >"$ISO_GRUB"; then
+  pass "iso_grub_cfg_text renders the live ISO menu"
+else
+  fail "iso_grub_cfg_text failed"
+fi
+iso_grub_cfg_text "$KERNEL_NAME" "$INITRD_NAME" 1 >"$ISO_GRAPHICAL_GRUB"
+
+assert_contains "menuentry \"Sysemble Live\"" "$ISO_GRUB" "ISO grub.cfg uses the Sysemble Live menu entry"
+assert_contains "search --no-floppy --file --set=root /live/vmlinuz" "$ISO_GRUB" \
+  "ISO grub.cfg searches for /live/vmlinuz"
+assert_contains "linux /live/vmlinuz boot=live live-media-path=/live console=ttyS0 systemd.unit=multi-user.target systemd.journald.forward_to_console=1" \
+  "$ISO_GRUB" "ISO grub.cfg linux line is the frozen multi-user live cmdline"
+assert_contains "initrd /live/initrd.img" "$ISO_GRUB" "ISO grub.cfg loads /live/initrd.img"
+assert_contains "source kernel=$KERNEL_NAME initrd=$INITRD_NAME" "$ISO_GRUB" \
+  "ISO grub.cfg records the actual kernel/initrd versions"
+assert_not_contains "set root=(hd0,gpt2)" "$ISO_GRUB" "ISO grub.cfg has no disk root"
+assert_not_contains "root=/dev/vda2" "$ISO_GRUB" "ISO grub.cfg has no disk root= cmdline"
+assert_not_contains "graphical.target" "$ISO_GRUB" "no-DM ISO grub.cfg keeps multi-user.target"
+assert_contains "linux /live/vmlinuz boot=live live-media-path=/live console=ttyS0 systemd.unit=graphical.target systemd.journald.forward_to_console=1" \
+  "$ISO_GRAPHICAL_GRUB" "graphical ISO grub.cfg targets graphical.target"
+assert_not_contains "systemd.unit=multi-user.target" "$ISO_GRAPHICAL_GRUB" \
+  "graphical ISO grub.cfg does not keep multi-user.target"
+assert_fails "iso_grub_cfg_text rejects an invalid graphical flag" \
+  iso_grub_cfg_text "$KERNEL_NAME" "$INITRD_NAME" 2
+if iso_grub_cfg_text "" "$INITRD_NAME" >/dev/null 2>&1; then
+  fail "iso_grub_cfg_text must reject an empty kernel name"
+else
+  pass "iso_grub_cfg_text rejects an empty kernel name"
+fi
+if iso_grub_cfg_text "$KERNEL_NAME" "/boot/$INITRD_NAME" >/dev/null 2>&1; then
+  fail "iso_grub_cfg_text must reject an initrd path with a slash"
+else
+  pass "iso_grub_cfg_text rejects an initrd path instead of a basename"
+fi
+
+# ---------------------------------------------------------------------------
+# P0-d2 live ISO artifact (iso-only, graphical, and iso+disk)
+# ---------------------------------------------------------------------------
+
+ISO_OUT="$TMP_DIR/iso-out"
+ISO_ROOTFS="$ISO_OUT/rootfs"
+mkdir -p "$ISO_ROOTFS/boot"
+printf 'iso kernel\n' >"$ISO_ROOTFS/boot/$KERNEL_NAME"
+printf 'iso initrd\n' >"$ISO_ROOTFS/boot/$INITRD_NAME"
+printf 'fake live iso\n' >"$ISO_OUT/live.iso"
+# 1 MiB is enough: artifact_iso_json hashes the file but does not inspect it.
+truncate -s 1048576 "$ISO_OUT/live.iso"
+
+ISO_JSON="$TMP_DIR/artifact-iso.json"
+if artifact_iso_json "$ISO_OUT" "minimal-debian-live" "trixie" "2026-11-01" \
+  "x86_64" "$CREATED_AT" 0 "${PACKAGES[@]}" >"$ISO_JSON"; then
+  pass "artifact_iso_json exits 0 for an iso-only build"
+else
+  fail "artifact_iso_json failed for an iso-only build"
+fi
+
+if [ "$json_backend" = "python3" ]; then
+  if python3 - "$ISO_JSON" "$ISO_OUT" "$CREATED_AT" <<'PY'
+import json
+import os
+import re
+import sys
+
+path, out, created_at = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(path, "r", encoding="utf-8") as fh:
+    doc = json.load(fh)
+
+def check(condition, message):
+    if not condition:
+        sys.exit("FAIL: " + message)
+    print("ok - " + message)
+
+ISO_CMDLINE = (
+    "boot=live live-media-path=/live console=ttyS0 "
+    "systemd.unit=multi-user.target systemd.journald.forward_to_console=1"
+)
+check(
+    set(doc) == {
+        "apiVersion", "createdAt", "spec", "base", "arch", "packages",
+        "rootfs", "images", "boot", "builder",
+    },
+    "iso-only top-level keys omit partitions and desktop",
+)
+check(doc["apiVersion"] == "sysemble/artifact/v1", "apiVersion")
+check(doc["createdAt"] == created_at, "createdAt")
+check(doc["spec"] == "minimal-debian-live", "spec")
+check(doc["base"] == {"kind": "debian", "release": "trixie", "pin": "2026-11-01"}, "base")
+check(doc["arch"] == "x86_64", "arch")
+check(doc["packages"] == ["apt", "ca-certificates", "systemd"], "artifact.packages keeps the plan list")
+check(doc["rootfs"]["path"] == "rootfs", "rootfs.path")
+check(doc["rootfs"]["size_mb"] >= 1, "rootfs.size_mb")
+check(len(doc["images"]) == 1, "iso-only images has one entry")
+image = doc["images"][0]
+check(image["path"] == "live.iso", "image path is live.iso")
+check(image["format"] == "iso", "image format is iso")
+check(re.fullmatch(r"[0-9a-f]{64}", image["sha256"]) is not None, "iso sha256")
+check(image["size_mb"] == 1, "iso size_mb is the 1 MiB fixture")
+check(os.path.isfile(os.path.join(out, "live.iso")), "live.iso exists under <out>")
+check(
+    set(doc["boot"]) == {"mode", "iso", "cmdline", "memory_mb"},
+    "iso-only boot keys are mode/iso/cmdline/memory_mb",
+)
+check(doc["boot"]["mode"] == "iso", "boot.mode is iso")
+check(doc["boot"]["iso"] == "live.iso", "boot.iso is live.iso")
+check(doc["boot"]["cmdline"] == ISO_CMDLINE, "boot.cmdline is the frozen ISO multi-user cmdline")
+check(doc["boot"]["memory_mb"] == 1024, "boot.memory_mb is 1024")
+check("partitions" not in doc, "iso-only artifact omits partitions")
+check("desktop" not in doc, "iso-only artifact omits desktop")
+check(doc["builder"] == {"name": "build.sh", "version": "0.1.0"}, "builder")
+PY
+  then
+    pass "iso-only artifact JSON shape and values"
+  else
+    fail "iso-only artifact JSON shape and values"
+  fi
+else
+  if jq -e '
+      .apiVersion == "sysemble/artifact/v1" and
+      .spec == "minimal-debian-live" and
+      .arch == "x86_64" and
+      .packages == ["apt","ca-certificates","systemd"] and
+      .rootfs.path == "rootfs" and
+      (.images | length == 1) and
+      .images[0].path == "live.iso" and
+      .images[0].format == "iso" and
+      (.images[0].sha256 | test("^[0-9a-f]{64}$")) and
+      .images[0].size_mb == 1 and
+      (has("partitions") | not) and
+      (has("desktop") | not) and
+      .boot == {"mode":"iso","iso":"live.iso","cmdline":"boot=live live-media-path=/live console=ttyS0 systemd.unit=multi-user.target systemd.journald.forward_to_console=1","memory_mb":1024}
+    ' "$ISO_JSON" >/dev/null 2>&1; then
+    pass "iso-only artifact JSON shape and values (jq)"
+  else
+    fail "iso-only artifact JSON shape and values (jq)"
+  fi
+fi
+
+ISO_DM_JSON="$TMP_DIR/artifact-iso-desktop.json"
+if artifact_iso_json "$ISO_OUT" "debian-live-xfce" "trixie" "2026-11-01" \
+  "x86_64" "$CREATED_AT" 0 apt ca-certificates lightdm xfce4 >"$ISO_DM_JSON"; then
+  pass "artifact_iso_json exits 0 for a DM live plan"
+else
+  fail "artifact_iso_json failed for a DM live plan"
+fi
+if [ "$json_backend" = "python3" ]; then
+  if python3 - "$ISO_DM_JSON" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    doc = json.load(fh)
+if doc.get("desktop") != {"session": "xfce", "display_manager": "lightdm"}:
+    sys.exit("desktop inference changed for ISO")
+if doc["boot"].get("graphical") is not True:
+    sys.exit("ISO DM boot.graphical must be true")
+if doc["boot"].get("memory_mb") != 2048:
+    sys.exit("ISO DM memory_mb must be 2048")
+if not doc["boot"]["cmdline"].endswith("systemd.unit=graphical.target systemd.journald.forward_to_console=1"):
+    sys.exit("ISO DM cmdline must target graphical.target")
+if "partitions" in doc:
+    sys.exit("iso-only DM artifact must omit partitions")
+PY
+  then
+    pass "iso-only DM artifact keeps desktop/graphical/2048 and no partitions"
+  else
+    fail "iso-only DM artifact changed the desktop contract"
+  fi
+else
+  if jq -e '
+      .desktop == {"session":"xfce","display_manager":"lightdm"} and
+      .boot.graphical == true and
+      .boot.memory_mb == 2048 and
+      (.boot.cmdline | endswith("systemd.unit=graphical.target systemd.journald.forward_to_console=1")) and
+      (has("partitions") | not)
+    ' "$ISO_DM_JSON" >/dev/null 2>&1; then
+    pass "iso-only DM artifact keeps desktop/graphical/2048 and no partitions (jq)"
+  else
+    fail "iso-only DM artifact changed the desktop contract (jq)"
+  fi
+fi
+
+BOTH_OUT="$TMP_DIR/iso-disk-out"
+mkdir -p "$BOTH_OUT/rootfs"
+cp "$ISO_ROOTFS/boot/$KERNEL_NAME" "$BOTH_OUT/rootfs/kernel"
+printf 'fake iso\n' >"$BOTH_OUT/live.iso"
+truncate -s 1024M "$BOTH_OUT/disk.img"
+printf 'fake qcow2\n' >"$BOTH_OUT/disk.qcow2"
+BOTH_JSON="$TMP_DIR/artifact-iso-disk.json"
+if artifact_iso_json "$BOTH_OUT" "debian-minimal-both" "trixie" "" \
+  "x86_64" "$CREATED_AT" 1 "${PACKAGES[@]}" >"$BOTH_JSON"; then
+  pass "artifact_iso_json exits 0 for an iso+disk build"
+else
+  fail "artifact_iso_json failed for an iso+disk build"
+fi
+if [ "$json_backend" = "python3" ]; then
+  if python3 - "$BOTH_JSON" <<'PY'
+import json
+import os
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    doc = json.load(fh)
+if doc["boot"]["mode"] != "iso" or doc["boot"]["iso"] != "live.iso":
+    sys.exit("iso+disk boot mode must stay iso")
+images = {image["format"]: image for image in doc["images"]}
+if set(images) != {"iso", "raw", "qcow2"}:
+    sys.exit("iso+disk images must include iso/raw/qcow2")
+if doc["partitions"] != [
+    {"index": 1, "role": "esp", "size_mb": 512, "fs": "vfat32"},
+    {"index": 2, "role": "root", "size_mb": 512, "fs": "ext4"},
+]:
+    sys.exit("iso+disk partitions are wrong")
+if doc["base"]["pin"] is not None:
+    sys.exit("missing pin must be null")
+if not os.path.isfile(os.path.join(os.path.dirname(sys.argv[1]), "iso-disk-out", "live.iso")):
+    sys.exit("live.iso fixture missing")
+PY
+  then
+    pass "iso+disk artifact keeps ISO boot mode, all images, and partitions"
+  else
+    fail "iso+disk artifact shape is wrong"
+  fi
+else
+  if jq -e '
+      .boot.mode == "iso" and .boot.iso == "live.iso" and
+      ([.images[].format] | sort == ["iso","qcow2","raw"]) and
+      .partitions == [
+        {"index":1,"role":"esp","size_mb":512,"fs":"vfat32"},
+        {"index":2,"role":"root","size_mb":512,"fs":"ext4"}
+      ]
+    ' "$BOTH_JSON" >/dev/null 2>&1; then
+    pass "iso+disk artifact keeps ISO boot mode and partitions (jq)"
+  else
+    fail "iso+disk artifact shape is wrong (jq)"
+  fi
+fi
+
+# artifact_iso_json must fail without live.iso / rootfs.
+if artifact_iso_json "$TMP_DIR/no-such" "spec" "trixie" "" "x86_64" "$CREATED_AT" 0 \
+  "${PACKAGES[@]}" >/dev/null 2>&1; then
+  fail "artifact_iso_json must fail without rootfs"
+else
+  pass "artifact_iso_json fails without rootfs"
+fi
+if artifact_iso_json "$ISO_OUT" "spec" "trixie" "" "x86_64" "$CREATED_AT" 2 \
+  "${PACKAGES[@]}" >/dev/null 2>&1; then
+  fail "artifact_iso_json must reject include_disk other than 0/1"
+else
+  pass "artifact_iso_json rejects an invalid include_disk flag"
+fi
+
+# ---------------------------------------------------------------------------
+# P0-d2 plan output mode selection
+# ---------------------------------------------------------------------------
+
+PLAN_OUTPUTS_VALUES=(iso)
+assert_eq "iso" "$(plan_build_mode)" "outputs [iso] selects iso-only"
+PLAN_OUTPUTS_VALUES=(qcow2 iso)
+assert_eq "iso-disk" "$(plan_build_mode)" "outputs [qcow2, iso] selects iso+disk"
+PLAN_OUTPUTS_VALUES=(raw iso)
+assert_eq "iso-disk" "$(plan_build_mode)" "outputs [raw, iso] selects iso+disk"
+PLAN_OUTPUTS_VALUES=(qcow2)
+assert_eq "disk" "$(plan_build_mode)" "outputs [qcow2] keeps the disk path"
+PLAN_OUTPUTS_VALUES=()
+assert_eq "disk" "$(plan_build_mode)" "missing outputs keep the legacy disk path"
+assert_eq "live-boot live-boot-initramfs-tools" "${ISO_RUNTIME_PACKAGES[*]}" \
+  "ISO runtime packages are live-boot and live-boot-initramfs-tools"
+
+# Runtime packages are deduplicated against plan.packages and each other.
+PLAN_PACKAGES_VALUES=(apt live-boot)
+assert_eq "live-boot-initramfs-tools" "$(runtime_packages_for 1 0)" \
+  "ISO runtime packages do not duplicate live-boot from the plan"
+assert_eq "1" "$(runtime_package_count_for 1 0)" \
+  "ISO runtime count reflects the deduplicated list"
+PLAN_PACKAGES_VALUES=(apt live-boot live-boot-initramfs-tools)
+assert_eq "" "$(runtime_packages_for 1 0)" \
+  "both live packages present in the plan add no runtime packages"
+PLAN_PACKAGES_VALUES=(apt)
+assert_eq "xserver-xorg,procps,accountsservice,live-boot,live-boot-initramfs-tools" \
+  "$(runtime_packages_for 1 1)" "desktop ISO runtime list keeps desktop then live packages"
+assert_eq "5" "$(runtime_package_count_for 1 1)" "desktop ISO runtime count is 5"
+PLAN_PACKAGES_VALUES=()
 
 # ---------------------------------------------------------------------------
 # P0-d1 desktop inference (pure helpers used by build.sh and artifact_json)

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Sysemble Debian builder - shared helpers for build.sh (P0-a + P0-b + P0-c + P0-d1).
+# Sysemble Debian builder - shared helpers for build.sh
+# (P0-a + P0-b + P0-c + P0-d1 + P0-d2).
 #
 # This file is sourced by build.sh. It is written for bash 3.2 (the /bin/bash
 # shipped by macOS) and must not use bash 4 features (mapfile, nameref, ...).
@@ -12,6 +13,8 @@
 #     (P0-b kernel mode + P0-c GPT/GRUB/UEFI extensions)
 #   - P0-d1 desktop inference from plan.packages (display manager -> graphical
 #     boot, memory, cmdline, and the artifact desktop object)
+#   - P0-d2 live ISO mode selection, live GRUB rendering, runtime-package
+#     deduplication, and the boot.mode="iso" artifact helper
 #   - output helpers / usage text
 #
 # It is safe to source this file without running a build: it only defines
@@ -54,6 +57,41 @@ GRUB_EFI_REL="esp/EFI/BOOT/BOOTX64.EFI"
 GRUB_CONFIG_REL="grub.cfg"
 GRUB_MENU_TITLE="Sysemble"
 GRUB_MODULES="part_gpt part_msdos fat ext2 normal linux search search_fs_uuid configfile serial terminal echo test"
+
+# ---------------------------------------------------------------------------
+# P0-d2 live ISO layout (frozen by docs/plan/P0-d2-workplan.md §2/§3)
+#
+#   <out>/live.iso
+#   <out>/iso/live/vmlinuz
+#   <out>/iso/live/initrd.img
+#   <out>/iso/live/filesystem.squashfs
+#   <out>/iso/boot/grub/efi.img
+#
+# The EFI system image is an 8 MiB FAT filesystem holding
+# EFI/BOOT/BOOTX64.EFI (grub-mkstandalone with the embedded live grub.cfg).
+# xorriso puts it in the ISO tree at boot/grub/efi.img and registers it as the
+# El Torito EFI boot image. The ISO is UEFI-only; BIOS boot is out of scope.
+# ---------------------------------------------------------------------------
+
+ISO_ARTIFACT_NAME="live.iso"
+ISO_DIR_NAME="iso"
+ISO_LABEL="SYMBLE"
+ISO_EFI_IMG_NAME="efi.img"
+# mkfs.vfat size argument is in 1 KiB blocks: 8192 KiB = 8 MiB.
+ISO_EFI_IMG_KB=8192
+ISO_GRUB_MENU_TITLE="Sysemble Live"
+# Frozen module list. iso9660 and search_fs_file are required to locate
+# /live/vmlinuz on the ISO; part_gpt/part_msdos/fat keep the standalone binary
+# usable on other media without rebuilding it.
+ISO_GRUB_MODULES="part_gpt part_msdos fat iso9660 normal linux search search_fs_file configfile serial terminal echo test"
+ISO_BOOT_CMDLINE="boot=live live-media-path=/live console=ttyS0 systemd.unit=multi-user.target systemd.journald.forward_to_console=1"
+ISO_BOOT_CMDLINE_GRAPHICAL="boot=live live-media-path=/live console=ttyS0 systemd.unit=graphical.target systemd.journald.forward_to_console=1"
+ISO_BOOT_MEMORY_MB_DEFAULT=1024
+ISO_BOOT_MEMORY_MB_GRAPHICAL=2048
+# Builder-added runtime packages for a live ISO. mmdebstrap installs no
+# Recommends, so a plain plan does not pull them in. artifact.packages keeps
+# the plan list; these only reach mmdebstrap --include.
+ISO_RUNTIME_PACKAGES=(live-boot live-boot-initramfs-tools)
 
 # docker info is given this long before it is treated as unavailable, so the
 # script never hangs on a wedged daemon.
@@ -126,7 +164,7 @@ err() {
 # ---------------------------------------------------------------------------
 
 IFS= read -r -d '' USAGE_TEXT <<'USAGE' || true
-Sysemble Debian builder (P0-d1) - build a bootable Debian UEFI disk image from plan.json
+Sysemble Debian builder (P0-d2) - build bootable Debian disk images and live ISOs from plan.json
 
 Usage:
   builders/debian/build.sh --plan <plan.json> --out <dir> [--dry-run] [--execute] [--engine docker|native]
@@ -137,56 +175,63 @@ Options:
   --dry-run          validate the plan, print stages/packages/estimates, and
                      write only <out>/plan.copy.json
   --execute          explicit alias for the default build mode: build the
-                     rootfs, GPT disk images, and artifact.json. Mutually
-                     exclusive with --dry-run. The CI contract passes this flag.
+                     rootfs plus the outputs requested by plan.target.outputs
+                     (live ISO and/or GPT disk images) and artifact.json.
+                     Mutually exclusive with --dry-run. The CI contract passes
+                     this flag.
   --engine <name>    native (default) or docker
   -h, --help         show this help and exit 0
 
-Outputs (native --execute):
+Outputs (native --execute), selected by plan.target.outputs:
   <out>/rootfs/        mmdebstrap rootfs
+  <out>/live.iso       UEFI El Torito live ISO (when outputs contains "iso")
+  <out>/iso/           ISO tree: live/{vmlinuz,initrd.img,filesystem.squashfs},
+                       boot/grub/efi.img (kept for diagnosis)
+  <out>/esp/           ESP staging tree (EFI/BOOT/BOOTX64.EFI and, for a disk
+                       build, boot/grub/grub.cfg)
+  <out>/grub.cfg       disk GRUB config, or the live ISO config in iso-only mode
   <out>/disk.img       raw GPT image: p1 ESP (vfat32) + p2 root (ext4)
   <out>/disk.qcow2     qcow2 conversion of disk.img
-  <out>/esp/           ESP staging tree (EFI/BOOT/BOOTX64.EFI, boot/grub/grub.cfg)
-  <out>/grub.cfg       GRUB config embedded into BOOTX64.EFI
-  <out>/artifact.json  sysemble/artifact/v1 manifest (boot.mode = "uefi")
+  <out>/artifact.json  sysemble/artifact/v1 manifest (boot.mode = "iso" or "uefi")
   <out>/build.log      full build output (tee)
 
-  <out>/esp.img is a temporary FAT32 image and is removed on success.
+  Disk mode builds disk.img/disk.qcow2. ISO-only mode skips the disk pipeline
+  entirely: it runs mksquashfs, grub-mkstandalone, mkfs.vfat, mcopy and xorriso.
+  An iso+disk plan builds both. <out>/esp.img and <out>/efi.img are temporary
+  FAT images and are removed on success.
 
 Engines:
-  native   requires Linux, euid 0, and mmdebstrap, mkfs.ext4, qemu-img,
-           sgdisk, mkfs.vfat, mcopy, grub-mkstandalone, and dd on PATH;
-           builds rootfs, disk.img (GPT + ESP + GRUB EFI), disk.qcow2, and
-           artifact.json.
+  native   requires Linux, euid 0, and mmdebstrap, mkfs.vfat, mcopy, and
+           grub-mkstandalone on PATH. A disk build also requires mkfs.ext4,
+           qemu-img, sgdisk, and dd. A live ISO build also requires mksquashfs
+           and xorriso. ISO-only plans do not require the disk-only tools.
   docker   runs mmdebstrap in a debian:trixie container with <out> mounted at
            /out; requires a working Docker daemon. Docker mode still stops after
-           the rootfs: P0-c disk/artifact assembly is native-only and has not
-           been verified in docker mode, so --execute with --engine docker is
-           rejected (exit 2). --dry-run does not check the engine, so it works
-           on hosts without Linux/Docker.
+           the rootfs: disk/ISO assembly and artifact.json are native-only and
+           have not been verified in docker mode, so --execute with
+           --engine docker is rejected (exit 2). --dry-run does not check the
+           engine, so it works on hosts without Linux/Docker.
 
 Exit codes:
   0  success (dry run, or a complete native image build)
   1  invalid plan (malformed JSON or failed plan validation), or plan.spec is
      missing for a real native build (artifact.json requires it)
   2  usage or I/O error (including an unsafe --out)
-  3  native engine unavailable (not Linux, not root, or a required tool is
-     missing: mmdebstrap, mkfs.ext4, qemu-img, sgdisk, mkfs.vfat, mcopy,
-     grub-mkstandalone, dd)
+  3  native engine unavailable (not Linux, not root, or a tool required by the
+     requested outputs is missing)
   4  docker engine unavailable (no docker CLI or no daemon)
   5  no JSON parser available (install jq or python3)
   6  a build step failed, <out>/rootfs or an output image already exists, or
      the rootfs has no bootable kernel/initrd
 
-P0-d1 scope: GPT partition table, FAT32 ESP, GRUB EFI (embedded config), UEFI
-artifact extensions, and desktop inference from plan.packages. A plan whose
-packages include gdm3/sddm/lightdm boots graphical.target with 2048 MB and gains
-artifact.desktop + boot.graphical/memory_mb; the rootfs also gets xserver-xorg,
-procps, accountsservice, and an enabled sysemble-boot-evidence.service marker
-unit. A plan without a display manager keeps the frozen P0-c multi-user cmdline
-and 1024 MB. Installers, ISO/squashfs, secure boot, and cross-architecture
-builds are out of scope. An artifact without boot.mode still means the P0-b
-direct-kernel mode.
+P0-d2 scope: target.outputs containing "iso" builds a UEFI-only live ISO with
+live-boot/live-media-path; when no qcow2/raw output is requested the disk pipeline is
+skipped and the manifest omits partitions. The ISO rootfs additionally gets
+live-boot and live-boot-initramfs-tools via --include (artifact.packages keeps
+the plan package list). A plan whose packages include gdm3/sddm/lightdm still
+gets the P0-d1 desktop inference and 2048 MB. Installers/Calamares, secure boot,
+BIOS boot, persistence, and cross-architecture builds are out of scope. An
+artifact without boot.mode still means the P0-b direct-kernel mode.
 USAGE
 
 usage() {
@@ -819,6 +864,15 @@ ARTIFACT_BOOT_CMDLINE_UEFI="root=/dev/vda2 rw console=ttyS0 rootfstype=ext4 syst
 ARTIFACT_BOOT_CMDLINE_UEFI_GRAPHICAL="root=/dev/vda2 rw console=ttyS0 rootfstype=ext4 systemd.unit=graphical.target systemd.journald.forward_to_console=1"
 ARTIFACT_BOOT_MEMORY_MB_DEFAULT=1024
 ARTIFACT_BOOT_MEMORY_MB_GRAPHICAL=2048
+# P0-d2 live ISO: boot.mode="iso", boot.iso=live.iso, images[] format "iso".
+# The live system finds its root filesystem through live-boot/live-media-path; no
+# disk/partition information is part of an ISO-only manifest.
+ARTIFACT_ISO_MODE="iso"
+ARTIFACT_ISO_IMAGE_FORMAT="iso"
+ARTIFACT_ISO_BOOT_MEMORY_MB_DEFAULT=$ISO_BOOT_MEMORY_MB_DEFAULT
+ARTIFACT_ISO_BOOT_MEMORY_MB_GRAPHICAL=$ISO_BOOT_MEMORY_MB_GRAPHICAL
+ARTIFACT_BOOT_CMDLINE_ISO=$ISO_BOOT_CMDLINE
+ARTIFACT_BOOT_CMDLINE_ISO_GRAPHICAL=$ISO_BOOT_CMDLINE_GRAPHICAL
 # A display manager without a known session package still boots graphically;
 # this is the artifact desktop.session value used in that case.
 ARTIFACT_DESKTOP_SESSION_FALLBACK="unknown"
@@ -892,6 +946,154 @@ detect_desktop_session() {
   return 0
 }
 
+# Which build stages a plan asks for (P0-d2):
+#   "iso"       target.outputs contains iso and no qcow2/raw: ISO only.
+#   "iso-disk"  target.outputs contains iso plus qcow2/raw: both are built.
+#   "disk"      no iso (the frozen P0-c/P0-d1 behavior, also the safe default
+#               when called without plan records, as the tests do).
+#
+# The plan contract allows other output names (uki/pxe); like P0-c this builder
+# treats anything without iso as the disk path. Prints one word on stdout.
+plan_build_mode() {
+  local want_iso=0
+  local want_disk=0
+
+  if [ "${#PLAN_OUTPUTS_VALUES[@]}" -gt 0 ]; then
+    if package_in_list iso "${PLAN_OUTPUTS_VALUES[@]}"; then
+      want_iso=1
+    fi
+    if package_in_list qcow2 "${PLAN_OUTPUTS_VALUES[@]}" ||
+      package_in_list raw "${PLAN_OUTPUTS_VALUES[@]}"; then
+      want_disk=1
+    fi
+  fi
+
+  if [ "$want_iso" -eq 1 ] && [ "$want_disk" -eq 1 ]; then
+    printf 'iso-disk\n'
+  elif [ "$want_iso" -eq 1 ]; then
+    printf 'iso\n'
+  else
+    printf 'disk\n'
+  fi
+}
+
+# Print the builder-added runtime package list for a plan. <iso> is 1/0 and
+# <graphical> is 1/0 (P0-d1 desktop inference). Packages already named by the
+# plan are skipped, so a plan that already names live-boot or xserver-xorg does
+# not pass duplicates to mmdebstrap. Runs in a subshell by design.
+runtime_packages_for() {
+  local iso=$1
+  local graphical=$2
+  local extras_csv=""
+  local package=""
+
+  if [ "$graphical" -eq 1 ]; then
+    for package in "${GRAPHICAL_RUNTIME_PACKAGES[@]}"; do
+      if ! package_in_list "$package" "${PLAN_PACKAGES_VALUES[@]}"; then
+        case ",$extras_csv," in
+          *",$package,"*) ;;
+          *)
+            if [ -z "$extras_csv" ]; then
+              extras_csv=$package
+            else
+              extras_csv="$extras_csv,$package"
+            fi
+            ;;
+        esac
+      fi
+    done
+  fi
+  if [ "$iso" -eq 1 ]; then
+    for package in "${ISO_RUNTIME_PACKAGES[@]}"; do
+      if ! package_in_list "$package" "${PLAN_PACKAGES_VALUES[@]}"; then
+        case ",$extras_csv," in
+          *",$package,"*) ;;
+          *)
+            if [ -z "$extras_csv" ]; then
+              extras_csv=$package
+            else
+              extras_csv="$extras_csv,$package"
+            fi
+            ;;
+        esac
+      fi
+    done
+  fi
+
+  if [ -n "$extras_csv" ]; then
+    printf '%s\n' "$extras_csv"
+  fi
+}
+
+# Print the builder-added runtime package count for a plan (see
+# runtime_packages_for); used in build.log and the dry run.
+runtime_package_count_for() {
+  local iso=$1
+  local graphical=$2
+  local csv=""
+
+  csv=$(runtime_packages_for "$iso" "$graphical")
+  if [ -z "$csv" ]; then
+    printf '0\n'
+    return 0
+  fi
+  printf '%s\n' "$(printf '%s' "$csv" | awk -F, '{print NF}')"
+}
+
+# Emit the P0-d2 live ISO GRUB configuration on stdout. <kernel_name> and
+# <initrd_name> are the versioned basenames found in rootfs/boot; the ISO tree
+# stores them as /live/vmlinuz and /live/initrd.img (P0-d2 workplan §2/§3), so
+# the source versions are recorded as comments for diagnosis while the frozen
+# boot lines use the stable live paths. The optional third argument is the
+# P0-d1 desktop flag (1 = graphical.target).
+iso_grub_cfg_text() {
+  local kernel_name=$1
+  local initrd_name=$2
+  local graphical=${3:-0}
+  local cmdline=$ISO_BOOT_CMDLINE
+
+  case "$graphical" in
+    0) ;;
+    1) cmdline=$ISO_BOOT_CMDLINE_GRAPHICAL ;;
+    *)
+      err "iso_grub_cfg_text: graphical flag must be 0 or 1 (got '$graphical')"
+      return 2
+      ;;
+  esac
+
+  case "$kernel_name" in
+    '')
+      err "iso_grub_cfg_text: kernel name is empty"
+      return 2
+      ;;
+    */*)
+      err "iso_grub_cfg_text: kernel name must be a basename (got '$kernel_name')"
+      return 2
+      ;;
+  esac
+  case "$initrd_name" in
+    '')
+      err "iso_grub_cfg_text: initrd name is empty"
+      return 2
+      ;;
+    */*)
+      err "iso_grub_cfg_text: initrd name must be a basename (got '$initrd_name')"
+      return 2
+      ;;
+  esac
+
+  printf '# P0-d2 live ISO: source kernel=%s initrd=%s\n' "$kernel_name" "$initrd_name"
+  printf 'set timeout=3\n'
+  printf 'serial --unit=0 --speed=115200\n'
+  printf 'terminal_input serial\n'
+  printf 'terminal_output serial\n'
+  printf 'menuentry "%s" {\n' "$ISO_GRUB_MENU_TITLE"
+  printf '  search --no-floppy --file --set=root /live/vmlinuz\n'
+  printf '  linux /live/vmlinuz %s\n' "$cmdline"
+  printf '  initrd /live/initrd.img\n'
+  printf '}\n'
+}
+
 # Packages the builder adds to a graphical build beyond plan.packages:
 #   xserver-xorg   xfce4/lightdm only *Recommend* the X server and mmdebstrap
 #                  installs no Recommends, so Xorg would otherwise be absent;
@@ -899,7 +1101,8 @@ detect_desktop_session() {
 #                  is Priority:important, so --variant=minbase omits it;
 #   accountsservice provides org.freedesktop.Accounts, which LightDM uses for
 #                  the greeter user list (only a Suggests in lightdm).
-# No-DM builds keep the frozen P0-c package list unchanged.
+# No-DM disk builds keep the frozen P0-c package list unchanged; ISO builds
+# separately add ISO_RUNTIME_PACKAGES.
 GRAPHICAL_RUNTIME_PACKAGES=(xserver-xorg procps accountsservice)
 
 # Debian process name for an artifact display_manager value. gdm3 is the
@@ -1367,6 +1570,188 @@ artifact_json() {
   return 0
 }
 
+# Emit a P0-d2 sysemble/artifact/v1 manifest for a live ISO build on stdout.
+#
+# Usage:
+#   artifact_iso_json <out_dir> <spec> <release> <pin> <arch> <created_at> \
+#                     <include_disk 0|1> [package ...]
+#
+# <out_dir> must contain rootfs/ and live.iso. When <include_disk> is 1 the
+# out dir must also contain disk.img and disk.qcow2 (an iso+disk plan); the
+# manifest then records those images and the P0-c partitions as well. The boot
+# object is always mode="iso" (the ISO carries its own kernel, initrd, and
+# grub.cfg), and a package list naming a display manager selects the P0-d1
+# graphical cmdline + desktop object + 2048 MB, exactly like the UEFI manifest.
+# The function never writes files; build.sh writes its stdout atomically to
+# <out>/artifact.json.
+artifact_iso_json() {
+  local out=""
+  local spec=""
+  local release=""
+  local pin=""
+  local arch=""
+  local created_at=""
+  local include_disk=""
+  local rootfs=""
+  local iso=""
+  local raw=""
+  local qcow=""
+  local desktop_dm=""
+  local desktop_session=""
+  local graphical=0
+  local graphical_json="false"
+  local memory_mb=$ARTIFACT_ISO_BOOT_MEMORY_MB_DEFAULT
+  local cmdline=$ARTIFACT_BOOT_CMDLINE_ISO
+  local root_part_mb=""
+  local rootfs_mb=""
+  local raw_mb=""
+  local qcow_mb=""
+  local iso_mb=""
+  local raw_sha=""
+  local qcow_sha=""
+  local iso_sha=""
+  local pin_json="null"
+  local sep=""
+
+  if [ "$#" -lt 7 ]; then
+    err "artifact_iso_json: expected at least 7 arguments"
+    return 2
+  fi
+  out=$1
+  spec=$2
+  release=$3
+  pin=$4
+  arch=$5
+  created_at=$6
+  include_disk=$7
+  shift 7
+
+  case "$include_disk" in
+    0 | 1) ;;
+    *)
+      err "artifact_iso_json: include_disk must be 0 or 1 (got '$include_disk')"
+      return 2
+      ;;
+  esac
+
+  rootfs="$out/rootfs"
+  iso="$out/$ISO_ARTIFACT_NAME"
+  raw="$out/disk.img"
+  qcow="$out/disk.qcow2"
+
+  if [ ! -d "$rootfs" ]; then
+    err "artifact: rootfs directory is missing: $rootfs"
+    return 1
+  fi
+  if [ ! -f "$iso" ]; then
+    err "artifact: live ISO is missing: $iso"
+    return 1
+  fi
+  if [ ! -s "$iso" ]; then
+    err "artifact: live ISO is empty: $iso"
+    return 1
+  fi
+
+  rootfs_mb=$(rootfs_size_mb "$rootfs") || return 1
+  iso_mb=$(file_size_mb "$iso") || return 1
+  iso_sha=$(sha256_file "$iso") || return 1
+
+  if [ "$include_disk" -eq 1 ]; then
+    if [ ! -f "$raw" ]; then
+      err "artifact: raw disk image is missing: $raw"
+      return 1
+    fi
+    if [ ! -f "$qcow" ]; then
+      err "artifact: qcow2 image is missing: $qcow"
+      return 1
+    fi
+    raw_mb=$(file_size_mb "$raw") || return 1
+    qcow_mb=$(file_size_mb "$qcow") || return 1
+    raw_sha=$(sha256_file "$raw") || return 1
+    qcow_sha=$(sha256_file "$qcow") || return 1
+    if [ "$raw_mb" -le "$ESP_SIZE_MB" ]; then
+      err "artifact: raw image is too small for a ${ESP_SIZE_MB} MB ESP (got ${raw_mb} MB)"
+      return 1
+    fi
+    root_part_mb=$((raw_mb - ESP_SIZE_MB))
+  fi
+
+  # P0-d1 desktop inference is reused unchanged. Only a display manager turns
+  # on graphical boot; a session package alone does not.
+  if desktop_dm=$(detect_display_manager "$@"); then
+    desktop_session=$(detect_desktop_session "$@")
+    graphical=1
+    graphical_json="true"
+    memory_mb=$ARTIFACT_ISO_BOOT_MEMORY_MB_GRAPHICAL
+    cmdline=$ARTIFACT_BOOT_CMDLINE_ISO_GRAPHICAL
+  else
+    desktop_dm=""
+    desktop_session=""
+    graphical=0
+    graphical_json="false"
+    memory_mb=$ARTIFACT_ISO_BOOT_MEMORY_MB_DEFAULT
+    cmdline=$ARTIFACT_BOOT_CMDLINE_ISO
+  fi
+
+  if [ -n "$pin" ]; then
+    pin_json=$(json_quote "$pin")
+  fi
+
+  printf '{\n'
+  printf '  "apiVersion": %s,\n' "$(json_quote "$ARTIFACT_API_VERSION")"
+  printf '  "createdAt": %s,\n' "$(json_quote "$created_at")"
+  printf '  "spec": %s,\n' "$(json_quote "$spec")"
+  printf '  "base": {"kind": "debian", "release": %s, "pin": %s},\n' \
+    "$(json_quote "$release")" "$pin_json"
+  printf '  "arch": %s,\n' "$(json_quote "$arch")"
+  printf '  "packages": ['
+  for pkg in "$@"; do
+    printf '%s%s' "$sep" "$(json_quote "$pkg")"
+    sep=", "
+  done
+  printf '],\n'
+  printf '  "rootfs": {"path": "rootfs", "size_mb": %s},\n' "$rootfs_mb"
+  printf '  "images": [\n'
+  printf '    {"path": %s, "format": %s, "size_mb": %s, "sha256": %s}' \
+    "$(json_quote "$ISO_ARTIFACT_NAME")" "$(json_quote "$ARTIFACT_ISO_IMAGE_FORMAT")" \
+    "$iso_mb" "$(json_quote "$iso_sha")"
+  if [ "$include_disk" -eq 1 ]; then
+    printf ',\n'
+    printf '    {"path": "disk.img", "format": "raw", "size_mb": %s, "sha256": %s},\n' \
+      "$raw_mb" "$(json_quote "$raw_sha")"
+    printf '    {"path": "disk.qcow2", "format": "qcow2", "size_mb": %s, "sha256": %s}\n' \
+      "$qcow_mb" "$(json_quote "$qcow_sha")"
+  else
+    printf '\n'
+  fi
+  printf '  ],\n'
+  if [ "$graphical" -eq 1 ]; then
+    printf '  "desktop": {"session": %s, "display_manager": %s},\n' \
+      "$(json_quote "$desktop_session")" "$(json_quote "$desktop_dm")"
+  fi
+  printf '  "boot": {\n'
+  printf '    "mode": "iso",\n'
+  printf '    "iso": %s,\n' "$(json_quote "$ISO_ARTIFACT_NAME")"
+  if [ "$graphical" -eq 1 ]; then
+    printf '    "graphical": true,\n'
+  fi
+  printf '    "cmdline": %s,\n' "$(json_quote "$cmdline")"
+  printf '    "memory_mb": %s\n' "$memory_mb"
+  printf '  },\n'
+  if [ "$include_disk" -eq 1 ]; then
+    printf '  "partitions": [\n'
+    printf '    {"index": 1, "role": "esp", "size_mb": %s, "fs": "vfat32"},\n' \
+      "$ESP_SIZE_MB"
+    printf '    {"index": 2, "role": "root", "size_mb": %s, "fs": "ext4"}\n' \
+      "$root_part_mb"
+    printf '  ],\n'
+  fi
+  printf '  "builder": {"name": %s, "version": %s}\n' \
+    "$(json_quote "$ARTIFACT_BUILDER_NAME")" "$(json_quote "$ARTIFACT_BUILDER_VERSION")"
+  printf '}\n'
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 # Engine preflight
 # ---------------------------------------------------------------------------
@@ -1375,6 +1760,26 @@ native_preflight() {
   local failed=0
   local host_os=""
   local euid=""
+  local mode=""
+  local want_iso=0
+  local want_disk=0
+
+  # P0-d2: only require the toolchain the plan actually uses. An ISO-only plan
+  # never runs sgdisk/mkfs.ext4/qemu-img/dd; it needs squashfs-tools + xorriso
+  # in addition to the shared mkfs.vfat/mcopy/grub-mkstandalone set.
+  mode=$(plan_build_mode)
+  case "$mode" in
+    iso)
+      want_iso=1
+      ;;
+    iso-disk)
+      want_iso=1
+      want_disk=1
+      ;;
+    *)
+      want_disk=1
+      ;;
+  esac
 
   host_os=$(uname -s 2>/dev/null || true)
   [ -n "$host_os" ] || host_os="unknown"
@@ -1395,30 +1800,14 @@ native_preflight() {
     failed=1
   fi
 
-  if ! command -v mkfs.ext4 >/dev/null 2>&1; then
-    err "native engine requires 'mkfs.ext4' on PATH (e2fsprogs); it was not found"
-    failed=1
-  fi
-
-  if ! command -v qemu-img >/dev/null 2>&1; then
-    err "native engine requires 'qemu-img' on PATH (qemu-utils); it was not found"
-    failed=1
-  fi
-
-  # P0-c1 GPT + GRUB/UEFI toolchain. Every missing tool is reported, then the
-  # caller exits 3.
-  if ! command -v sgdisk >/dev/null 2>&1; then
-    err "native engine requires 'sgdisk' on PATH (gdisk) to write the GPT partition table; it was not found"
-    failed=1
-  fi
-
+  # Shared UEFI boot-image toolchain (disk ESP and live efi.img).
   if ! command -v mkfs.vfat >/dev/null 2>&1; then
-    err "native engine requires 'mkfs.vfat' on PATH (dosfstools) to create the FAT32 ESP; it was not found"
+    err "native engine requires 'mkfs.vfat' on PATH (dosfstools) to create the FAT ESP/efi.img; it was not found"
     failed=1
   fi
 
   if ! command -v mcopy >/dev/null 2>&1; then
-    err "native engine requires 'mcopy' on PATH (mtools) to populate the ESP; it was not found"
+    err "native engine requires 'mcopy' on PATH (mtools) to populate the ESP/efi.img; it was not found"
     failed=1
   fi
 
@@ -1427,9 +1816,39 @@ native_preflight() {
     failed=1
   fi
 
-  if ! command -v dd >/dev/null 2>&1; then
-    err "native engine requires 'dd' on PATH (coreutils) to merge the ESP into disk.img; it was not found"
-    failed=1
+  if [ "$want_iso" -eq 1 ]; then
+    if ! command -v mksquashfs >/dev/null 2>&1; then
+      err "native engine requires 'mksquashfs' on PATH (squashfs-tools) to build live/filesystem.squashfs; it was not found"
+      failed=1
+    fi
+    if ! command -v xorriso >/dev/null 2>&1; then
+      err "native engine requires 'xorriso' on PATH (xorriso) to build the UEFI El Torito ISO; it was not found"
+      failed=1
+    fi
+  fi
+
+  if [ "$want_disk" -eq 1 ]; then
+    if ! command -v mkfs.ext4 >/dev/null 2>&1; then
+      err "native engine requires 'mkfs.ext4' on PATH (e2fsprogs); it was not found"
+      failed=1
+    fi
+
+    if ! command -v qemu-img >/dev/null 2>&1; then
+      err "native engine requires 'qemu-img' on PATH (qemu-utils); it was not found"
+      failed=1
+    fi
+
+    # P0-c1 GPT + GRUB/UEFI toolchain. Every missing tool is reported, then the
+    # caller exits 3.
+    if ! command -v sgdisk >/dev/null 2>&1; then
+      err "native engine requires 'sgdisk' on PATH (gdisk) to write the GPT partition table; it was not found"
+      failed=1
+    fi
+
+    if ! command -v dd >/dev/null 2>&1; then
+      err "native engine requires 'dd' on PATH (coreutils) to merge the ESP into disk.img; it was not found"
+      failed=1
+    fi
   fi
 
   return "$failed"

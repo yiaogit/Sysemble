@@ -1,20 +1,27 @@
 #!/usr/bin/env bash
 # Sysemble Debian builder (P0-a + P0-b native build path + P0-c1 GPT/GRUB/UEFI
-# + P0-d1 desktop boot).
+# + P0-d1 desktop boot + P0-d2 live ISO).
 #
 # Reads a plan.json produced by `sysemble plan --json` and bootstraps a Debian
 # rootfs with mmdebstrap, either natively (Linux/root) or inside a
 # debian:trixie Docker container. In native mode without --dry-run (or with
-# --execute) it then:
-#   - creates a GPT disk image (p1 ESP vfat32, p2 root ext4) loop-free,
-#   - writes a FAT32 ESP in esp.img, installs GRUB EFI with an embedded
-#     grub.cfg, copies the ESP tree with mcopy, and merges it with dd,
-#   - converts disk.img to qcow2 with qemu-img, and writes artifact.json.
+# --execute) it then builds the outputs requested by plan.target.outputs:
+#   - iso-only: mksquashfs rootfs -> iso/live/filesystem.squashfs, copies the
+#     highest kernel/initrd to iso/live/, builds an 8 MiB FAT efi.img with
+#     grub-mkstandalone (embedded live grub.cfg) + mcopy, and packs a UEFI
+#     El Torito ISO with xorriso. No disk/partition/GRUB-disk work is done.
+#   - iso + qcow2/raw: both the ISO and the P0-c/d1 GPT/UEFI disk image.
+#   - qcow2/raw only: the frozen P0-c/d1 disk pipeline.
 #
 # P0-d1: when plan.packages names a display manager (gdm3/sddm/lightdm) the
 # kernel cmdline targets graphical.target (plus journald console forwarding),
 # the artifact records the inferred desktop and memory_mb=2048; otherwise the
-# frozen P0-c multi-user cmdline and memory_mb=1024 are kept.
+# frozen multi-user cmdline and memory_mb=1024 are kept.
+#
+# P0-d2: a live ISO build adds live-boot and live-boot-initramfs-tools to
+# --include (deduplicated; artifact.packages keeps the plan list) and records
+# boot.mode="iso" / boot.iso="live.iso" in artifact.json. An ISO-only manifest
+# omits partitions.
 #
 # Contract (frozen):
 #   build.sh --plan <plan.json> --out <dir> [--dry-run] [--execute] [--engine docker|native]
@@ -45,6 +52,8 @@ EXECUTE=0
 ENGINE="native"
 BUILD_LOG=""
 OUTPUTS_OWNED=0
+DISK_OUTPUTS_OWNED=0
+ISO_OUTPUTS_OWNED=0
 
 # ---------------------------------------------------------------------------
 # Arguments
@@ -302,10 +311,20 @@ build_exit_trap() {
   local rc=$1
 
   if [ "$rc" -ne 0 ] && [ "$OUTPUTS_OWNED" -eq 1 ]; then
-    # P0-c: disk.img is deliberately kept for diagnosis (it may hold a valid
-    # GPT/ext4 even when a later GRUB/mcopy/dd/qemu-img step failed).
-    rm -f "$OUT_ABS/esp.img" "$OUT_ABS/disk.qcow2" \
-      "$OUT_ABS/.artifact.json.tmp" "$OUT_ABS/.grub.cfg.tmp" 2>/dev/null || true
+    # P0-c/P0-d2: disk.img and the iso/ tree are deliberately kept for
+    # diagnosis (they may hold a valid GPT/ext4 or a complete squashfs even
+    # when a later GRUB/mcopy/dd/qemu-img/xorriso step failed). Half-written
+    # final images and temporary FAT files that belong to this build's mode
+    # are removed; unrelated pre-existing outputs are left alone.
+    if [ "$DISK_OUTPUTS_OWNED" -eq 1 ]; then
+      rm -f "$OUT_ABS/esp.img" "$OUT_ABS/disk.qcow2" \
+        "$OUT_ABS/.grub.cfg.tmp" 2>/dev/null || true
+    fi
+    if [ "$ISO_OUTPUTS_OWNED" -eq 1 ]; then
+      rm -f "$OUT_ABS/efi.img" "$OUT_ABS/live.iso" \
+        "$OUT_ABS/.iso-grub.cfg.tmp" 2>/dev/null || true
+    fi
+    rm -f "$OUT_ABS/.artifact.json.tmp" 2>/dev/null || true
   fi
   cleanup_tmp
 }
@@ -349,22 +368,38 @@ make_boot_evidence_hook_fragment() {
   printf 'chroot "$1" systemctl enable sysemble-boot-evidence.service >/dev/null 2>&1 || true\n'
 }
 
+# P0-d2: after all packages are configured, regenerate the initramfs so the
+# live-boot hook installed by live-boot-initramfs-tools is definitely part of
+# initrd.img. Debian postinst triggers normally do this already, but an
+# explicit update removes that ordering dependency. mmdebstrap runs the hook
+# on the host with the rootfs as $1, so the command runs inside the chroot and
+# a failure fails the build (exit 6) instead of producing a non-live initrd.
+make_iso_initramfs_hook_fragment() {
+  printf '; printf "mmdebstrap customize hook: update-initramfs for live-boot\\n"; chroot "$1" update-initramfs -u -k all'
+}
+
 # Shell command passed to mmdebstrap --customize-hook. mmdebstrap runs the hook
 # on the host with the rootfs directory as $1. systemctl enable is executed
 # inside a chroot; failure is non-fatal and produces a warning in build.log
 # (P0-b workplan risk 2). A desktop plan also installs and enables the P0-d1
-# boot evidence oneshot.
+# boot evidence oneshot; an ISO plan regenerates the initramfs for live-boot.
 make_customize_hook() {
   local host=$1
   local display_manager=${2:-}
+  local iso=${3:-0}
   local evidence=""
+  local initramfs=""
 
   if [ -n "$display_manager" ]; then
     evidence=$(make_boot_evidence_hook_fragment "$display_manager") || return 1
   fi
+  if [ "$iso" -eq 1 ]; then
+    initramfs=$(make_iso_initramfs_hook_fragment) || return 1
+  fi
 
-  printf '%s' "printf '%s\\n' '$host' > \"\$1/etc/hostname\"; if chroot \"\$1\" systemctl enable serial-getty@ttyS0.service >/dev/null 2>&1; then :; else printf 'mmdebstrap customize hook: warning: could not enable serial-getty@ttyS0.service (non-fatal)\\n' >&2; fi${evidence}"
+  printf '%s' "printf '%s\\n' '$host' > \"\$1/etc/hostname\"; if chroot \"\$1\" systemctl enable serial-getty@ttyS0.service >/dev/null 2>&1; then :; else printf 'mmdebstrap customize hook: warning: could not enable serial-getty@ttyS0.service (non-fatal)\\n' >&2; fi${evidence}${initramfs}"
 }
+
 
 # ---------------------------------------------------------------------------
 # Dry run
@@ -413,11 +448,35 @@ do_dry_run() {
 
   local spec_text=""
   local pin_text=""
+  local mode=""
+  local iso=0
+  local disk=0
+  local desktop=""
+  local desktop_on=0
+  local runtime_csv=""
+  local runtime_count=0
+
+  mode=$(plan_build_mode)
+  case "$mode" in
+    iso) iso=1 ;;
+    iso-disk) iso=1; disk=1 ;;
+    *) disk=1 ;;
+  esac
+  if desktop=$(detect_display_manager "${PLAN_PACKAGES_VALUES[@]}"); then
+    desktop_on=1
+  else
+    desktop=""
+    desktop_on=0
+  fi
+  if [ "$iso" -eq 1 ]; then
+    runtime_csv=$(runtime_packages_for 1 "$desktop_on")
+    runtime_count=$(runtime_package_count_for 1 "$desktop_on")
+  fi
 
   spec_text=$(display_field "$PLAN_SPEC_TYPE" "$PLAN_SPEC_VALUE" "(not set)")
   pin_text=$(display_field "$PLAN_BASE_PIN_TYPE" "$PLAN_BASE_PIN_VALUE" "unpinned")
 
-  printf 'Sysemble Debian builder - dry run (P0-a)\n'
+  printf 'Sysemble Debian builder - dry run (P0-d2)\n'
   printf '  plan:       %s\n' "$PLAN"
   printf '  out:        %s\n' "$OUT_ABS"
   printf '  engine:     %s (not checked in dry-run)\n' "$ENGINE"
@@ -427,16 +486,33 @@ do_dry_run() {
     "$PLAN_BASE_KIND_VALUE" "$PLAN_BASE_RELEASE_VALUE" "$pin_text"
   printf '  arch:       %s\n' "$PLAN_TARGET_ARCH_VALUE"
   printf '  outputs:    %s\n' "$OUTPUTS_TEXT"
+  printf '  build mode: %s\n' "$mode"
 
   printf '\nStages (planned):\n'
   printf '  [1/6] validate          plan structure is valid\n'
   printf '  [2/6] fetch base        %s/%s\n' "$PLAN_BASE_KIND_VALUE" "$PLAN_BASE_RELEASE_VALUE"
   printf '  [3/6] bootstrap rootfs  mmdebstrap --variant=minbase\n'
+  # Keep this line byte-compatible with the P0-a acceptance check even when
+  # the plan also asks for an ISO; the builder-added runtime packages are
+  # listed separately below.
   printf '  [4/6] install packages  %d packages via --include\n' "$PKG_COUNT"
   printf '  [5/6] configure         not implemented in P0-a\n'
-  printf '  [6/6] assemble image    not implemented in P0-a (requested: %s)\n' "$OUTPUTS_TEXT"
+  if [ "$iso" -eq 1 ] && [ "$disk" -eq 0 ]; then
+    printf '  [6/6] assemble image    live ISO: mksquashfs + grub-mkstandalone + xorriso (requested: %s)\n' "$OUTPUTS_TEXT"
+  elif [ "$iso" -eq 1 ]; then
+    printf '  [6/6] assemble image    live ISO + GPT disk image (requested: %s)\n' "$OUTPUTS_TEXT"
+  else
+    printf '  [6/6] assemble image    not implemented in P0-a (requested: %s)\n' "$OUTPUTS_TEXT"
+  fi
 
   print_packages
+  if [ "$iso" -eq 1 ]; then
+    if [ -n "$runtime_csv" ]; then
+      printf 'Runtime packages (builder-added, deduplicated): %s\n' "$runtime_csv"
+    else
+      printf 'Runtime packages (builder-added, deduplicated): (none)\n'
+    fi
+  fi
 
   printf '\nEstimates (from plan.estimates):\n'
   print_estimate "image_mb" "$PLAN_EST_IMAGE_MB_TYPE" "$PLAN_EST_IMAGE_MB_VALUE" "MB"
@@ -449,6 +525,15 @@ do_dry_run() {
   if [ "$ENGINE" = "native" ]; then
     printf '  mmdebstrap --variant=minbase --include=<%d packages> %s %s/rootfs\n' \
       "$PKG_COUNT" "$PLAN_BASE_RELEASE_VALUE" "$OUT_ABS"
+    if [ "$iso" -eq 1 ]; then
+      printf '  mksquashfs %s/rootfs %s/iso/live/filesystem.squashfs -comp zstd -noappend\n' \
+        "$OUT_ABS" "$OUT_ABS"
+      printf '  grub-mkstandalone -O x86_64-efi -o %s/esp/EFI/BOOT/BOOTX64.EFI --modules=<live> ...\n' "$OUT_ABS"
+      printf '  mkfs.vfat -C -n EFI %s/efi.img 8192 && mcopy -i %s/efi.img -s %s/esp/EFI ::/\n' \
+        "$OUT_ABS" "$OUT_ABS" "$OUT_ABS"
+      printf '  xorriso -as mkisofs -R -J -joliet-long -V SYMBLE -o %s/live.iso ... %s/iso\n' \
+        "$OUT_ABS" "$OUT_ABS"
+    fi
   else
     printf '  docker run --rm --privileged -v %s:/out debian:trixie \\\n' "$OUT_ABS"
     printf '    bash -c '"'"'apt-get update && apt-get install -y mmdebstrap && mmdebstrap ...'"'"'\n'
@@ -482,9 +567,126 @@ finish_rootfs_only() {
   local rootfs=$1
 
   info "[build] stage 5/6: configure - not implemented in P0-a (skipped)"
-  info "[build] stage 6/6: assemble GPT/GRUB/UEFI image - not supported by the docker engine (skipped)"
-  warn "docker engine stops after the rootfs; P0-c GPT/GRUB/UEFI disk assembly is native-only and unverified for docker"
+  info "[build] stage 6/6: assemble image - not supported by the docker engine (skipped; requested: $OUTPUTS_TEXT)"
+  warn "docker engine stops after the rootfs; native disk/ISO assembly is unverified for docker"
   info "rootfs ready: $rootfs"
+}
+
+# ---------------------------------------------------------------------------
+# P0-d2 live ISO stage (frozen steps in docs/plan/P0-d2-workplan.md §3)
+# ---------------------------------------------------------------------------
+
+# Build live.iso from a complete rootfs. <kernel>/<initrd> are the versioned
+# files found under rootfs/boot; they are copied to the stable live paths
+# /live/vmlinuz and /live/initrd.img inside the ISO tree. <iso_cfg>, <iso_esp>,
+# and <iso_efi> are the GRUB config, ESP staging tree, and intermediate FAT
+# image (iso-only uses <out>/grub.cfg, <out>/esp, <out>/efi.img; an iso+disk
+# plan uses a private <out>/iso-staging tree so it cannot clobber the disk
+# build). Returns 0 on success, 6 on any failed step; the caller's EXIT trap
+# removes a half-written live.iso/efi.img and keeps rootfs/, iso/, and logs.
+build_iso_image() {
+  local rootfs=$1
+  local kernel=$2
+  local initrd=$3
+  local graphical=$4
+  local iso_cfg=$5
+  local iso_esp=$6
+  local iso_efi=$7
+  local iso_dir=$8
+  local iso_live="$iso_dir/live"
+  local iso_boot="$iso_dir/boot/grub"
+  local kernel_name=${kernel##*/}
+  local initrd_name=${initrd##*/}
+  local grub_efi="$iso_esp/EFI/BOOT/BOOTX64.EFI"
+  local iso_out="$OUT_ABS/$ISO_ARTIFACT_NAME"
+
+  blog "[build] stage 5/6: assemble live ISO - rootfs ${rootfs##*/}, kernel $kernel_name"
+  blog "[build] iso tree: $iso_dir (live/filesystem.squashfs, live/vmlinuz, live/initrd.img, boot/grub/efi.img)"
+  blog "[build] iso grub: menuentry \"$ISO_GRUB_MENU_TITLE\", search /live/vmlinuz, boot=live live-media-path=/live"
+
+  if ! mkdir -p "$iso_live" "$iso_boot" "$iso_esp/EFI/BOOT"; then
+    blog_err "cannot create the ISO staging tree under $OUT_ABS"
+    return 6
+  fi
+
+  if ! run_logged mksquashfs "$rootfs" "$iso_live/filesystem.squashfs" -comp zstd -noappend; then
+    blog_err "mksquashfs failed; rootfs/, the iso/ tree, and build.log are kept for diagnosis"
+    return 6
+  fi
+  if [ ! -s "$iso_live/filesystem.squashfs" ]; then
+    blog_err "mksquashfs reported success but filesystem.squashfs is missing or empty"
+    return 6
+  fi
+
+  if ! cp "$kernel" "$iso_live/vmlinuz"; then
+    blog_err "cannot copy the kernel to $iso_live/vmlinuz"
+    return 6
+  fi
+  if ! cp "$initrd" "$iso_live/initrd.img"; then
+    blog_err "cannot copy the initrd to $iso_live/initrd.img"
+    return 6
+  fi
+
+  if ! iso_grub_cfg_text "$kernel_name" "$initrd_name" "$graphical" \
+    >"$OUT_ABS/.iso-grub.cfg.tmp" 2>"$TMP_DIR/grub.err"; then
+    if [ -s "$TMP_DIR/grub.err" ]; then
+      cat "$TMP_DIR/grub.err" | tee -a "$BUILD_LOG" >&2
+    fi
+    rm -f "$OUT_ABS/.iso-grub.cfg.tmp" 2>/dev/null || true
+    blog_err "cannot render the live ISO grub.cfg for kernel=$kernel_name initrd=$initrd_name"
+    return 6
+  fi
+  if ! mv -f "$OUT_ABS/.iso-grub.cfg.tmp" "$iso_cfg"; then
+    blog_err "cannot write the live ISO grub.cfg: $iso_cfg"
+    return 6
+  fi
+
+  if ! run_logged grub-mkstandalone -O x86_64-efi -o "$grub_efi" \
+    --modules="$ISO_GRUB_MODULES" \
+    "boot/grub/grub.cfg=$iso_cfg"; then
+    blog_err "grub-mkstandalone failed; the iso/ tree and build.log are kept for diagnosis"
+    return 6
+  fi
+  if [ ! -s "$grub_efi" ]; then
+    blog_err "grub-mkstandalone reported success but $grub_efi is missing or empty"
+    return 6
+  fi
+
+  if ! run_logged mkfs.vfat -C -n EFI "$iso_efi" "$ISO_EFI_IMG_KB"; then
+    blog_err "mkfs.vfat failed to create the live efi.img"
+    return 6
+  fi
+  if ! run_logged mcopy -i "$iso_efi" -s "$iso_esp/EFI" "::/"; then
+    blog_err "mcopy failed to populate the live efi.img"
+    return 6
+  fi
+  if [ ! -s "$iso_efi" ]; then
+    blog_err "mkfs.vfat reported success but $iso_efi is missing"
+    return 6
+  fi
+  if ! cp "$iso_efi" "$iso_boot/efi.img"; then
+    blog_err "cannot stage the EFI boot image at $iso_boot/efi.img"
+    return 6
+  fi
+
+  if ! run_logged xorriso -as mkisofs -R -J -joliet-long -V "$ISO_LABEL" \
+    -o "$iso_out" -eltorito-alt-boot -e boot/grub/efi.img -no-emul-boot \
+    -isohybrid-gpt-basdat "$iso_dir"; then
+    blog_err "xorriso failed; the iso/ tree and build.log are kept for diagnosis"
+    return 6
+  fi
+  if [ ! -s "$iso_out" ]; then
+    blog_err "xorriso reported success but $iso_out is missing or empty"
+    return 6
+  fi
+
+  # efi.img is an intermediate copied into the ISO tree; the workplan's
+  # diagnostic tree only keeps iso/boot/grub/efi.img.
+  if ! rm -f "$iso_efi"; then
+    blog "[build] warning: could not remove the intermediate EFI image: $iso_efi"
+  fi
+  blog "[build] iso: $iso_out, live tree staged under $iso_dir"
+  return 0
 }
 
 build_native() {
@@ -496,6 +698,11 @@ build_native() {
   local grub_cfg="$OUT_ABS/grub.cfg"
   local grub_staged="$esp_dir/boot/grub/grub.cfg"
   local grub_efi="$esp_dir/EFI/BOOT/BOOTX64.EFI"
+  local iso_dir="$OUT_ABS/$ISO_DIR_NAME"
+  local iso_staging="$OUT_ABS/iso-staging"
+  local iso_efi="$OUT_ABS/$ISO_EFI_IMG_NAME"
+  local iso_cfg=""
+  local iso_esp=""
   local pkg_csv=""
   local hostname=""
   local hook=""
@@ -507,26 +714,70 @@ build_native() {
   local desktop_dm=""
   local desktop_session=""
   local include_csv=""
+  local runtime_csv=""
   local runtime_count=0
   local rootfs_mb=0
   local disk_mb=0
   local root_part_mb=0
   local root_fs_blocks=0
   local esp_bytes=0
+  local mode=""
+  local iso=0
+  local disk=0
+  local stale=0
 
-  # P0-a rule: never overwrite an existing rootfs. The disk outputs are also
-  # refused so a stale image can never be paired with a fresh rootfs.
+  # P0-d2: choose the requested stages from plan.target.outputs. An ISO-only
+  # plan must never touch sgdisk/mkfs.ext4/qemu-img/dd; a disk plan keeps the
+  # frozen P0-c/P0-d1 pipeline.
+  mode=$(plan_build_mode)
+  case "$mode" in
+    iso)
+      iso=1
+      ;;
+    iso-disk)
+      iso=1
+      disk=1
+      ;;
+    *)
+      disk=1
+      ;;
+  esac
+  if [ "$disk" -eq 1 ]; then
+    DISK_OUTPUTS_OWNED=1
+  fi
+  if [ "$iso" -eq 1 ]; then
+    ISO_OUTPUTS_OWNED=1
+  fi
+  if [ "$iso" -eq 1 ] && [ "$disk" -eq 1 ]; then
+    iso_cfg="$iso_staging/grub.cfg"
+    iso_esp="$iso_staging/esp"
+  else
+    iso_cfg="$grub_cfg"
+    iso_esp="$esp_dir"
+  fi
+
+  # P0-a rule: never overwrite an existing rootfs. Output images requested by
+  # this plan are refused too, so a stale image can never be paired with a
+  # fresh rootfs.
   if [ -e "$rootfs" ] || [ -L "$rootfs" ]; then
     blog_err "refusing to overwrite existing path: $rootfs"
     return 6
   fi
-  if [ -e "$raw" ] || [ -L "$raw" ]; then
-    blog_err "refusing to overwrite existing image: $raw"
-    return 6
+  if [ "$disk" -eq 1 ]; then
+    if [ -e "$raw" ] || [ -L "$raw" ]; then
+      blog_err "refusing to overwrite existing image: $raw"
+      return 6
+    fi
+    if [ -e "$qcow" ] || [ -L "$qcow" ]; then
+      blog_err "refusing to overwrite existing image: $qcow"
+      return 6
+    fi
   fi
-  if [ -e "$qcow" ] || [ -L "$qcow" ]; then
-    blog_err "refusing to overwrite existing image: $qcow"
-    return 6
+  if [ "$iso" -eq 1 ]; then
+    if [ -e "$OUT_ABS/$ISO_ARTIFACT_NAME" ] || [ -L "$OUT_ABS/$ISO_ARTIFACT_NAME" ]; then
+      blog_err "refusing to overwrite existing image: $OUT_ABS/$ISO_ARTIFACT_NAME"
+      return 6
+    fi
   fi
 
   pkg_csv=$(make_pkg_csv)
@@ -536,7 +787,7 @@ build_native() {
   fi
 
   # P0-d1: infer the desktop from plan.packages (the plan contract is frozen).
-  # The same pure helpers run again inside artifact_json(), so build.log,
+  # The same pure helpers run again inside the artifact helpers, so build.log,
   # grub.cfg, and artifact.json always agree.
   if desktop_dm=$(detect_display_manager "${PLAN_PACKAGES_VALUES[@]}"); then
     desktop_session=$(detect_desktop_session "${PLAN_PACKAGES_VALUES[@]}")
@@ -547,54 +798,83 @@ build_native() {
     graphical=0
   fi
 
-  # A desktop plan needs three runtime packages the plan itself does not name:
-  # the X server (only a Recommends in xfce4/lightdm), procps (pgrep for the
-  # boot evidence unit, not part of --variant=minbase), and accountsservice
-  # (LightDM's greeter user list; only a Suggests in lightdm). artifact.packages
-  # stays the plan package list; these are builder-added runtime packages.
+  # Builder-added runtime packages, deduplicated against the plan:
+  #   - desktop: xserver-xorg/procps/accountsservice (P0-d1, unchanged);
+  #   - live ISO: live-boot/live-boot-initramfs-tools (mmdebstrap installs no
+  #     Recommends, so the plan alone does not pull them in).
+  # artifact.packages stays the plan package list.
+  runtime_csv=$(runtime_packages_for "$iso" "$graphical")
+  runtime_count=$(runtime_package_count_for "$iso" "$graphical")
   include_csv=$pkg_csv
-  runtime_count=0
-  if [ "$graphical" -eq 1 ]; then
-    runtime_count=${#GRAPHICAL_RUNTIME_PACKAGES[@]}
-    include_csv="$pkg_csv,$(join_values "," "${GRAPHICAL_RUNTIME_PACKAGES[@]}")"
+  if [ -n "$runtime_csv" ]; then
+    include_csv="$pkg_csv,$runtime_csv"
   fi
 
   hostname=$(plan_hostname)
-  if ! hook=$(make_customize_hook "$hostname" "$desktop_dm"); then
+  if ! hook=$(make_customize_hook "$hostname" "$desktop_dm" "$iso"); then
     blog_err "cannot build the mmdebstrap customize hook for display_manager='$desktop_dm'"
     return 6
   fi
 
-  # esp/, esp.img, and grub.cfg are derived P0-c intermediates. They can only
-  # survive a previous interrupted/failed attempt here, because rootfs/ and the
-  # disk images above are refused when they already exist. Removing them keeps
-  # a retry from mixing a stale ESP with a fresh disk.img.
-  if [ -e "$esp_dir" ] || [ -L "$esp_dir" ] ||
-    [ -e "$esp_img" ] || [ -L "$esp_img" ] ||
-    [ -e "$grub_cfg" ] || [ -L "$grub_cfg" ]; then
+  # esp/, esp.img, grub.cfg, efi.img, and iso/ are derived staging outputs.
+  # They can only survive a previous interrupted/failed attempt here, because
+  # rootfs/ and the final images above are refused when they already exist.
+  if [ "$disk" -eq 1 ] &&
+    { [ -e "$esp_dir" ] || [ -L "$esp_dir" ] ||
+      [ -e "$esp_img" ] || [ -L "$esp_img" ] ||
+      [ -e "$grub_cfg" ] || [ -L "$grub_cfg" ]; }; then
     blog "[build] removing stale P0-c staging outputs from a previous attempt"
     if ! rm -rf "$esp_dir" "$esp_img" "$grub_cfg"; then
       blog_err "cannot remove stale staging outputs under $OUT_ABS"
       return 6
     fi
+    stale=1
+  fi
+  if [ "$iso" -eq 1 ] &&
+    { [ -e "$iso_dir" ] || [ -L "$iso_dir" ] ||
+      [ -e "$iso_efi" ] || [ -L "$iso_efi" ] ||
+      [ -e "$iso_staging" ] || [ -L "$iso_staging" ] ||
+      { [ "$disk" -eq 0 ] && { [ -e "$esp_dir" ] || [ -L "$esp_dir" ] || [ -e "$grub_cfg" ] || [ -L "$grub_cfg" ]; }; }; }; then
+    if [ "$stale" -eq 0 ]; then
+      blog "[build] removing stale live ISO staging outputs from a previous attempt"
+    fi
+    if ! rm -rf "$iso_dir" "$iso_efi" "$iso_staging" "$OUT_ABS/.iso-grub.cfg.tmp"; then
+      blog_err "cannot remove stale ISO staging outputs under $OUT_ABS"
+      return 6
+    fi
+    if [ "$disk" -eq 0 ]; then
+      if ! rm -rf "$esp_dir" "$grub_cfg"; then
+        blog_err "cannot remove stale ISO staging outputs under $OUT_ABS"
+        return 6
+      fi
+    fi
   fi
   rm -f "$OUT_ABS/.grub.cfg.tmp" "$OUT_ABS/.artifact.json.tmp" 2>/dev/null || true
 
   # From here on, derived outputs belong to this build and the EXIT trap may
-  # remove the ESP image, a partial qcow2, and temp manifests.
+  # remove the ESP image, a partial qcow2/live.iso, efi.img, and temp manifests.
   OUTPUTS_OWNED=1
 
   blog "[build] stage 1/6: validate - plan is valid"
   blog "[build] stage 2/6: fetch base - $PLAN_BASE_KIND_VALUE/$PLAN_BASE_RELEASE_VALUE"
   blog "[build] stage 3/6: bootstrap rootfs - $rootfs"
-  if [ "$graphical" -eq 1 ]; then
+  if [ "$iso" -eq 1 ]; then
+    blog "[build] stage 4/6: install packages - $PKG_COUNT plan + $runtime_count runtime packages via --include"
+  elif [ "$graphical" -eq 1 ]; then
     blog "[build] stage 4/6: install packages - $PKG_COUNT plan + $runtime_count desktop runtime packages via --include"
+  else
+    blog "[build] stage 4/6: install packages - $PKG_COUNT packages via --include"
+  fi
+  if [ "$graphical" -eq 1 ]; then
     blog "[build] desktop: session=$desktop_session, display_manager=$desktop_dm (graphical boot, ${ARTIFACT_BOOT_MEMORY_MB_GRAPHICAL} MB)"
     blog "[build] desktop runtime: add ${GRAPHICAL_RUNTIME_PACKAGES[*]} to --include (Xorg + pgrep + Accounts)"
     blog "[build] boot evidence: install /etc/systemd/system/sysemble-boot-evidence.service (enabled for graphical.target)"
   else
-    blog "[build] stage 4/6: install packages - $PKG_COUNT packages via --include"
     blog "[build] desktop: none detected (multi-user boot, ${ARTIFACT_BOOT_MEMORY_MB_DEFAULT} MB)"
+  fi
+  if [ "$iso" -eq 1 ]; then
+    blog "[build] live ISO runtime: add ${runtime_csv:-none} to --include (deduplicated against plan.packages)"
+    blog "[build] live ISO: regenerate the initramfs in the customize hook so the live-boot hook is included"
   fi
   blog "[build] customize: hostname=$hostname, enable serial-getty@ttyS0.service (failure is non-fatal)"
 
@@ -631,6 +911,7 @@ build_native() {
       return 6
       ;;
   esac
+  if [ "$disk" -eq 1 ]; then
   disk_mb=$(compute_disk_size_mb "$rootfs_mb") || {
     blog_err "cannot compute disk size from rootfs size ${rootfs_mb} MB"
     return 6
@@ -738,8 +1019,29 @@ build_native() {
     return 6
   fi
 
+  fi
+
+  if [ "$iso" -eq 1 ]; then
+    if ! build_iso_image "$rootfs" "$kernel" "$initrd" "$graphical" \
+      "$iso_cfg" "$iso_esp" "$iso_efi" "$iso_dir"; then
+      return 6
+    fi
+  fi
+
   blog "[build] stage 6/6: write artifact manifest"
-  if ! artifact_json "$OUT_ABS" "$PLAN_SPEC_VALUE" \
+  if [ "$iso" -eq 1 ]; then
+    if ! artifact_iso_json "$OUT_ABS" "$PLAN_SPEC_VALUE" \
+      "$PLAN_BASE_RELEASE_VALUE" "$PLAN_BASE_PIN_VALUE" \
+      "$PLAN_TARGET_ARCH_VALUE" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      "$disk" "${PLAN_PACKAGES_VALUES[@]}" >"$OUT_ABS/.artifact.json.tmp" 2>"$TMP_DIR/artifact.err"; then
+      if [ -s "$TMP_DIR/artifact.err" ]; then
+        cat "$TMP_DIR/artifact.err" | tee -a "$BUILD_LOG" >&2
+      fi
+      rm -f "$OUT_ABS/.artifact.json.tmp" 2>/dev/null || true
+      blog_err "artifact.json generation failed"
+      return 6
+    fi
+  elif ! artifact_json "$OUT_ABS" "$PLAN_SPEC_VALUE" \
     "$PLAN_BASE_RELEASE_VALUE" "$PLAN_BASE_PIN_VALUE" \
     "$PLAN_TARGET_ARCH_VALUE" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     "${PLAN_PACKAGES_VALUES[@]}" >"$OUT_ABS/.artifact.json.tmp" 2>"$TMP_DIR/artifact.err"; then
@@ -758,11 +1060,24 @@ build_native() {
   OUTPUTS_OWNED=0
 
   blog ""
-  blog "[build] complete (mode: uefi)"
+  if [ "$iso" -eq 1 ] && [ "$disk" -eq 1 ]; then
+    blog "[build] complete (mode: uefi+iso)"
+  elif [ "$iso" -eq 1 ]; then
+    blog "[build] complete (mode: iso)"
+  else
+    blog "[build] complete (mode: uefi)"
+  fi
   blog "  rootfs:   $rootfs"
-  blog "  raw:      $raw (${disk_mb} MB: GPT, p1 esp ${ESP_SIZE_MB} MB, p2 root ${root_part_mb} MB)"
-  blog "  qcow2:    $qcow"
-  blog "  grub:     $grub_efi (config: $grub_cfg)"
+  if [ "$disk" -eq 1 ]; then
+    blog "  raw:      $raw (${disk_mb} MB: GPT, p1 esp ${ESP_SIZE_MB} MB, p2 root ${root_part_mb} MB)"
+    blog "  qcow2:    $qcow"
+    blog "  grub:     $grub_efi (config: $grub_cfg)"
+  fi
+  if [ "$iso" -eq 1 ]; then
+    blog "  iso:      $OUT_ABS/$ISO_ARTIFACT_NAME (UEFI El Torito)"
+    blog "  iso tree: $iso_dir (live/vmlinuz, live/initrd.img, live/filesystem.squashfs, boot/grub/efi.img)"
+    blog "  iso cfg:  $iso_cfg"
+  fi
   blog "  artifact: $OUT_ABS/artifact.json"
   blog "  log:      $BUILD_LOG"
   return 0
@@ -787,6 +1102,10 @@ INNER
 build_docker() {
   local rootfs="$OUT_ABS/rootfs"
   local pkg_csv=""
+  local mode=""
+  local iso=0
+  local graphical=0
+  local runtime_csv=""
 
   case "$OUT_ABS" in
     *:*)
@@ -804,6 +1123,21 @@ build_docker() {
   if [ -z "$pkg_csv" ]; then
     err "package list is empty; refusing to build"
     return 6
+  fi
+
+  # Match the native rootfs content when the plan asks for an ISO or a desktop:
+  # docker mode still stops after the rootfs, but the packages it installs
+  # should be the same ones the native pipeline would use.
+  mode=$(plan_build_mode)
+  case "$mode" in
+    iso | iso-disk) iso=1 ;;
+  esac
+  if detect_display_manager "${PLAN_PACKAGES_VALUES[@]}" >/dev/null 2>&1; then
+    graphical=1
+  fi
+  runtime_csv=$(runtime_packages_for "$iso" "$graphical")
+  if [ -n "$runtime_csv" ]; then
+    pkg_csv="$pkg_csv,$runtime_csv"
   fi
 
   info "[build] stage 1/6: validate - plan is valid"

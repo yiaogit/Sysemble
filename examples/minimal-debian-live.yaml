@@ -1,0 +1,41 @@
+apiVersion: sysemble/v1
+
+meta:
+  name: minimal-debian-live
+  description: Minimal bootable Debian live ISO used by the P0-d2 live smoke test.
+  tags: [live, iso, ci]
+
+target:
+  base:
+    kind: debian
+    release: trixie
+    pin: "2026-11-01"
+  arch: x86_64
+  firmware: uefi
+  output: [iso]
+
+system:
+  hostname: sysemble-live
+  locale: C.UTF-8
+  timezone: UTC
+  users:
+    - name: ops
+      groups: [sudo]
+      shell: /bin/bash
+      password: locked
+  kernel:
+    flavor: lts
+  packages:
+    include: []
+    exclude: []
+
+security:
+  disk_encryption: none
+  secure_boot: false
+  firewall: none
+  hardening: minimal
+
+verify:
+  scenarios:
+    - id: live
+      tests: [boot, login]

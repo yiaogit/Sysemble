@@ -1,45 +1,54 @@
 #!/usr/bin/env bash
-# Sysemble boot-check (P0-b kernel + P0-c UEFI + P0-d1 graphical).
+# Sysemble boot-check (P0-b kernel + P0-c UEFI + P0-d1 graphical + P0-d2 live ISO).
 #
-# Boots a built disk image with QEMU and proves that the serial console reaches
-# a kernel, systemd, and a login prompt. With --log-from it runs the same
-# assertions against an existing log, so the assertion logic is testable on a
-# host without QEMU.
+# Boots a built image with QEMU and proves that the serial console reaches a
+# kernel, systemd, and a login prompt (plus the live-media marker for an ISO).
+# With --log-from it runs the same assertions against an existing log, so the
+# assertion logic is testable on a host without QEMU.
 #
 # Contract (frozen):
 #   tools/boot-check.sh --artifact <artifact.json> [--timeout 300] [--json]
 #                       [--log-from <file>] [--qemu <binary>]
 #                       [--firmware <OVMF_CODE.fd>]
 #
-# Two boot modes are selected by artifact.boot.mode:
+# Three boot modes are selected by artifact.boot.mode:
 #
 #   kernel (default)  QEMU starts the kernel directly with -kernel/-initrd and
 #                     the raw image as a virtio drive (P0-b behavior).
 #   uefi              QEMU boots OVMF from pflash, which loads GRUB from the GPT
 #                     ESP on artifact.boot.disk. The kernel, initrd, and cmdline
 #                     live inside the disk and are not passed to QEMU.
+#   iso               QEMU boots OVMF from pflash, which loads GRUB from the El
+#                     Torito EFI image inside artifact.boot.iso. The ISO is
+#                     attached with -cdrom and no disk is attached, so the boot
+#                     can only succeed from the live CD-ROM. The live initramfs
+#                     mounts filesystem.squashfs.
 #
-# In UEFI mode artifact.boot.graphical=true selects the desktop image: QEMU
-# additionally gets -vga virtio and three desktop assertions (display manager,
-# Xorg, graphical target) follow the usual five. artifact.boot.memory_mb
-# overrides QEMU -m in every mode (default 1024). boot.graphical is ignored in
-# kernel mode, which keeps the P0-b assertion set at three.
+# In UEFI and ISO modes artifact.boot.graphical=true selects the desktop image:
+# QEMU additionally gets -vga virtio and three desktop assertions (display
+# manager, Xorg, graphical target) follow the mode's usual assertions.
+# artifact.boot.memory_mb overrides QEMU -m in every mode (default 1024).
+# boot.graphical is ignored in kernel mode, which keeps the P0-b assertion set
+# at three.
 #
-# Artifact paths (boot.kernel, boot.initrd, boot.disk, images[].path) are
-# resolved relative to the directory holding artifact.json. Boot-check writes
+# Artifact paths (boot.kernel, boot.initrd, boot.disk, boot.iso, images[].path)
+# are resolved relative to the directory holding artifact.json. Boot-check writes
 # <artifact dir>/boot.log and <artifact dir>/boot-evidence.json plus a temporary
-# directory under $TMPDIR. In UEFI mode the OVMF VARS template is copied to a
-# temporary file inside that $TMPDIR work directory (QEMU needs a writable copy)
-# and deleted on exit; nothing is ever written to the caller's working
-# directory. QEMU opens the target disk read-write because the cmdline mounts
-# the root filesystem rw, so the disk must be writable by the user running
-# boot-check. The host, network, and boot configuration are never modified; no
-# sudo is used.
+# directory under $TMPDIR. In UEFI and ISO modes the OVMF VARS template is
+# copied to a temporary file inside that $TMPDIR work directory (QEMU needs a
+# writable copy) and deleted on exit; nothing is ever written to the caller's
+# working directory. QEMU opens the target disk read-write because the cmdline
+# mounts the root filesystem rw, so the disk must be writable by the user
+# running boot-check. An ISO is attached read-only with -cdrom, so only the
+# artifact directory (for boot.log/boot-evidence.json) and the OVMF VARS copy
+# need to be writable in ISO mode. The host, network, and boot configuration
+# are never modified; no sudo is used.
 #
 # A successful boot does not power itself off. In QEMU mode a monitor watches
 # boot.log and stops QEMU as soon as every required assertion has matched (3 in
-# kernel mode, 5 in UEFI mode, 8 in UEFI graphical mode), which is what lets a
-# healthily booted VM finish before --timeout.
+# kernel mode, 5 in UEFI mode, 6 in ISO mode, 8 in UEFI graphical mode, 9 in
+# ISO graphical mode), which is what lets a healthily booted VM finish before
+# --timeout.
 #
 # Requires bash 3.2+ (macOS /bin/bash). Do not use bash 4 features
 # (mapfile, associative arrays, wait -n, ...).
@@ -85,11 +94,13 @@ INITRD_REL=""
 CMDLINE_VALUE=""
 RAW_IMAGE_REL=""
 BOOT_DISK_REL=""
+ISO_REL=""
 
 KERNEL_ABS=""
 INITRD_ABS=""
 RAW_IMAGE_ABS=""
 BOOT_DISK_ABS=""
+ISO_ABS=""
 
 QEMU_LABEL=""
 QEMU_BIN=""
@@ -115,6 +126,8 @@ SYSTEMD_RESULT="fail"
 SYSTEMD_DETAIL=""
 LOGIN_RESULT="fail"
 LOGIN_DETAIL=""
+LIVE_RESULT="fail"
+LIVE_DETAIL=""
 DISPLAY_MANAGER_RESULT="fail"
 DISPLAY_MANAGER_DETAIL=""
 XORG_RESULT="fail"
@@ -175,7 +188,7 @@ Options:
   --log-from <file>  offline mode: do not run QEMU, run the assertions against
                      this existing serial log
   --qemu <binary>    QEMU binary (default: qemu-system-<arch> from PATH)
-  --firmware <path>  OVMF code image for boot.mode=uefi. Default: the first
+  --firmware <path>  OVMF code image for boot.mode=uefi/iso. Default: the first
                      readable path of
                        /usr/share/OVMF/OVMF_CODE_4M.fd
                        /usr/share/OVMF/OVMF_CODE.fd
@@ -187,39 +200,49 @@ Options:
 Artifact fields used (relative to the artifact.json directory):
   apiVersion must be 'sysemble/artifact/v1'
   arch       must be 'x86_64' or 'aarch64'
-  boot.mode  'kernel' (default when absent) or 'uefi'
+  boot.mode  'kernel' (default when absent), 'uefi', or 'iso'
   boot.memory_mb  QEMU -m value in MB: a positive JSON integer (default: 1024)
-  boot.graphical  uefi only: true adds -vga virtio and the three desktop
+  boot.graphical  uefi/iso only: true adds -vga virtio and the three desktop
                   assertions below; missing/false keeps the P0-c behavior
   boot.kernel / boot.initrd  required when boot.mode=kernel
   boot.disk  required when boot.mode=uefi: raw GPT disk image with the ESP
+  boot.iso   required when boot.mode=iso: UEFI El Torito ISO with GRUB and the
+             live squashfs
   boot.cmdline is passed to QEMU -append in kernel mode only
-  images[]   must contain an entry with format 'raw' whose path exists
+  images[]   must be an array; boot.mode=kernel/uefi also requires an entry with
+             format 'raw' whose path exists (an iso-only artifact has an 'iso'
+             entry instead)
 
 In kernel mode QEMU opens the raw image read-write (the cmdline mounts the root
-filesystem rw); in UEFI mode it opens boot.disk read-write and pflash. Boot-check
-writes boot.log/boot-evidence.json beside artifact.json, so the artifact
-directory, the raw image, and boot.disk must be writable by the invoking user.
+filesystem rw); in UEFI mode it opens boot.disk read-write and pflash; in ISO
+mode it attaches boot.iso read-only with -cdrom and no disk at all, and boots
+OVMF from the ISO's El Torito EFI image. Boot-check writes
+boot.log/boot-evidence.json beside artifact.json, so the artifact directory must
+be writable by the invoking user (plus the raw image and boot.disk in
+kernel/UEFI mode).
 
 Assertions (all required):
-  boot.firmware  (uefi only) serial log contains 'EFI v' or 'UEFI'
-  boot.grub      (uefi only) serial log contains 'GRUB' or 'Booting'
+  boot.firmware  (uefi/iso) serial log contains 'EFI v' or 'UEFI'
+  boot.grub      (uefi/iso) serial log contains 'GRUB' or 'Booting'
   boot.kernel    serial log contains 'Linux version'
   boot.systemd   serial log contains 'systemd[1]' or 'Reached target'
   boot.login     serial log contains 'login:'
-  boot.display_manager  (uefi + graphical) log contains 'lightdm', 'sddm', or
-                        'gdm' (case-insensitive)
-  boot.xorg             (uefi + graphical) log contains 'X.Org X Server' or
+  boot.live      (iso) log contains 'live-boot', 'live-media', 'squashfs', or
+                 'overlay' (case-insensitive)
+  boot.display_manager  (uefi/iso + graphical) log contains 'lightdm', 'sddm',
+                        or 'gdm' (case-insensitive)
+  boot.xorg             (uefi/iso + graphical) log contains 'X.Org X Server' or
                         'Xorg'
-  boot.graphical        (uefi + graphical) log contains 'Reached target
+  boot.graphical        (uefi/iso + graphical) log contains 'Reached target
                         Graphical Interface' or 'graphical.target'
 
-The required assertion count is therefore 3 in kernel mode, 5 in UEFI mode, and
-8 in UEFI graphical mode. boot.graphical is ignored in kernel mode.
+The required assertion count is therefore 3 in kernel mode, 5 in UEFI mode, 6 in
+ISO mode, 8 in UEFI graphical mode, and 9 in ISO graphical mode (the desktop
+assertions follow boot.live). boot.graphical is ignored in kernel mode.
 
 In QEMU mode every assertion must pass before --timeout; QEMU is stopped as soon
 as they do. A timeout keeps the partial boot.log and reports result 'timeout'.
---log-from never launches QEMU or probes firmware, so UEFI assertions are
+--log-from never launches QEMU or probes firmware, so UEFI/ISO assertions are
 testable offline.
 
 Exit codes:
@@ -519,6 +542,7 @@ scalar("boot.mode"; ["boot", "mode"]),
 scalar("boot.graphical"; ["boot", "graphical"]),
 scalar("boot.memory_mb"; ["boot", "memory_mb"]),
 scalar("boot.disk"; ["boot", "disk"]),
+scalar("boot.iso"; ["boot", "iso"]),
 scalar("boot.kernel"; ["boot", "kernel"]),
 scalar("boot.initrd"; ["boot", "initrd"]),
 scalar("boot.cmdline"; ["boot", "cmdline"]),
@@ -608,6 +632,7 @@ def main(argv):
     scalar("boot.graphical", ["boot", "graphical"])
     scalar("boot.memory_mb", ["boot", "memory_mb"])
     scalar("boot.disk", ["boot", "disk"])
+    scalar("boot.iso", ["boot", "iso"])
     scalar("boot.kernel", ["boot", "kernel"])
     scalar("boot.initrd", ["boot", "initrd"])
     scalar("boot.cmdline", ["boot", "cmdline"])
@@ -706,6 +731,7 @@ parse_artifact() {
   local graphical_type="missing" graphical_value=""
   local memory_type="missing" memory_value=""
   local disk_type="missing" disk_value=""
+  local iso_type="missing" iso_value=""
   local kernel_type="missing" kernel_value=""
   local initrd_type="missing" initrd_value=""
   local cmdline_type="missing" cmdline_value=""
@@ -756,6 +782,10 @@ parse_artifact() {
       boot.disk)
         disk_type=$field1
         disk_value=$field2
+        ;;
+      boot.iso)
+        iso_type=$field1
+        iso_value=$field2
         ;;
       boot.kernel)
         kernel_type=$field1
@@ -827,11 +857,11 @@ EOF
       ;;
     string)
       case "$mode_value" in
-        kernel | uefi)
+        kernel | uefi | iso)
           BOOT_MODE=$mode_value
           ;;
         *)
-          err "artifact boot.mode must be 'kernel' or 'uefi' (got '$mode_value')"
+          err "artifact boot.mode must be 'kernel', 'uefi', or 'iso' (got '$mode_value')"
           exit "$EXIT_USAGE"
           ;;
       esac
@@ -865,8 +895,9 @@ EOF
   esac
 
   # boot.graphical selects the desktop assertion set. Absent/false is the P0-c
-  # behavior. The field is validated in every mode but only acted on in UEFI
-  # mode, so a kernel-mode artifact that carries it still runs 3 assertions.
+  # behavior. The field is validated in every mode but only acted on in UEFI and
+  # ISO modes, so a kernel-mode artifact that carries it still runs 3
+  # assertions.
   case "$graphical_type" in
     missing)
       GRAPHICAL_MODE=0
@@ -891,10 +922,12 @@ EOF
       ;;
   esac
 
-  # OVMF is x86_64-only in P0-c; an aarch64 UEFI artifact would silently get
-  # the wrong QEMU arguments, so reject it instead of booting something else.
-  if [ "$BOOT_MODE" = "uefi" ] && [ "$ARCH_VALUE" != "x86_64" ]; then
-    err "artifact boot.mode=uefi is only supported for arch x86_64 (got '$ARCH_VALUE')"
+  # OVMF is x86_64-only in P0-c/P0-d2; an aarch64 UEFI/ISO artifact would
+  # silently get the wrong QEMU arguments, so reject it instead of booting
+  # something else.
+  if { [ "$BOOT_MODE" = "uefi" ] || [ "$BOOT_MODE" = "iso" ]; } &&
+    [ "$ARCH_VALUE" != "x86_64" ]; then
+    err "artifact boot.mode=$BOOT_MODE is only supported for arch x86_64 (got '$ARCH_VALUE')"
     exit "$EXIT_USAGE"
   fi
 
@@ -916,6 +949,14 @@ EOF
       exit "$EXIT_USAGE"
     fi
     CMDLINE_VALUE=$cmdline_value
+  elif [ "$BOOT_MODE" = "iso" ]; then
+    # The live ISO carries its own kernel, initrd, cmdline, GRUB, and squashfs,
+    # so only the ISO path is handed to QEMU (as a read-only CD-ROM).
+    if [ "$iso_type" != "string" ] || [ -z "$iso_value" ]; then
+      err "artifact field boot.iso is required when boot.mode=iso"
+      exit "$EXIT_USAGE"
+    fi
+    ISO_REL=$iso_value
   else
     # UEFI boots through firmware + GRUB, so the kernel/initrd/cmdline inside
     # boot are informational and are not handed to QEMU.
@@ -938,7 +979,9 @@ EOF
     err "artifact images[] contains an entry that is not an object"
     exit "$EXIT_USAGE"
   fi
-  if [ -z "$RAW_IMAGE_REL" ]; then
+  # An iso-only artifact lists the ISO under images[] (format 'iso') and has no
+  # raw disk; kernel/UEFI still require the raw image they boot from.
+  if [ -z "$RAW_IMAGE_REL" ] && [ "$BOOT_MODE" != "iso" ]; then
     err "artifact images[] must contain a raw image with a non-empty path"
     exit "$EXIT_USAGE"
   fi
@@ -948,12 +991,17 @@ EOF
     KERNEL_ABS=$RESOLVED_FILE
     resolve_artifact_file "boot.initrd" "$INITRD_REL"
     INITRD_ABS=$RESOLVED_FILE
+  elif [ "$BOOT_MODE" = "iso" ]; then
+    resolve_artifact_file "boot.iso" "$ISO_REL"
+    ISO_ABS=$RESOLVED_FILE
   else
     resolve_artifact_file "boot.disk" "$BOOT_DISK_REL"
     BOOT_DISK_ABS=$RESOLVED_FILE
   fi
-  resolve_artifact_file "images[].path (raw)" "$RAW_IMAGE_REL"
-  RAW_IMAGE_ABS=$RESOLVED_FILE
+  if [ "$BOOT_MODE" != "iso" ]; then
+    resolve_artifact_file "images[].path (raw)" "$RAW_IMAGE_REL"
+    RAW_IMAGE_ABS=$RESOLVED_FILE
+  fi
 }
 
 # Resolve a manifest path relative to the artifact directory, then require a
@@ -1004,13 +1052,14 @@ log_has_ci() {
   grep -Fiq "$1" "$LOG_PATH" 2>/dev/null
 }
 
-# The assertion set depends on the boot mode: UEFI adds firmware and GRUB
-# before the kernel/systemd/login triple; UEFI graphical mode adds the desktop
-# triple after it. Both all_assertions_pass (the QEMU early-stop monitor) and
-# evaluate_assertions (the evidence writer) use the same predicates so a boot
-# can never be "proven" by one and reported by the other.
+# The assertion set depends on the boot mode: UEFI and ISO add firmware and
+# GRUB before the kernel/systemd/login triple; ISO adds the live-media marker
+# after it; UEFI/ISO graphical mode adds the desktop triple after that (so
+# boot.live precedes boot.display_manager). Both all_assertions_pass (the QEMU
+# early-stop monitor) and evaluate_assertions (the evidence writer) use the same
+# predicates so a boot can never be "proven" by one and reported by the other.
 all_assertions_pass() {
-  if [ "$BOOT_MODE" = "uefi" ]; then
+  if [ "$BOOT_MODE" = "uefi" ] || [ "$BOOT_MODE" = "iso" ]; then
     log_has 'EFI v' || log_has 'UEFI' || return 1
     log_has 'GRUB' || log_has 'Booting' || return 1
   fi
@@ -1019,7 +1068,12 @@ all_assertions_pass() {
     return 1
   fi
   log_has 'login:' || return 1
-  if [ "$BOOT_MODE" = "uefi" ] && [ "$GRAPHICAL_MODE" -eq 1 ]; then
+  if [ "$BOOT_MODE" = "iso" ]; then
+    log_has_ci 'live-boot' || log_has_ci 'live-media' || \
+      log_has_ci 'squashfs' || log_has_ci 'overlay' || return 1
+  fi
+  if { [ "$BOOT_MODE" = "uefi" ] || [ "$BOOT_MODE" = "iso" ]; } &&
+    [ "$GRAPHICAL_MODE" -eq 1 ]; then
     log_has_ci 'lightdm' || log_has_ci 'sddm' || log_has_ci 'gdm' || return 1
     log_has 'X.Org X Server' || log_has 'Xorg' || return 1
     log_has 'Reached target Graphical Interface' || log_has 'graphical.target' || return 1
@@ -1111,12 +1165,13 @@ record_assertion() {
 
 # Set the result/detail variables for every assertion that applies to the
 # current boot mode, then snapshot them as evidence records in report order.
-# kernel mode runs 3 assertions; uefi mode runs 5; uefi + graphical runs 8.
+# kernel 3; uefi 5; iso 6; uefi + graphical 8; iso + graphical 9 (boot.live
+# always precedes the desktop triple).
 evaluate_assertions() {
   LOG_STATE=$(log_state_of)
   ASSERT_RECORDS=""
 
-  if [ "$BOOT_MODE" = "uefi" ]; then
+  if [ "$BOOT_MODE" = "uefi" ] || [ "$BOOT_MODE" = "iso" ]; then
     evaluate_assertion FIRMWARE_RESULT FIRMWARE_DETAIL \
       'no `EFI v` or `UEFI`' 'EFI v' 'UEFI'
     record_assertion boot.firmware "$FIRMWARE_RESULT" "$FIRMWARE_DETAIL"
@@ -1138,7 +1193,19 @@ evaluate_assertions() {
     'no `login:`' 'login:'
   record_assertion boot.login "$LOGIN_RESULT" "$LOGIN_DETAIL"
 
-  if [ "$BOOT_MODE" = "uefi" ] && [ "$GRAPHICAL_MODE" -eq 1 ]; then
+  # The live marker proves the initramfs used the live medium (live-boot /
+  # live-media-path) and that the live filesystem was recognised (squashfs /
+  # overlayfs). Kernel messages spell 'SQUASHFS' and 'OVERLAYFS' in upper case,
+  # so this assertion is case-insensitive.
+  if [ "$BOOT_MODE" = "iso" ]; then
+    evaluate_assertion_ci LIVE_RESULT LIVE_DETAIL \
+      'no `live-boot`, `live-media`, `squashfs`, or `overlay`' \
+      'live-boot' 'live-media' 'squashfs' 'overlay'
+    record_assertion boot.live "$LIVE_RESULT" "$LIVE_DETAIL"
+  fi
+
+  if { [ "$BOOT_MODE" = "uefi" ] || [ "$BOOT_MODE" = "iso" ]; } &&
+    [ "$GRAPHICAL_MODE" -eq 1 ]; then
     evaluate_assertion_ci DISPLAY_MANAGER_RESULT DISPLAY_MANAGER_DETAIL \
       'no `lightdm`, `sddm`, or `gdm`' 'lightdm' 'sddm' 'gdm'
     record_assertion boot.display_manager "$DISPLAY_MANAGER_RESULT" "$DISPLAY_MANAGER_DETAIL"
@@ -1159,7 +1226,7 @@ determine_result() {
     RESULT=timeout
     return 0
   fi
-  if [ "$BOOT_MODE" = "uefi" ]; then
+  if [ "$BOOT_MODE" = "uefi" ] || [ "$BOOT_MODE" = "iso" ]; then
     if [ "$FIRMWARE_RESULT" != "pass" ] || [ "$GRUB_RESULT" != "pass" ]; then
       RESULT=fail
       return 0
@@ -1171,7 +1238,12 @@ determine_result() {
     RESULT=fail
     return 0
   fi
-  if [ "$BOOT_MODE" = "uefi" ] && [ "$GRAPHICAL_MODE" -eq 1 ]; then
+  if [ "$BOOT_MODE" = "iso" ] && [ "$LIVE_RESULT" != "pass" ]; then
+    RESULT=fail
+    return 0
+  fi
+  if { [ "$BOOT_MODE" = "uefi" ] || [ "$BOOT_MODE" = "iso" ]; } &&
+    [ "$GRAPHICAL_MODE" -eq 1 ]; then
     if [ "$DISPLAY_MANAGER_RESULT" != "pass" ] ||
       [ "$XORG_RESULT" != "pass" ] ||
       [ "$GRAPHICAL_RESULT" != "pass" ]; then
@@ -1432,6 +1504,11 @@ run_qemu() {
   if [ "$BOOT_MODE" = "uefi" ]; then
     resolve_firmware
     require_writable_disk "boot.disk" "$BOOT_DISK_REL" "$BOOT_DISK_ABS"
+  elif [ "$BOOT_MODE" = "iso" ]; then
+    # The CD-ROM is attached read-only, so only the OVMF VARS copy and the
+    # artifact directory (for boot.log) need to be writable. resolve_artifact_file
+    # already required boot.iso to be a readable regular file.
+    resolve_firmware
   else
     require_writable_disk "raw image" "$RAW_IMAGE_REL" "$RAW_IMAGE_ABS"
   fi
@@ -1446,12 +1523,14 @@ run_qemu() {
     exit "$EXIT_USAGE"
   fi
 
-  if [ "$BOOT_MODE" = "uefi" ]; then
+  if [ "$BOOT_MODE" = "uefi" ] || [ "$BOOT_MODE" = "iso" ]; then
     # Contract sequence: firmware CODE (read-only), writable VARS copy, then the
-    # partitioned disk as a virtio drive. GRUB loads the kernel from the ESP.
-    # Graphical mode inserts -vga virtio before the drives; serial stays the only
-    # console (-nographic), so the guest's virtio-gpu is exercised by Xorg
-    # without opening a host window.
+    # boot medium: the partitioned disk as a virtio drive (UEFI) or the live ISO
+    # as a read-only CD-ROM with no disk attached (ISO). GRUB loads the kernel
+    # from the ESP (UEFI) or from the ISO's El Torito EFI image (ISO). Graphical
+    # mode inserts -vga virtio before the drives; serial stays the only console
+    # (-nographic), so the guest's virtio-gpu is exercised by Xorg without
+    # opening a host window.
     qemu_args=(
       -machine q35
       -m "$MEMORY_MB"
@@ -1465,9 +1544,14 @@ run_qemu() {
     qemu_args+=(
       -drive "if=pflash,format=raw,readonly=on,file=$FIRMWARE_CODE"
       -drive "if=pflash,format=raw,file=$VARS_TMP"
-      -drive "file=$BOOT_DISK_ABS,format=raw,if=virtio"
     )
-    say "launching $QEMU_LABEL (uefi/OVMF, -machine q35, timeout ${TIMEOUT_SECONDS}s)"
+    if [ "$BOOT_MODE" = "iso" ]; then
+      qemu_args+=(-cdrom "$ISO_ABS")
+      say "launching $QEMU_LABEL (iso/OVMF, -cdrom, timeout ${TIMEOUT_SECONDS}s)"
+    else
+      qemu_args+=(-drive "file=$BOOT_DISK_ABS,format=raw,if=virtio")
+      say "launching $QEMU_LABEL (uefi/OVMF, -machine q35, timeout ${TIMEOUT_SECONDS}s)"
+    fi
   else
     qemu_args=(
       -machine "$MACHINE"
@@ -1711,14 +1795,25 @@ report_summary() {
     else
       say "boot mode: uefi (OVMF + GRUB)"
     fi
+  elif [ "$BOOT_MODE" = "iso" ]; then
+    if [ -n "$FIRMWARE_CODE" ]; then
+      say "boot mode: iso (OVMF $FIRMWARE_CODE + GRUB from CD-ROM + live-boot)"
+    else
+      say "boot mode: iso (OVMF + GRUB from CD-ROM + live-boot)"
+    fi
   else
     say "boot mode: kernel (-kernel/-initrd)"
   fi
   if [ -n "$LOG_FROM" ]; then
     say "mode: offline (--log-from $LOG_FROM)"
   fi
-  if [ "$BOOT_MODE" = "uefi" ] && [ "$GRAPHICAL_MODE" -eq 1 ]; then
-    say "graphical: -vga virtio, -m ${MEMORY_MB} (8 assertions)"
+  if { [ "$BOOT_MODE" = "uefi" ] || [ "$BOOT_MODE" = "iso" ]; } &&
+    [ "$GRAPHICAL_MODE" -eq 1 ]; then
+    if [ "$BOOT_MODE" = "iso" ]; then
+      say "graphical: -vga virtio, -m ${MEMORY_MB} (9 assertions)"
+    else
+      say "graphical: -vga virtio, -m ${MEMORY_MB} (8 assertions)"
+    fi
   fi
   say "artifact: $ARTIFACT_ABS"
   say "qemu: $QEMU_LABEL (timeout ${TIMEOUT_SECONDS}s)"
@@ -1756,8 +1851,8 @@ main() {
   detect_json_backend
   parse_artifact
 
-  if [ -n "$FIRMWARE_OPT" ] && [ "$BOOT_MODE" != "uefi" ]; then
-    warn "ignoring --firmware: artifact boot.mode is '$BOOT_MODE' (only 'uefi' uses OVMF)"
+  if [ -n "$FIRMWARE_OPT" ] && [ "$BOOT_MODE" != "uefi" ] && [ "$BOOT_MODE" != "iso" ]; then
+    warn "ignoring --firmware: artifact boot.mode is '$BOOT_MODE' (only 'uefi'/'iso' use OVMF)"
   fi
 
   if [ -n "$LOG_FROM" ]; then
