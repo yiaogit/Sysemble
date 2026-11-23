@@ -1,4 +1,4 @@
-# Debian builder (P0-a + P0-b + P0-c1)
+# Debian builder (P0-a + P0-b + P0-c1 + P0-d1)
 
 `build.sh` reads the `plan.json` produced by `sysemble plan --json` and turns
 it into a bootable Debian disk image:
@@ -20,6 +20,14 @@ it into a bootable Debian disk image:
 
   The artifact gains `boot.mode="uefi"`, `boot.disk`, `boot.grub`, `partitions`,
   and a `root=/dev/vda2` cmdline.
+- **P0-d1**: the builder infers a desktop from `plan.packages` (the plan schema
+  stays frozen). A display manager (`gdm3`/`sddm`/`lightdm`) selects
+  `graphical.target`, `systemd.journald.forward_to_console=1`, 2048 MB of guest
+  RAM, and the artifact fields `desktop` + `boot.graphical`/`boot.memory_mb`.
+  A plan without a display manager keeps the frozen P0-c multi-user cmdline,
+  1024 MB, and no `desktop` object. The XFCE example
+  (`examples/debian-xfce.yaml`) plans `xfce4` + `lightdm` and therefore boots
+  graphically.
 
 The authoritative acceptance is the GitHub Actions `boot-smoke` job on
 `ubuntu-latest`. The development host is macOS arm64, where no real native
@@ -56,7 +64,8 @@ arguments print usage and exit 2.
     EFI/BOOT/BOOTX64.EFI  # grub-mkstandalone, config embedded
     boot/grub/grub.cfg    # copy of the embedded config
   grub.cfg                # the GRUB config (artifact boot.grub.config)
-  artifact.json           # sysemble/artifact/v1 manifest (boot.mode = uefi)
+  artifact.json           # sysemble/artifact/v1 manifest (boot.mode = uefi;
+                          #   desktop + graphical fields when a DM is planned)
   build.log               # full build output (tee)
   plan.copy.json          # byte-identical copy of the input plan
 ```
@@ -135,7 +144,9 @@ Optional fields:
 `builders/debian/testdata/plan.example.json` is a self-contained fixture (43
 packages, 9 modules, no warnings) regenerated from `sysemble plan` on the
 Debian example. Its `linux-image-amd64` package and `x86_64` architecture make
-it an x86_64 plan.
+it an x86_64 plan. `builders/debian/testdata/plan.no-desktop.json` is the
+minimal 14-package counterpart used for the P0-d1 no-DM regression: it contains
+no `gdm3`/`sddm`/`lightdm`, so the builder must keep the multi-user cmdline.
 
 JSON is read with `jq` when available, otherwise with `python3 -c`. Both
 backends emit the same validated record stream; the dry-run output is identical
@@ -190,6 +201,9 @@ rm -f <out>/esp.img
 
 qemu-img convert -O qcow2 <out>/disk.img <out>/disk.qcow2
 ```
+
+For a graphical plan the `--include` list gains `,xserver-xorg,procps` and the
+customize hook also installs/enables the boot evidence unit described above.
 
 All stage messages and all command stdout/stderr are teed to
 `<out>/build.log`.
@@ -252,11 +266,83 @@ menuentry "Sysemble" {
 }
 ```
 
+When `plan.packages` contains a display manager, the single `linux` line
+instead uses the P0-d1 desktop cmdline:
+
+```grub
+  linux /boot/vmlinuz-<ver> root=/dev/vda2 rw console=ttyS0 rootfstype=ext4 systemd.unit=graphical.target systemd.journald.forward_to_console=1
+```
+
+`systemd.journald.forward_to_console=1` is required for the desktop boot check:
+LightDM and Xorg log through journald, so without it their messages never reach
+the serial console. The exact same string is written to `artifact.boot.cmdline`;
+the tests compare both byte for byte. A no-DM plan does not gain the journald
+flag, keeping the P0-c cmdline byte-identical.
+
 `<ver>` is the basename of the highest-versioned `vmlinuz-*` / `initrd.img-*`
 found under `rootfs/boot` with `sort -V` (for example `6.12.3-amd64`). The same
 text is written to `<out>/grub.cfg`, staged at
 `<out>/esp/boot/grub/grub.cfg`, and embedded into `BOOTX64.EFI` by
 `grub-mkstandalone`; no external `/boot/grub` directory is needed at boot time.
+
+### Desktop inference (P0-d1)
+
+The builder reads only `plan.packages`; `desktop` in the spec is not required
+(and does not reach the builder as a field). Detection is deliberately simple:
+
+| Package in `plan.packages` | Inferred value | Priority |
+|---|---|---|
+| `gdm3` | `display_manager: "gdm"` | 1 |
+| `sddm` | `display_manager: "sddm"` | 2 |
+| `lightdm` | `display_manager: "lightdm"` | 3 |
+| `plasma-desktop` | `session: "plasma"` | 1 |
+| `gnome-shell` | `session: "gnome"` | 2 |
+| `xfce4` | `session: "xfce"` | 3 |
+
+- Only the display manager turns graphical mode on. `xfce4` without `lightdm`
+  stays multi-user.
+- A display manager without any recognized session package still boots
+  graphically; `desktop.session` is then `"unknown"`.
+- The 18-package XFCE plan (`xfce4`, `lightdm`, `thunar`,
+  `xfce4-terminal`, ...) infers `session=xfce`, `display_manager=lightdm`.
+
+A graphical build also adds two packages that the plan does not name:
+
+| Runtime package | Why |
+|---|---|
+| `xserver-xorg` | `xfce4` and `lightdm` only **Recommend** the X server, and mmdebstrap installs no Recommends. Without it LightDM cannot start Xorg. |
+| `procps` | Provides `pgrep` for the boot evidence unit. procps is `Priority: important`, so `--variant=minbase` does not install it. |
+
+These packages are appended to `--include` only for graphical plans.
+`artifact.packages` stays the plan package list; no-DM builds keep the exact
+P0-c `--include` and multi-user cmdline.
+
+#### Boot evidence unit (graphical only)
+
+LightDM normally sends Xorg's stdout to `/var/log/lightdm/x-0.log`, so
+`systemd.journald.forward_to_console=1` alone may not put `X.Org X Server` on
+the serial console. A graphical rootfs therefore gets
+`/etc/systemd/system/sysemble-boot-evidence.service`, enabled through a
+`graphical.target.wants/` symlink:
+
+```ini
+[Unit]
+Description=Sysemble boot evidence markers
+After=graphical.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'pgrep -x Xorg ... && echo "SYMBLE: Xorg ready" > /dev/ttyS0; (...) && echo "SYMBLE: lightdm ready" > /dev/ttyS0; true'
+
+[Install]
+WantedBy=graphical.target
+```
+
+The marker names the real Debian process (`lightdm`, `sddm`, or `gdm3` for the
+artifact's `gdm`), so boot-check's existing `boot.xorg` (`Xorg`) and
+`boot.display_manager` (`lightdm`/`sddm`/`gdm`) assertions match without
+changes. The unit is written and enabled by the `--customize-hook`; no-DM builds
+neither install nor enable it. `build.log` records the installed unit.
 
 ### Boot images
 
@@ -266,6 +352,12 @@ cmdline is:
 
 ```
 root=/dev/vda2 rw console=ttyS0 rootfstype=ext4 systemd.unit=multi-user.target
+```
+
+For a desktop plan it is:
+
+```
+root=/dev/vda2 rw console=ttyS0 rootfstype=ext4 systemd.unit=graphical.target systemd.journald.forward_to_console=1
 ```
 
 The frozen partition layout means the root filesystem is always GPT partition 2
@@ -289,12 +381,15 @@ rename) only after every image and GRUB output exists. A P0-c build emits:
     {"path": "disk.img", "format": "raw", "size_mb": 4096, "sha256": "..."},
     {"path": "disk.qcow2", "format": "qcow2", "size_mb": 900, "sha256": "..."}
   ],
+  "desktop": {"session": "plasma", "display_manager": "sddm"},
   "boot": {
     "mode": "uefi",
     "disk": "disk.img",
     "kernel": "rootfs/boot/vmlinuz-6.12.3-amd64",
     "initrd": "rootfs/boot/initrd.img-6.12.3-amd64",
-    "cmdline": "root=/dev/vda2 rw console=ttyS0 rootfstype=ext4 systemd.unit=multi-user.target",
+    "graphical": true,
+    "memory_mb": 2048,
+    "cmdline": "root=/dev/vda2 rw console=ttyS0 rootfstype=ext4 systemd.unit=graphical.target systemd.journald.forward_to_console=1",
     "grub": {"efi": "esp/EFI/BOOT/BOOTX64.EFI", "config": "grub.cfg"}
   },
   "partitions": [
@@ -307,6 +402,15 @@ rename) only after every image and GRUB output exists. A P0-c build emits:
 
 - `boot.mode` is `"uefi"`. P0-b artifacts (and any artifact without
   `boot.mode`) default to `"kernel"`.
+- `desktop` is present only for a UEFI build whose package list contains a
+  display manager. It has exactly two fields: `session` (`plasma`/`gnome`/
+  `xfce`/`unknown`) and `display_manager` (`gdm`/`sddm`/`lightdm`).
+- `boot.graphical` and `boot.memory_mb` are present in UEFI artifacts:
+  `true`/`2048` for a desktop plan and `false`/`1024` for a no-DM plan. The
+  cmdline uses `graphical.target`/`multi-user.target` to match.
+- The historical P0-b kernel fallback (no GRUB outputs) stays unchanged: it has
+  no `desktop`, `graphical`, or `memory_mb` fields and keeps the `/dev/vda`
+  cmdline. `boot.graphical` is ignored by boot-check in kernel mode.
 - `boot.disk` and `boot.grub` are relative to the artifact directory.
   `boot.grub.config` is `<out>/grub.cfg`; the same text is also in
   `esp/boot/grub/grub.cfg`.
@@ -318,9 +422,10 @@ rename) only after every image and GRUB output exists. A P0-c build emits:
 - `images` still contains exactly the raw and qcow2 images with actual file
   sizes rounded up to MiB and SHA-256 digests (`sha256sum`, `shasum -a 256`, or
   `openssl dgst -sha256`).
-- The artifact helper falls back to the P0-b direct-kernel shape (no
-  `boot.mode`, no `disk`, no `grub`, no `partitions`, `/dev/vda` cmdline) when
-  neither GRUB output exists, and refuses to guess when only one exists.
+- The artifact helper falls back to the historical P0-b direct-kernel shape (no
+  `boot.mode`, no `disk`, no `grub`, no `partitions`, no `desktop`, no
+  `graphical`/`memory_mb`, `/dev/vda` cmdline) when neither GRUB output exists,
+  and refuses to guess when only one exists.
 
 ### Failure behavior
 
@@ -380,10 +485,11 @@ acceptance.
 - No loop devices, mounts, or host block devices are used.
 - Docker mode bind-mounts only `<out>`; no Docker socket or host directories.
 
-## Not implemented in P0-c1
+## Not implemented in P0-d1
 
-- Calamares or any installer flow; desktop/KDE configuration; first boot after
-  installation (P0-d/P0-e).
+- Calamares or any installer flow; desktop *configuration* (theme, apps,
+  users, autologin) beyond installing the session packages and letting the
+  display manager start; first boot after installation (P0-d2/P0-d3).
 - ISO/squashfs/PXE assembly, persistence, secure boot signing, dm-verity.
 - Cross-architecture UEFI: `grub-mkstandalone -O x86_64-efi` is x86_64 only;
   `target.arch` is validated but the native build uses the host toolchain.
@@ -400,7 +506,7 @@ acceptance.
   path is covered by offline tests with a fake toolchain; the real path is only
   exercised by CI.
 
-## Known risks (tracked by P0-c)
+## Known risks (tracked by P0-c/P0-d1)
 
 1. `grub-mkstandalone`'s module set or embedded-config argument may need
    adjustment on the CI runner; the build.log from the first CI run is the
@@ -417,6 +523,18 @@ acceptance.
    reduced later.
 6. Booting with `rw` modifies `disk.img`, so the artifact SHA-256 describes the
    pre-boot image (P0-c still does not solve post-boot digest staleness).
+7. The desktop path assumes the Debian display-manager package enables its
+   `display-manager.service` symlink during `mmdebstrap` (lightdm/sddm/gdm3 do
+   this in their postinst). If the CI boot log reaches multi-user without a DM,
+   the customize hook must enable it explicitly.
+8. QEMU runs with TCG on GitHub-hosted runners; Xorg on `-vga virtio` may be
+   slow or fail to start. `systemd.journald.forward_to_console=1` is what makes
+   the LightDM/Xorg failure (or success) visible in `boot.log`; the P0-d1
+   workplan allows falling back to `-vga std` or `nomodeset` if needed.
+   The boot evidence unit re-checks Xorg/display-manager processes and prints
+   `SYMBLE:` markers, which is more reliable than parsing LightDM's redirected
+   Xorg log. It runs only after `graphical.target`; if the target itself fails,
+   the usual five boot assertions still report the failure.
 
 ## Local checks
 
@@ -432,10 +550,10 @@ bash builders/debian/build.sh \
   --out /tmp/sysemble-dry --dry-run
 
 # Offline artifact manifest tests (fixture rootfs + real sha256)
-bash builders/debian/tests/artifact_test.sh        # 36 checks
+bash builders/debian/tests/artifact_test.sh        # 68 checks
 
 # Offline native --execute command-sequence test (fake UEFI toolchain)
-bash builders/debian/tests/build_exec_test.sh      # 84 checks
+bash builders/debian/tests/build_exec_test.sh      # 110 checks
 
 # On macOS, without --dry-run, the native preflight is expected to exit 3
 bash builders/debian/build.sh \
@@ -482,7 +600,8 @@ Expected evidence on success: `rootfs/`, `disk.img` (GPT + ESP + GRUB EFI),
 | File | Role |
 |---|---|
 | `build.sh` | CLI, output directory handling, dry run, native GPT/ESP/GRUB/UEFI pipeline, docker rootfs bootstrap. |
-| `lib.sh` | JSON backends, record parsing, plan validation, preflight, disk sizing, GRUB rendering, artifact helpers, usage text. |
-| `tests/artifact_test.sh` | Offline fixture tests for `artifact_json` (UEFI + P0-b fallback), kernel/initrd selection, hashing, and disk sizing. |
-| `tests/build_exec_test.sh` | Offline fake-toolchain end-to-end test of the native `--execute` P0-c command sequence, arguments, GRUB config, and failure cleanup. |
-| `testdata/plan.example.json` | Contract-shaped fixture used by the checks above. |
+| `lib.sh` | JSON backends, record parsing, plan validation, preflight, disk sizing, GRUB rendering, P0-d1 desktop inference/runtime packages/boot evidence unit, artifact helpers, usage text. |
+| `tests/artifact_test.sh` | Offline fixture tests for `artifact_json` (UEFI no-DM + graphical desktop + P0-b fallback), desktop inference, boot evidence unit text, kernel/initrd selection, hashing, and disk sizing. |
+| `tests/build_exec_test.sh` | Offline fake-toolchain end-to-end test of the native `--execute` P0-c/P0-d1 command sequence, arguments, GRUB config, desktop/no-desktop cmdlines, boot evidence unit installation, and failure cleanup. |
+| `testdata/plan.example.json` | Contract-shaped fixture used by the checks above (KDE plan, has a DM). |
+| `testdata/plan.no-desktop.json` | Minimal fixture without a display manager for the P0-d1 no-DM regression. |

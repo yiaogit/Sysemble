@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sysemble Debian builder - shared helpers for build.sh (P0-a + P0-b + P0-c).
+# Sysemble Debian builder - shared helpers for build.sh (P0-a + P0-b + P0-c + P0-d1).
 #
 # This file is sourced by build.sh. It is written for bash 3.2 (the /bin/bash
 # shipped by macOS) and must not use bash 4 features (mapfile, nameref, ...).
@@ -10,6 +10,8 @@
 #   - engine preflight checks (native / docker)
 #   - disk sizing, GRUB config rendering, and artifact.json generation helpers
 #     (P0-b kernel mode + P0-c GPT/GRUB/UEFI extensions)
+#   - P0-d1 desktop inference from plan.packages (display manager -> graphical
+#     boot, memory, cmdline, and the artifact desktop object)
 #   - output helpers / usage text
 #
 # It is safe to source this file without running a build: it only defines
@@ -124,7 +126,7 @@ err() {
 # ---------------------------------------------------------------------------
 
 IFS= read -r -d '' USAGE_TEXT <<'USAGE' || true
-Sysemble Debian builder (P0-c) - build a bootable Debian UEFI disk image from plan.json
+Sysemble Debian builder (P0-d1) - build a bootable Debian UEFI disk image from plan.json
 
 Usage:
   builders/debian/build.sh --plan <plan.json> --out <dir> [--dry-run] [--execute] [--engine docker|native]
@@ -176,10 +178,14 @@ Exit codes:
   6  a build step failed, <out>/rootfs or an output image already exists, or
      the rootfs has no bootable kernel/initrd
 
-P0-c1 scope: GPT partition table, FAT32 ESP, GRUB EFI (embedded config), and
-UEFI artifact extensions. Installers, desktops, ISO/squashfs, secure boot, and
-cross-architecture builds are out of scope. An artifact without boot.mode still
-means the P0-b direct-kernel mode.
+P0-d1 scope: GPT partition table, FAT32 ESP, GRUB EFI (embedded config), UEFI
+artifact extensions, and desktop inference from plan.packages. A plan whose
+packages include gdm3/sddm/lightdm boots graphical.target with 2048 MB and gains
+artifact.desktop + boot.graphical/memory_mb; the rootfs also gets xserver-xorg,
+procps, and an enabled sysemble-boot-evidence.service marker unit. A plan
+without a display manager keeps the frozen P0-c multi-user cmdline and 1024 MB.
+Installers, ISO/squashfs, secure boot, and cross-architecture builds are out of
+scope. An artifact without boot.mode still means the P0-b direct-kernel mode.
 USAGE
 
 usage() {
@@ -806,16 +812,154 @@ ARTIFACT_BUILDER_VERSION="0.1.0"
 ARTIFACT_BOOT_CMDLINE_KERNEL="console=ttyS0 root=/dev/vda rw rootfstype=ext4 systemd.unit=multi-user.target"
 # P0-c UEFI mode: the root filesystem is GPT partition 2 of the virtio disk.
 ARTIFACT_BOOT_CMDLINE_UEFI="root=/dev/vda2 rw console=ttyS0 rootfstype=ext4 systemd.unit=multi-user.target"
+# P0-d1 graphical boot: selected when plan.packages names a display manager.
+# journald forwarding keeps LightDM/Xorg messages on the serial console so the
+# boot-check desktop assertions can see them.
+ARTIFACT_BOOT_CMDLINE_UEFI_GRAPHICAL="root=/dev/vda2 rw console=ttyS0 rootfstype=ext4 systemd.unit=graphical.target systemd.journald.forward_to_console=1"
+ARTIFACT_BOOT_MEMORY_MB_DEFAULT=1024
+ARTIFACT_BOOT_MEMORY_MB_GRAPHICAL=2048
+# A display manager without a known session package still boots graphically;
+# this is the artifact desktop.session value used in that case.
+ARTIFACT_DESKTOP_SESSION_FALLBACK="unknown"
 # Backward-compatible alias for the current UEFI cmdline.
 ARTIFACT_BOOT_CMDLINE=$ARTIFACT_BOOT_CMDLINE_UEFI
 
+# ---------------------------------------------------------------------------
+# P0-d1 desktop inference (pure)
+#
+# The plan contract has no desktop field; the builder infers it from
+# plan.packages so the core/spec schema stays frozen:
+#
+#   gdm3          -> gdm        (highest display-manager priority)
+#   sddm          -> sddm
+#   lightdm       -> lightdm
+#   plasma-desktop -> plasma     (highest session priority)
+#   gnome-shell   -> gnome
+#   xfce4         -> xfce
+#
+# Only the display manager decides graphical mode; the session only fills the
+# artifact desktop.session field.
+# ---------------------------------------------------------------------------
+
+package_in_list() {
+  local needle=""
+  local package=""
+
+  if [ "$#" -lt 1 ]; then
+    return 1
+  fi
+  needle=$1
+  shift
+  for package in "$@"; do
+    if [ "$package" = "$needle" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Print gdm, sddm, or lightdm for the highest-priority display manager found in
+# the package arguments. Return 1 (printing nothing) when no DM is present.
+detect_display_manager() {
+  if package_in_list gdm3 "$@"; then
+    printf 'gdm\n'
+    return 0
+  fi
+  if package_in_list sddm "$@"; then
+    printf 'sddm\n'
+    return 0
+  fi
+  if package_in_list lightdm "$@"; then
+    printf 'lightdm\n'
+    return 0
+  fi
+  return 1
+}
+
+# Print plasma, gnome, or xfce for the highest-priority session package found in
+# the package arguments. A DM without a recognized session prints "unknown".
+detect_desktop_session() {
+  if package_in_list plasma-desktop "$@"; then
+    printf 'plasma\n'
+  elif package_in_list gnome-shell "$@"; then
+    printf 'gnome\n'
+  elif package_in_list xfce4 "$@"; then
+    printf 'xfce\n'
+  else
+    printf '%s\n' "$ARTIFACT_DESKTOP_SESSION_FALLBACK"
+  fi
+  return 0
+}
+
+# Packages the builder adds to a graphical build beyond plan.packages:
+#   xserver-xorg  xfce4/lightdm only *Recommend* the X server and mmdebstrap
+#                 installs no Recommends, so Xorg would otherwise be absent;
+#   procps        provides pgrep, which the boot evidence unit uses. procps is
+#                 Priority:important, so --variant=minbase does not install it.
+# No-DM builds keep the frozen P0-c package list unchanged.
+GRAPHICAL_RUNTIME_PACKAGES=(xserver-xorg procps)
+
+# Debian process name for an artifact display_manager value. gdm3 is the
+# package/process name for the "gdm" display manager.
+desktop_manager_process_name() {
+  case "$1" in
+    gdm)
+      printf 'gdm3\n'
+      ;;
+    lightdm | sddm)
+      printf '%s\n' "$1"
+      ;;
+    *)
+      err "unknown display manager: '$1'"
+      return 2
+      ;;
+  esac
+}
+
+# Emit the P0-d1 graphical boot evidence unit on stdout.
+#
+# LightDM redirects Xorg's stdout to /var/log/lightdm/x-0.log, so journald
+# console forwarding alone does not guarantee an "Xorg" line on the serial
+# console. This oneshot unit deliberately writes the boot-check marker words
+# (Xorg plus the real display-manager process name) to /dev/ttyS0.
+boot_evidence_service_text() {
+  local display_manager=$1
+  local process=""
+
+  process=$(desktop_manager_process_name "$display_manager") || return 2
+
+  printf '[Unit]\n'
+  printf 'Description=Sysemble boot evidence markers\n'
+  printf 'After=graphical.target\n'
+  printf '\n'
+  printf '[Service]\n'
+  printf 'Type=oneshot\n'
+  printf "ExecStart=/bin/sh -c 'pgrep -x Xorg >/dev/null 2>&1 && echo \"SYMBLE: Xorg ready\" > /dev/ttyS0; (pgrep -x lightdm >/dev/null 2>&1 || pgrep -x sddm >/dev/null 2>&1 || pgrep -x gdm3 >/dev/null 2>&1) && echo \"SYMBLE: %s ready\" > /dev/ttyS0; true'\n" "$process"
+  printf '\n'
+  printf '[Install]\n'
+  printf 'WantedBy=graphical.target\n'
+}
+
 # Emit the frozen P0-c GRUB configuration on stdout. <kernel_name> and
 # <initrd_name> are basenames found under rootfs/boot (for example
-# vmlinuz-6.12.3-amd64). build.sh embeds this text into BOOTX64.EFI with
-# grub-mkstandalone and keeps a copy at <out>/grub.cfg.
+# vmlinuz-6.12.3-amd64). The optional third argument selects the P0-d1 desktop
+# cmdline: "1" for graphical.target, "0"/omitted for the P0-c multi-user
+# cmdline. build.sh embeds this text into BOOTX64.EFI with grub-mkstandalone
+# and keeps a copy at <out>/grub.cfg.
 grub_cfg_text() {
   local kernel_name=$1
   local initrd_name=$2
+  local graphical=${3:-0}
+  local cmdline=$ARTIFACT_BOOT_CMDLINE_UEFI
+
+  case "$graphical" in
+    0) ;;
+    1) cmdline=$ARTIFACT_BOOT_CMDLINE_UEFI_GRAPHICAL ;;
+    *)
+      err "grub_cfg_text: graphical flag must be 0 or 1 (got '$graphical')"
+      return 2
+      ;;
+  esac
 
   case "$kernel_name" in
     '')
@@ -844,7 +988,7 @@ grub_cfg_text() {
   printf 'terminal_output serial\n'
   printf 'menuentry "%s" {\n' "$GRUB_MENU_TITLE"
   printf '  set root=(hd0,gpt2)\n'
-  printf '  linux /boot/%s %s\n' "$kernel_name" "$ARTIFACT_BOOT_CMDLINE_UEFI"
+  printf '  linux /boot/%s %s\n' "$kernel_name" "$cmdline"
   printf '  initrd /boot/%s\n' "$initrd_name"
   printf '}\n'
 }
@@ -1021,10 +1165,13 @@ find_boot_image() {
 # <out_dir> must contain rootfs/, disk.img, and disk.qcow2 with a kernel and an
 # initrd under rootfs/boot/. When <out_dir> also contains the P0-c GRUB outputs
 # (grub.cfg and esp/EFI/BOOT/BOOTX64.EFI) the manifest is extended with
-# boot.mode="uefi", boot.disk, boot.grub, and the two partitions. Without those
-# outputs the historical P0-b direct-kernel shape is emitted (boot.mode absent,
-# which consumers must treat as "kernel"). The function never writes files;
-# build.sh writes its stdout atomically to <out>/artifact.json.
+# boot.mode="uefi", boot.disk, boot.grub, and the two partitions. A package list
+# naming a display manager additionally selects the P0-d1 graphical boot
+# (boot.graphical=true, boot.memory_mb=2048, graphical.target cmdline) and adds
+# the top-level desktop object. Without the GRUB outputs the historical P0-b
+# direct-kernel shape is emitted unchanged (boot.mode absent, which consumers
+# must treat as "kernel"). The function never writes files; build.sh writes its
+# stdout atomically to <out>/artifact.json.
 artifact_json() {
   local out=""
   local spec=""
@@ -1041,6 +1188,11 @@ artifact_json() {
   local have_efi=0
   local have_cfg=0
   local cmdline=""
+  local desktop_dm=""
+  local desktop_session=""
+  local graphical=0
+  local graphical_json="false"
+  local memory_mb=$ARTIFACT_BOOT_MEMORY_MB_DEFAULT
   local root_part_mb=""
   local rootfs_mb=""
   local raw_mb=""
@@ -1128,6 +1280,21 @@ artifact_json() {
       return 1
     fi
     cmdline=$ARTIFACT_BOOT_CMDLINE_UEFI
+    # P0-d1: only a display manager turns on graphical boot. The session package
+    # supplies desktop.session but does not change the boot target by itself.
+    if desktop_dm=$(detect_display_manager "$@"); then
+      desktop_session=$(detect_desktop_session "$@")
+      graphical=1
+      graphical_json="true"
+      memory_mb=$ARTIFACT_BOOT_MEMORY_MB_GRAPHICAL
+      cmdline=$ARTIFACT_BOOT_CMDLINE_UEFI_GRAPHICAL
+    else
+      desktop_dm=""
+      desktop_session=""
+      graphical=0
+      graphical_json="false"
+      memory_mb=$ARTIFACT_BOOT_MEMORY_MB_DEFAULT
+    fi
     # The frozen P0-c artifact sample reports root = disk_mb - 512: the 1 MiB
     # alignment gap between the GPT start and the ESP is not charged to a role.
     root_part_mb=$((raw_mb - ESP_SIZE_MB))
@@ -1159,6 +1326,10 @@ artifact_json() {
   printf '    {"path": "disk.qcow2", "format": "qcow2", "size_mb": %s, "sha256": %s}\n' \
     "$qcow_mb" "$(json_quote "$qcow_sha")"
   printf '  ],\n'
+  if [ "$uefi" -eq 1 ] && [ "$graphical" -eq 1 ]; then
+    printf '  "desktop": {"session": %s, "display_manager": %s},\n' \
+      "$(json_quote "$desktop_session")" "$(json_quote "$desktop_dm")"
+  fi
   printf '  "boot": {\n'
   if [ "$uefi" -eq 1 ]; then
     printf '    "mode": "uefi",\n'
@@ -1167,6 +1338,8 @@ artifact_json() {
   printf '    "kernel": %s,\n' "$(json_quote "$kernel_rel")"
   printf '    "initrd": %s,\n' "$(json_quote "$initrd_rel")"
   if [ "$uefi" -eq 1 ]; then
+    printf '    "graphical": %s,\n' "$graphical_json"
+    printf '    "memory_mb": %s,\n' "$memory_mb"
     printf '    "cmdline": %s,\n' "$(json_quote "$cmdline")"
     printf '    "grub": {"efi": %s, "config": %s}\n' \
       "$(json_quote "$GRUB_EFI_REL")" "$(json_quote "$GRUB_CONFIG_REL")"

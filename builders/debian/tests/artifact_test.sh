@@ -1,18 +1,24 @@
 #!/usr/bin/env bash
-# P0-c artifact manifest tests.
+# P0-c/P0-d1 artifact manifest tests.
 #
 # Runs entirely offline: no Linux, root, mmdebstrap, mkfs.ext4, mkfs.vfat,
 # sgdisk, mcopy, grub-mkstandalone, qemu-img or qemu is required. It builds a
 # fixture rootfs plus a fake ESP/GRUB tree, sources lib.sh (which defines
 # functions only), and calls the pure artifact_json()/compute_disk_size_mb()/
-# grub_cfg_text() helpers. The result is validated with python3 (jq fallback).
+# grub_cfg_text()/desktop-detection helpers. The result is validated with
+# python3 (jq fallback).
 #
 # Covered:
 #   - P0-c UEFI artifact: boot.mode/disk/grub, two partitions, vda2 cmdline
+#   - P0-d1 no-DM artifact: graphical=false, memory_mb=1024, no desktop object
+#   - P0-d1 DM artifact: desktop/lightdm + xfce, graphical=true, memory_mb=2048,
+#     graphical.target + journald-forwarding cmdline
+#   - DM/session detection priority and the unknown-session fallback
+#   - graphical boot evidence unit text (Xorg + real DM process marker)
 #   - P0-b kernel fallback when the GRUB outputs are absent (mode defaults)
 #   - images raw+qcow2 with sha256/size, kernel/initrd selection
 #   - missing kernel/initrd still fail (build.sh maps that to exit 6)
-#   - P0-c disk sizing formula and GRUB config rendering
+#   - P0-c disk sizing formula and GRUB config rendering (both cmdlines)
 #
 # Usage: bash builders/debian/tests/artifact_test.sh
 
@@ -77,6 +83,29 @@ assert_contains() {
   fi
 }
 
+assert_not_contains() {
+  local pattern=$1
+  local file=$2
+  local label=$3
+
+  if grep -Fq -- "$pattern" "$file"; then
+    fail "$label (unexpected pattern '$pattern' found in $file)"
+  else
+    pass "$label"
+  fi
+}
+
+assert_fails() {
+  local label=$1
+  shift
+
+  if "$@" >/dev/null 2>&1; then
+    fail "$label (command unexpectedly succeeded)"
+  else
+    pass "$label"
+  fi
+}
+
 json_backend=python3
 if ! command -v python3 >/dev/null 2>&1; then
   if command -v jq >/dev/null 2>&1; then
@@ -86,6 +115,18 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 1
   fi
 fi
+
+json_boot_cmdline() {
+  if [ "$json_backend" = "python3" ]; then
+    python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["boot"]["cmdline"])' "$1"
+  else
+    jq -r '.boot.cmdline' "$1"
+  fi
+}
+
+grub_kernel_cmdline() {
+  sed -n 's/^  linux \/boot\/[^ ]* //p' "$1" | head -n 1
+}
 
 # ---------------------------------------------------------------------------
 # Fixture: a rootfs with two kernel/initrd versions, a 4096 MiB disk image
@@ -168,6 +209,23 @@ assert_contains "initrd /boot/$INITRD_NAME" "$OUT/grub.cfg" \
   "grub.cfg initrd line has the real initrd"
 assert_contains "rootfstype=ext4 systemd.unit=multi-user.target" "$OUT/grub.cfg" \
   "grub.cfg cmdline is the frozen P0-c cmdline"
+assert_not_contains "graphical.target" "$OUT/grub.cfg" \
+  "no-DM grub.cfg does not target graphical.target"
+
+# P0-d1: the third argument selects the desktop kernel cmdline. The journald
+# forwarding flag is required so LightDM/Xorg messages reach the serial console.
+GRAPHICAL_GRUB="$TMP_DIR/grub-graphical.cfg"
+if grub_cfg_text "$KERNEL_NAME" "$INITRD_NAME" 1 >"$GRAPHICAL_GRUB"; then
+  pass "grub_cfg_text renders the graphical cmdline"
+else
+  fail "grub_cfg_text failed for the graphical cmdline"
+fi
+assert_contains "linux /boot/$KERNEL_NAME root=/dev/vda2 rw console=ttyS0 rootfstype=ext4 systemd.unit=graphical.target systemd.journald.forward_to_console=1" \
+  "$GRAPHICAL_GRUB" "graphical grub.cfg kernel line targets graphical.target and forwards journald"
+assert_not_contains "systemd.unit=multi-user.target" "$GRAPHICAL_GRUB" \
+  "graphical grub.cfg does not keep multi-user.target"
+assert_fails "grub_cfg_text rejects an invalid graphical flag" \
+  grub_cfg_text "$KERNEL_NAME" "$INITRD_NAME" 2
 
 if grub_cfg_text "" "$INITRD_NAME" >/dev/null 2>&1; then
   fail "grub_cfg_text must reject an empty kernel name"
@@ -181,7 +239,63 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# JSON shape / values (P0-c UEFI artifact)
+# P0-d1 desktop inference (pure helpers used by build.sh and artifact_json)
+# ---------------------------------------------------------------------------
+
+assert_eq "gdm" "$(detect_display_manager gdm3 sddm lightdm)" \
+  "display-manager priority: gdm3 wins over sddm and lightdm"
+assert_eq "sddm" "$(detect_display_manager sddm lightdm)" \
+  "display-manager priority: sddm wins over lightdm"
+assert_eq "lightdm" "$(detect_display_manager apt lightdm xfce4)" \
+  "display-manager detection: lightdm"
+assert_fails "display-manager detection fails without a DM" \
+  detect_display_manager apt ca-certificates systemd
+DM_EMPTY=$(detect_display_manager apt systemd 2>/dev/null || true)
+assert_eq "" "$DM_EMPTY" "display-manager detection prints nothing without a DM"
+assert_eq "plasma" "$(detect_desktop_session plasma-desktop gnome-shell xfce4)" \
+  "session priority: plasma-desktop wins"
+assert_eq "gnome" "$(detect_desktop_session gnome-shell xfce4)" \
+  "session priority: gnome-shell wins over xfce4"
+assert_eq "xfce" "$(detect_desktop_session apt xfce4)" "session detection: xfce"
+assert_eq "unknown" "$(detect_desktop_session lightdm)" \
+  "a DM without a recognized session falls back to 'unknown'"
+
+# P0-d1 boot evidence unit: the marker text must contain Xorg and the actual
+# Debian display-manager process name so boot-check can match it unchanged.
+EVIDENCE_LIGHTDM="$TMP_DIR/evidence-lightdm.service"
+EVIDENCE_SDDM="$TMP_DIR/evidence-sddm.service"
+EVIDENCE_GDM="$TMP_DIR/evidence-gdm.service"
+if boot_evidence_service_text lightdm >"$EVIDENCE_LIGHTDM"; then
+  pass "boot_evidence_service_text renders the lightdm unit"
+else
+  fail "boot_evidence_service_text failed for lightdm"
+fi
+boot_evidence_service_text sddm >"$EVIDENCE_SDDM"
+boot_evidence_service_text gdm >"$EVIDENCE_GDM"
+assert_contains "Description=Sysemble boot evidence markers" "$EVIDENCE_LIGHTDM" \
+  "evidence unit has the Sysemble description"
+assert_contains "After=graphical.target" "$EVIDENCE_LIGHTDM" \
+  "evidence unit runs after graphical.target"
+assert_contains "WantedBy=graphical.target" "$EVIDENCE_LIGHTDM" \
+  "evidence unit is wanted by graphical.target"
+assert_contains "Type=oneshot" "$EVIDENCE_LIGHTDM" "evidence unit is oneshot"
+assert_contains "SYMBLE: Xorg ready" "$EVIDENCE_LIGHTDM" \
+  "evidence unit emits the Xorg marker"
+assert_contains "SYMBLE: lightdm ready" "$EVIDENCE_LIGHTDM" \
+  "evidence unit emits the lightdm marker"
+assert_contains "SYMBLE: sddm ready" "$EVIDENCE_SDDM" \
+  "evidence unit emits the sddm marker"
+assert_contains "SYMBLE: gdm3 ready" "$EVIDENCE_GDM" \
+  "gdm maps to the Debian gdm3 process and marker"
+assert_not_contains "SYMBLE: gdm ready" "$EVIDENCE_GDM" \
+  "gdm marker uses gdm3, not the artifact string gdm"
+assert_contains "pgrep -x Xorg" "$EVIDENCE_LIGHTDM" \
+  "evidence unit probes the Xorg process"
+assert_fails "boot_evidence_service_text rejects an unknown display manager" \
+  boot_evidence_service_text nope
+
+# ---------------------------------------------------------------------------
+# JSON shape / values (P0-c UEFI artifact, no display manager)
 # ---------------------------------------------------------------------------
 
 if [ "$json_backend" = "python3" ]; then
@@ -246,13 +360,23 @@ for image in images:
     check(image["size_mb"] == expected_mb, "%s size_mb matches the file size" % image["format"])
 
 boot = doc["boot"]
+check("desktop" not in doc, "no-DM artifact has no top-level desktop object")
+check(
+    set(boot) == {
+        "mode", "disk", "kernel", "initrd", "graphical", "memory_mb",
+        "cmdline", "grub",
+    },
+    "no-DM boot object has the P0-c keys plus graphical/memory_mb",
+)
 check(boot["mode"] == "uefi", "boot.mode is uefi")
 check(boot["disk"] == "disk.img", "boot.disk is disk.img")
 check(boot["kernel"] == "rootfs/boot/" + kernel_name, "highest kernel version wins (6.12.3)")
 check(boot["initrd"] == "rootfs/boot/" + initrd_name, "highest initrd version wins (6.12.3)")
+check(boot["graphical"] is False, "no-DM boot.graphical is false")
+check(boot["memory_mb"] == 1024, "no-DM boot.memory_mb is 1024")
 check(
     boot["cmdline"] == "root=/dev/vda2 rw console=ttyS0 rootfstype=ext4 systemd.unit=multi-user.target",
-    "boot.cmdline is the frozen P0-c UEFI cmdline",
+    "no-DM boot.cmdline is the frozen P0-c UEFI cmdline",
 )
 check(boot["cmdline"].startswith("root=/dev/vda2"), "boot.cmdline starts with root=/dev/vda2")
 check(
@@ -291,10 +415,13 @@ else
       (.images | length == 2) and
       ([.images[].format] | sort == ["qcow2","raw"]) and
       ([.images[].sha256 | test("^[0-9a-f]{64}$")] | all) and
+      (has("desktop") | not) and
       .boot.mode == "uefi" and
       .boot.disk == "disk.img" and
       .boot.kernel == "rootfs/boot/vmlinuz-6.12.3" and
       .boot.initrd == "rootfs/boot/initrd.img-6.12.3" and
+      .boot.graphical == false and
+      .boot.memory_mb == 1024 and
       .boot.cmdline == "root=/dev/vda2 rw console=ttyS0 rootfstype=ext4 systemd.unit=multi-user.target" and
       .boot.grub == {"efi":"esp/EFI/BOOT/BOOTX64.EFI","config":"grub.cfg"} and
       .partitions == [
@@ -306,6 +433,139 @@ else
     pass "artifact JSON shape and values (P0-c UEFI, jq)"
   else
     fail "artifact JSON shape and values (P0-c UEFI, jq)"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# P0-d1 graphical artifact: lightdm + xfce4 -> lightdm/xfce, 2048 MB
+# ---------------------------------------------------------------------------
+
+DM_PACKAGES=(apt ca-certificates lightdm xfce4)
+DM_JSON="$TMP_DIR/artifact-desktop.json"
+if artifact_json "$OUT" "debian-xfce" "trixie" "2026-11-01" "x86_64" \
+  "$CREATED_AT" "${DM_PACKAGES[@]}" >"$DM_JSON"; then
+  pass "artifact_json exits 0 for a DM plan"
+else
+  fail "artifact_json failed for a DM plan"
+fi
+
+assert_eq "$(json_boot_cmdline "$JSON")" "$(grub_kernel_cmdline "$OUT/grub.cfg")" \
+  "no-DM grub.cfg kernel line matches the artifact cmdline byte for byte"
+assert_eq "$(json_boot_cmdline "$DM_JSON")" "$(grub_kernel_cmdline "$GRAPHICAL_GRUB")" \
+  "graphical grub.cfg kernel line matches the artifact cmdline byte for byte"
+
+if [ "$json_backend" = "python3" ]; then
+  if python3 - "$DM_JSON" "$OUT" <<'PY'
+import json
+import os
+import sys
+
+path, out = sys.argv[1], sys.argv[2]
+with open(path, "r", encoding="utf-8") as fh:
+    doc = json.load(fh)
+
+def check(condition, message):
+    if not condition:
+        sys.exit("FAIL: " + message)
+    print("ok - " + message)
+
+DESKTOP_CMDLINE = (
+    "root=/dev/vda2 rw console=ttyS0 rootfstype=ext4 "
+    "systemd.unit=graphical.target systemd.journald.forward_to_console=1"
+)
+check(
+    set(doc) == {
+        "apiVersion", "createdAt", "spec", "base", "arch", "packages",
+        "rootfs", "images", "desktop", "boot", "partitions", "builder",
+    },
+    "DM artifact top-level keys add desktop to the P0-c shape",
+)
+check(doc["desktop"] == {"session": "xfce", "display_manager": "lightdm"},
+      "desktop infers session=xfce and display_manager=lightdm")
+check(doc["spec"] == "debian-xfce", "DM artifact keeps plan.spec")
+check(len(doc["packages"]) == 4, "DM artifact keeps the package list")
+check(
+    set(doc["boot"]) == {
+        "mode", "disk", "kernel", "initrd", "graphical", "memory_mb",
+        "cmdline", "grub",
+    },
+    "DM boot object has the P0-c keys plus graphical/memory_mb",
+)
+check(doc["boot"]["graphical"] is True, "DM boot.graphical is true")
+check(doc["boot"]["memory_mb"] == 2048, "DM boot.memory_mb is 2048")
+check(doc["boot"]["cmdline"] == DESKTOP_CMDLINE,
+      "DM boot.cmdline targets graphical.target and forwards journald")
+check(doc["boot"]["cmdline"].endswith("systemd.journald.forward_to_console=1"),
+      "DM cmdline ends with the journald console-forwarding flag")
+check(doc["boot"]["mode"] == "uefi", "DM boot.mode stays uefi")
+check(
+    doc["partitions"] == [
+        {"index": 1, "role": "esp", "size_mb": 512, "fs": "vfat32"},
+        {"index": 2, "role": "root", "size_mb": 3584, "fs": "ext4"},
+    ],
+    "DM artifact keeps the P0-c partitions unchanged",
+)
+check([image["format"] for image in doc["images"]] == ["raw", "qcow2"],
+      "DM artifact keeps the raw+qcow2 images unchanged")
+check(os.path.isfile(os.path.join(out, doc["boot"]["grub"]["efi"])),
+      "DM boot.grub.efi exists under <out>")
+PY
+  then
+    pass "artifact JSON shape and values (P0-d1 graphical)"
+  else
+    fail "artifact JSON shape and values (P0-d1 graphical)"
+  fi
+else
+  if jq -e '
+      .desktop == {"session":"xfce","display_manager":"lightdm"} and
+      .boot.graphical == true and
+      .boot.memory_mb == 2048 and
+      .boot.mode == "uefi" and
+      .boot.cmdline == "root=/dev/vda2 rw console=ttyS0 rootfstype=ext4 systemd.unit=graphical.target systemd.journald.forward_to_console=1" and
+      .partitions == [
+        {"index":1,"role":"esp","size_mb":512,"fs":"vfat32"},
+        {"index":2,"role":"root","size_mb":3584,"fs":"ext4"}
+      ]
+    ' "$DM_JSON" >/dev/null 2>&1; then
+    pass "artifact JSON shape and values (P0-d1 graphical, jq)"
+  else
+    fail "artifact JSON shape and values (P0-d1 graphical, jq)"
+  fi
+fi
+
+# The desktop object must stay absent when the same packages have no DM.
+NODM_XFCE_JSON="$TMP_DIR/artifact-xfce-no-dm.json"
+if artifact_json "$OUT" "debian-xfce" "trixie" "2026-11-01" "x86_64" \
+  "$CREATED_AT" apt xfce4 >"$NODM_XFCE_JSON" 2>/dev/null; then
+  pass "artifact_json accepts an XFCE session without a display manager"
+else
+  fail "artifact_json failed for an XFCE session without a display manager"
+fi
+if [ "$json_backend" = "python3" ]; then
+  if python3 - "$NODM_XFCE_JSON" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    doc = json.load(fh)
+if "desktop" in doc:
+    sys.exit("session-only plan must not add desktop")
+if doc["boot"]["graphical"] is not False or doc["boot"]["memory_mb"] != 1024:
+    sys.exit("session-only plan must stay non-graphical")
+if not doc["boot"]["cmdline"].endswith("systemd.unit=multi-user.target"):
+    sys.exit("session-only plan must keep the multi-user cmdline")
+PY
+  then
+    pass "session without DM keeps graphical=false/memory 1024/no desktop"
+  else
+    fail "session without DM changed the no-DM contract"
+  fi
+else
+  if jq -e '(has("desktop") | not) and .boot.graphical == false and .boot.memory_mb == 1024' \
+    "$NODM_XFCE_JSON" >/dev/null 2>&1; then
+    pass "session without DM keeps graphical=false/memory 1024/no desktop (jq)"
+  else
+    fail "session without DM changed the no-DM contract (jq)"
   fi
 fi
 
@@ -378,10 +638,14 @@ with open(sys.argv[1], "r", encoding="utf-8") as fh:
     doc = json.load(fh)
 if "partitions" in doc:
     sys.exit("kernel-mode artifact must not contain partitions")
+if "desktop" in doc:
+    sys.exit("kernel-mode artifact must not contain the P0-d1 desktop object")
 if "mode" in doc["boot"]:
     sys.exit("kernel-mode artifact must omit boot.mode (defaults to kernel)")
 if "disk" in doc["boot"] or "grub" in doc["boot"]:
     sys.exit("kernel-mode artifact must not contain UEFI boot fields")
+if "graphical" in doc["boot"] or "memory_mb" in doc["boot"]:
+    sys.exit("kernel-mode artifact must keep the historical P0-b boot shape")
 if doc["boot"]["cmdline"] != "console=ttyS0 root=/dev/vda rw rootfstype=ext4 systemd.unit=multi-user.target":
     sys.exit("kernel-mode cmdline changed")
 PY

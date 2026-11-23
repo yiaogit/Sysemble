@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sysemble boot-check (P0-b + P0-c UEFI).
+# Sysemble boot-check (P0-b kernel + P0-c UEFI + P0-d1 graphical).
 #
 # Boots a built disk image with QEMU and proves that the serial console reaches
 # a kernel, systemd, and a login prompt. With --log-from it runs the same
@@ -19,6 +19,12 @@
 #                     ESP on artifact.boot.disk. The kernel, initrd, and cmdline
 #                     live inside the disk and are not passed to QEMU.
 #
+# In UEFI mode artifact.boot.graphical=true selects the desktop image: QEMU
+# additionally gets -vga virtio and three desktop assertions (display manager,
+# Xorg, graphical target) follow the usual five. artifact.boot.memory_mb
+# overrides QEMU -m in every mode (default 1024). boot.graphical is ignored in
+# kernel mode, which keeps the P0-b assertion set at three.
+#
 # Artifact paths (boot.kernel, boot.initrd, boot.disk, images[].path) are
 # resolved relative to the directory holding artifact.json. Boot-check writes
 # <artifact dir>/boot.log and <artifact dir>/boot-evidence.json plus a temporary
@@ -32,8 +38,8 @@
 #
 # A successful boot does not power itself off. In QEMU mode a monitor watches
 # boot.log and stops QEMU as soon as every required assertion has matched (3 in
-# kernel mode, 5 in UEFI mode), which is what lets a healthily booted VM finish
-# before --timeout.
+# kernel mode, 5 in UEFI mode, 8 in UEFI graphical mode), which is what lets a
+# healthily booted VM finish before --timeout.
 #
 # Requires bash 3.2+ (macOS /bin/bash). Do not use bash 4 features
 # (mapfile, associative arrays, wait -n, ...).
@@ -72,6 +78,8 @@ TMP_DIR=""
 
 ARCH_VALUE=""
 BOOT_MODE="kernel"
+GRAPHICAL_MODE=0
+MEMORY_MB=1024
 KERNEL_REL=""
 INITRD_REL=""
 CMDLINE_VALUE=""
@@ -107,6 +115,12 @@ SYSTEMD_RESULT="fail"
 SYSTEMD_DETAIL=""
 LOGIN_RESULT="fail"
 LOGIN_DETAIL=""
+DISPLAY_MANAGER_RESULT="fail"
+DISPLAY_MANAGER_DETAIL=""
+XORG_RESULT="fail"
+XORG_DETAIL=""
+GRAPHICAL_RESULT="fail"
+GRAPHICAL_DETAIL=""
 
 # Assertion records for the evidence JSON: id<0x1f>result<0x1f>detail per line.
 # The unit separator is the same framing character the artifact parser uses, so
@@ -146,7 +160,7 @@ say() {
 }
 
 IFS= read -r -d '' USAGE_TEXT <<'USAGE' || true
-Sysemble boot-check (P0-b/P0-c) - prove a built image boots to a login prompt
+Sysemble boot-check (P0-b/P0-c/P0-d) - prove a built image boots to a login prompt
 
 Usage:
   tools/boot-check.sh --artifact <artifact.json> [--timeout 300] [--json]
@@ -174,6 +188,9 @@ Artifact fields used (relative to the artifact.json directory):
   apiVersion must be 'sysemble/artifact/v1'
   arch       must be 'x86_64' or 'aarch64'
   boot.mode  'kernel' (default when absent) or 'uefi'
+  boot.memory_mb  QEMU -m value in MB: a positive JSON integer (default: 1024)
+  boot.graphical  uefi only: true adds -vga virtio and the three desktop
+                  assertions below; missing/false keeps the P0-c behavior
   boot.kernel / boot.initrd  required when boot.mode=kernel
   boot.disk  required when boot.mode=uefi: raw GPT disk image with the ESP
   boot.cmdline is passed to QEMU -append in kernel mode only
@@ -190,6 +207,15 @@ Assertions (all required):
   boot.kernel    serial log contains 'Linux version'
   boot.systemd   serial log contains 'systemd[1]' or 'Reached target'
   boot.login     serial log contains 'login:'
+  boot.display_manager  (uefi + graphical) log contains 'lightdm', 'sddm', or
+                        'gdm' (case-insensitive)
+  boot.xorg             (uefi + graphical) log contains 'X.Org X Server' or
+                        'Xorg'
+  boot.graphical        (uefi + graphical) log contains 'Reached target
+                        Graphical Interface' or 'graphical.target'
+
+The required assertion count is therefore 3 in kernel mode, 5 in UEFI mode, and
+8 in UEFI graphical mode. boot.graphical is ignored in kernel mode.
 
 In QEMU mode every assertion must pass before --timeout; QEMU is stopped as soon
 as they do. A timeout keeps the partial boot.log and reports result 'timeout'.
@@ -490,6 +516,8 @@ def image_records:
 scalar("apiVersion"; ["apiVersion"]),
 scalar("arch"; ["arch"]),
 scalar("boot.mode"; ["boot", "mode"]),
+scalar("boot.graphical"; ["boot", "graphical"]),
+scalar("boot.memory_mb"; ["boot", "memory_mb"]),
 scalar("boot.disk"; ["boot", "disk"]),
 scalar("boot.kernel"; ["boot", "kernel"]),
 scalar("boot.initrd"; ["boot", "initrd"]),
@@ -577,6 +605,8 @@ def main(argv):
     scalar("apiVersion", ["apiVersion"])
     scalar("arch", ["arch"])
     scalar("boot.mode", ["boot", "mode"])
+    scalar("boot.graphical", ["boot", "graphical"])
+    scalar("boot.memory_mb", ["boot", "memory_mb"])
     scalar("boot.disk", ["boot", "disk"])
     scalar("boot.kernel", ["boot", "kernel"])
     scalar("boot.initrd", ["boot", "initrd"])
@@ -673,6 +703,8 @@ parse_artifact() {
   local api_type="missing" api_value=""
   local arch_type="missing" arch_value=""
   local mode_type="missing" mode_value=""
+  local graphical_type="missing" graphical_value=""
+  local memory_type="missing" memory_value=""
   local disk_type="missing" disk_value=""
   local kernel_type="missing" kernel_value=""
   local initrd_type="missing" initrd_value=""
@@ -712,6 +744,14 @@ parse_artifact() {
       boot.mode)
         mode_type=$field1
         mode_value=$field2
+        ;;
+      boot.graphical)
+        graphical_type=$field1
+        graphical_value=$field2
+        ;;
+      boot.memory_mb)
+        memory_type=$field1
+        memory_value=$field2
         ;;
       boot.disk)
         disk_type=$field1
@@ -798,6 +838,55 @@ EOF
       ;;
     *)
       err "artifact field boot.mode must be a string (got '$mode_type')"
+      exit "$EXIT_USAGE"
+      ;;
+  esac
+
+  # boot.memory_mb sizes QEMU's -m in every boot mode. Absent keeps the P0-b/c
+  # default. Only a positive JSON integer is accepted: QEMU also understands
+  # suffixes ('2G') and negative values, so anything else must not leak through.
+  case "$memory_type" in
+    missing)
+      MEMORY_MB=1024
+      ;;
+    number)
+      case "$memory_value" in
+        '' | 0 | *[!0-9]*)
+          err "artifact field boot.memory_mb must be a positive integer (got '$memory_value')"
+          exit "$EXIT_USAGE"
+          ;;
+      esac
+      MEMORY_MB=$memory_value
+      ;;
+    *)
+      err "artifact field boot.memory_mb must be a number (got '$memory_type')"
+      exit "$EXIT_USAGE"
+      ;;
+  esac
+
+  # boot.graphical selects the desktop assertion set. Absent/false is the P0-c
+  # behavior. The field is validated in every mode but only acted on in UEFI
+  # mode, so a kernel-mode artifact that carries it still runs 3 assertions.
+  case "$graphical_type" in
+    missing)
+      GRAPHICAL_MODE=0
+      ;;
+    boolean)
+      case "$graphical_value" in
+        true)
+          GRAPHICAL_MODE=1
+          ;;
+        false)
+          GRAPHICAL_MODE=0
+          ;;
+        *)
+          err "artifact field boot.graphical must be a boolean (got '$graphical_value')"
+          exit "$EXIT_USAGE"
+          ;;
+      esac
+      ;;
+    *)
+      err "artifact field boot.graphical must be a boolean (got '$graphical_type')"
       exit "$EXIT_USAGE"
       ;;
   esac
@@ -905,11 +994,21 @@ log_has() {
   grep -Fq "$1" "$LOG_PATH" 2>/dev/null
 }
 
+# Display managers mix 'lightdm' and 'LightDM' in their log lines, so the
+# boot.display_manager assertion matches case-insensitively. The Xorg and
+# graphical-target patterns stay exact: their canonical spellings are frozen by
+# docs/plan/P0-d1-workplan.md section 3.
+log_has_ci() {
+  [ -f "$LOG_PATH" ] || return 1
+  [ -s "$LOG_PATH" ] || return 1
+  grep -Fiq "$1" "$LOG_PATH" 2>/dev/null
+}
+
 # The assertion set depends on the boot mode: UEFI adds firmware and GRUB
-# before the kernel/systemd/login triple. Both all_assertions_pass (the QEMU
-# early-stop monitor) and evaluate_assertions (the evidence writer) use the
-# same predicates so a boot can never be "proven" by one and reported by the
-# other.
+# before the kernel/systemd/login triple; UEFI graphical mode adds the desktop
+# triple after it. Both all_assertions_pass (the QEMU early-stop monitor) and
+# evaluate_assertions (the evidence writer) use the same predicates so a boot
+# can never be "proven" by one and reported by the other.
 all_assertions_pass() {
   if [ "$BOOT_MODE" = "uefi" ]; then
     log_has 'EFI v' || log_has 'UEFI' || return 1
@@ -919,7 +1018,13 @@ all_assertions_pass() {
   if ! log_has 'systemd[1]' && ! log_has 'Reached target'; then
     return 1
   fi
-  log_has 'login:'
+  log_has 'login:' || return 1
+  if [ "$BOOT_MODE" = "uefi" ] && [ "$GRAPHICAL_MODE" -eq 1 ]; then
+    log_has_ci 'lightdm' || log_has_ci 'sddm' || log_has_ci 'gdm' || return 1
+    log_has 'X.Org X Server' || log_has 'Xorg' || return 1
+    log_has 'Reached target Graphical Interface' || log_has 'graphical.target' || return 1
+  fi
+  return 0
 }
 
 log_state_of() {
@@ -958,17 +1063,27 @@ failure_detail() {
 # so a log carrying all alternatives is visible in the evidence. A missing or
 # empty log is an assertion failure, never an I/O error.
 evaluate_assertion() {
-  local result_var=$1
-  local detail_var=$2
-  local fail_phrase=$3
+  evaluate_assertion_with log_has "$@"
+}
+
+# Same contract as evaluate_assertion, with case-insensitive patterns.
+evaluate_assertion_ci() {
+  evaluate_assertion_with log_has_ci "$@"
+}
+
+evaluate_assertion_with() {
+  local matcher=$1
+  local result_var=$2
+  local detail_var=$3
+  local fail_phrase=$4
   local pattern=""
   local matched=""
   local result="fail"
   local detail=""
 
-  shift 3
+  shift 4
   for pattern in "$@"; do
-    if log_has "$pattern"; then
+    if "$matcher" "$pattern"; then
       if [ -z "$matched" ]; then
         matched="\`$pattern\`"
       else
@@ -996,7 +1111,7 @@ record_assertion() {
 
 # Set the result/detail variables for every assertion that applies to the
 # current boot mode, then snapshot them as evidence records in report order.
-# kernel mode runs 3 assertions; uefi mode runs 5.
+# kernel mode runs 3 assertions; uefi mode runs 5; uefi + graphical runs 8.
 evaluate_assertions() {
   LOG_STATE=$(log_state_of)
   ASSERT_RECORDS=""
@@ -1022,6 +1137,21 @@ evaluate_assertions() {
   evaluate_assertion LOGIN_RESULT LOGIN_DETAIL \
     'no `login:`' 'login:'
   record_assertion boot.login "$LOGIN_RESULT" "$LOGIN_DETAIL"
+
+  if [ "$BOOT_MODE" = "uefi" ] && [ "$GRAPHICAL_MODE" -eq 1 ]; then
+    evaluate_assertion_ci DISPLAY_MANAGER_RESULT DISPLAY_MANAGER_DETAIL \
+      'no `lightdm`, `sddm`, or `gdm`' 'lightdm' 'sddm' 'gdm'
+    record_assertion boot.display_manager "$DISPLAY_MANAGER_RESULT" "$DISPLAY_MANAGER_DETAIL"
+
+    evaluate_assertion XORG_RESULT XORG_DETAIL \
+      'no `X.Org X Server` or `Xorg`' 'X.Org X Server' 'Xorg'
+    record_assertion boot.xorg "$XORG_RESULT" "$XORG_DETAIL"
+
+    evaluate_assertion GRAPHICAL_RESULT GRAPHICAL_DETAIL \
+      'no `Reached target Graphical Interface` or `graphical.target`' \
+      'Reached target Graphical Interface' 'graphical.target'
+    record_assertion boot.graphical "$GRAPHICAL_RESULT" "$GRAPHICAL_DETAIL"
+  fi
 }
 
 determine_result() {
@@ -1035,13 +1165,21 @@ determine_result() {
       return 0
     fi
   fi
-  if [ "$KERNEL_RESULT" = "pass" ] &&
-    [ "$SYSTEMD_RESULT" = "pass" ] &&
-    [ "$LOGIN_RESULT" = "pass" ]; then
-    RESULT=pass
-  else
+  if [ "$KERNEL_RESULT" != "pass" ] ||
+    [ "$SYSTEMD_RESULT" != "pass" ] ||
+    [ "$LOGIN_RESULT" != "pass" ]; then
     RESULT=fail
+    return 0
   fi
+  if [ "$BOOT_MODE" = "uefi" ] && [ "$GRAPHICAL_MODE" -eq 1 ]; then
+    if [ "$DISPLAY_MANAGER_RESULT" != "pass" ] ||
+      [ "$XORG_RESULT" != "pass" ] ||
+      [ "$GRAPHICAL_RESULT" != "pass" ]; then
+      RESULT=fail
+      return 0
+    fi
+  fi
+  RESULT=pass
 }
 
 # ---------------------------------------------------------------------------
@@ -1311,12 +1449,20 @@ run_qemu() {
   if [ "$BOOT_MODE" = "uefi" ]; then
     # Contract sequence: firmware CODE (read-only), writable VARS copy, then the
     # partitioned disk as a virtio drive. GRUB loads the kernel from the ESP.
+    # Graphical mode inserts -vga virtio before the drives; serial stays the only
+    # console (-nographic), so the guest's virtio-gpu is exercised by Xorg
+    # without opening a host window.
     qemu_args=(
       -machine q35
-      -m 1024
+      -m "$MEMORY_MB"
       -smp 2
       -nographic
       -no-reboot
+    )
+    if [ "$GRAPHICAL_MODE" -eq 1 ]; then
+      qemu_args+=(-vga virtio)
+    fi
+    qemu_args+=(
       -drive "if=pflash,format=raw,readonly=on,file=$FIRMWARE_CODE"
       -drive "if=pflash,format=raw,file=$VARS_TMP"
       -drive "file=$BOOT_DISK_ABS,format=raw,if=virtio"
@@ -1325,7 +1471,7 @@ run_qemu() {
   else
     qemu_args=(
       -machine "$MACHINE"
-      -m 1024
+      -m "$MEMORY_MB"
       -smp 2
       -nographic
       -no-reboot
@@ -1570,6 +1716,9 @@ report_summary() {
   fi
   if [ -n "$LOG_FROM" ]; then
     say "mode: offline (--log-from $LOG_FROM)"
+  fi
+  if [ "$BOOT_MODE" = "uefi" ] && [ "$GRAPHICAL_MODE" -eq 1 ]; then
+    say "graphical: -vga virtio, -m ${MEMORY_MB} (8 assertions)"
   fi
   say "artifact: $ARTIFACT_ABS"
   say "qemu: $QEMU_LABEL (timeout ${TIMEOUT_SECONDS}s)"

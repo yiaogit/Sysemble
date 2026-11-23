@@ -1,0 +1,46 @@
+apiVersion: sysemble/v1
+
+meta:
+  name: debian-xfce
+  description: Minimal XFCE desktop used by the P0-d1 desktop smoke test.
+  tags: [desktop, xfce, ci]
+
+target:
+  base:
+    kind: debian
+    release: trixie
+    pin: "2026-11-01"
+  arch: x86_64
+  firmware: uefi
+  output: [qcow2]
+
+system:
+  hostname: sysemble-desktop
+  locale: C.UTF-8
+  timezone: UTC
+  users:
+    - name: ops
+      groups: [sudo]
+      shell: /bin/bash
+      password: locked
+  kernel:
+    flavor: lts
+  packages:
+    include: []
+    exclude: []
+
+desktop:
+  session: xfce
+  display_manager: lightdm
+  apps: []
+
+security:
+  disk_encryption: none
+  secure_boot: false
+  firewall: none
+  hardening: minimal
+
+verify:
+  scenarios:
+    - id: desktop
+      tests: [boot, login, session]

@@ -538,7 +538,7 @@ cmp -s "$GIT_START" "$A10_STATUS_END" || A10_ERR="$A10_ERR git-status-changed"
 cmp -s "$GIT_DIFF_START" "$A10_DIFF_END" || A10_ERR="$A10_ERR tracked-diff-changed"
 [ "$LOCK_START" = "$LOCK_END" ] || A10_ERR="$A10_ERR Cargo.lock-changed"
 # P0-b: the one reviewed example addition is allowed; spec/ and other examples stay frozen.
-grep -E '^.. (spec|examples)/' "$A10_STATUS_END" | grep -vE '^.. examples/minimal-debian\.yaml$' | grep -q . && A10_ERR="$A10_ERR frozen-dir-touched"
+grep -E '^.. (spec|examples)/' "$A10_STATUS_END" | grep -vE '^.. examples/(minimal-debian|debian-xfce)\.yaml$' | grep -q . && A10_ERR="$A10_ERR frozen-dir-touched"
 
 A10_OUTSIDE=""
 while IFS= read -r line; do
@@ -548,7 +548,7 @@ while IFS= read -r line; do
     Cargo.lock | README.md | \
       crates/sysemble-core/* | crates/sysemble-cli/* | \
       builders/* | docs/plan/* | \
-      tools/* | .github/workflows/* | examples/minimal-debian.yaml | \
+      tools/* | .github/workflows/* | examples/minimal-debian.yaml | examples/debian-xfce.yaml | \
       tests/acceptance/* | docs/acceptance/*)
       ;;
     *)

@@ -66,3 +66,44 @@ jobs:
             out/build.log
             out/boot.log
             out/boot-evidence.json
+
+  desktop-smoke:
+    name: Desktop smoke (XFCE)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install build and boot tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            mmdebstrap debian-archive-keyring \
+            qemu-system-x86 qemu-utils e2fsprogs jq \
+            gdisk dosfstools mtools grub-efi-amd64-bin grub-common ovmf
+
+      - name: Plan desktop image
+        run: cargo run -q -p sysemble-cli -- plan examples/debian-xfce.yaml > plan.json
+
+      - name: Build desktop image
+        run: sudo env PATH="$PATH" bash builders/debian/build.sh --plan plan.json --out out --execute
+
+      - name: Hand build output back to the runner user
+        run: sudo chown -R "$(id -u):$(id -g)" out
+
+      - name: Boot and assert the desktop
+        run: bash tools/boot-check.sh --artifact out/artifact.json --timeout 600 --json
+
+      - name: Upload desktop boot evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-evidence-desktop
+          if-no-files-found: warn
+          path: |
+            plan.json
+            out/artifact.json
+            out/build.log
+            out/boot.log
+            out/boot-evidence.json

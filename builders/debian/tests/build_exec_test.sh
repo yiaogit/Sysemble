@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# P0-c native `--execute` command-sequence test.
+# P0-c/P0-d1 native `--execute` command-sequence test.
 #
 # macOS has no Linux, root, mmdebstrap, sgdisk, mkfs.ext4, mkfs.vfat, mcopy,
 # grub-mkstandalone, dd (as a controllable fake), or qemu-img, so this test
@@ -11,6 +11,15 @@
 #     the actual kernel/initrd versions
 #   - the grub-mkstandalone module list and embedded config argument
 #   - the UEFI artifact fields: mode/disk/grub/partitions/cmdline/images
+#   - P0-d1: a DM plan (KDE: sddm+plasma-desktop) produces the graphical
+#     desktop object, graphical=true, memory_mb=2048, and a graphical.target +
+#     journald-forwarding cmdline; grub.cfg and artifact.json agree byte for
+#     byte
+#   - P0-d1: a graphical build adds xserver-xorg/procps and installs + enables
+#     the sysemble-boot-evidence.service marker unit; a no-DM build adds none
+#     of them
+#   - P0-d1: a no-DM plan keeps graphical=false, memory_mb=1024, no desktop
+#     object, and the frozen multi-user cmdline; grub.cfg agrees
 #   - failure cleanup keeps rootfs + disk.img + build.log, removes esp.img and
 #     partial qcow2 (GRUB and qemu-img failure paths)
 #   - preflight reports every missing P0-c tool
@@ -29,13 +38,20 @@ esac
 TEST_DIR=$(cd "$TEST_DIR" && pwd)
 BUILDER_DIR=$(cd "$TEST_DIR/.." && pwd)
 BUILD_SH="$BUILDER_DIR/build.sh"
+# KDE fixture: a display manager (sddm) + session (plasma-desktop) -> graphical.
 PLAN="$BUILDER_DIR/testdata/plan.example.json"
+# Minimal fixture with no display manager -> frozen P0-c multi-user behavior.
+PLAN_NODM="$BUILDER_DIR/testdata/plan.no-desktop.json"
 
 # shellcheck source=builders/debian/lib.sh
 . "$BUILDER_DIR/lib.sh"
 
 if [ ! -f "$PLAN" ]; then
   printf 'FAIL: fixture plan not found: %s\n' "$PLAN" >&2
+  exit 1
+fi
+if [ ! -f "$PLAN_NODM" ]; then
+  printf 'FAIL: no-desktop fixture plan not found: %s\n' "$PLAN_NODM" >&2
   exit 1
 fi
 if ! command -v python3 >/dev/null 2>&1; then
@@ -95,12 +111,28 @@ assert_absent() {
   fi
 }
 
+assert_not_contains() {
+  if grep -Fq -- "$1" "$2"; then
+    fail "$3 (unexpected pattern '$1' found in $2)"
+  else
+    pass "$3"
+  fi
+}
+
 assert_file() {
   if [ -f "$1" ]; then
     pass "$2"
   else
     fail "$2 (missing file: $1)"
   fi
+}
+
+artifact_boot_cmdline() {
+  python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["boot"]["cmdline"])' "$1"
+}
+
+grub_kernel_cmdline() {
+  sed -n 's/^  linux \/boot\/[^ ]* //p' "$1" | head -n 1
 }
 
 # ---------------------------------------------------------------------------
@@ -491,23 +523,41 @@ chmod +x "$FAKEBIN"/*
 # ---------------------------------------------------------------------------
 
 run_build() {
-  local out=$1
-  local log=$2
-  shift 2
+  local plan=$1
+  local out=$2
+  local log=$3
+  shift 3
 
-  PATH="$FAKEBIN:$PATH" bash "$BUILD_SH" --plan "$PLAN" --out "$out" "$@" \
+  PATH="$FAKEBIN:$PATH" bash "$BUILD_SH" --plan "$plan" --out "$out" "$@" \
     >"$log" 2>&1
 }
 
 # artifact.json checker used by both successful builds.
+# Usage: validate_artifact <json> <out_dir> <expected_spec> <package_count> <mode>
+# mode is "graphical" (DM plan) or "plain" (no-DM plan).
 validate_artifact() {
-  python3 - "$1" "$2" "$3" <<'PY'
+  python3 - "$1" "$2" "$3" "$4" "$5" <<'PY'
 import json
 import os
 import re
 import sys
 
-path, out, expected_spec = sys.argv[1], sys.argv[2], sys.argv[3]
+path, out, expected_spec, expected_packages, mode = (
+    sys.argv[1],
+    sys.argv[2],
+    sys.argv[3],
+    sys.argv[4],
+    sys.argv[5],
+)
+MULTIUSER_CMDLINE = (
+    "root=/dev/vda2 rw console=ttyS0 rootfstype=ext4 "
+    "systemd.unit=multi-user.target"
+)
+GRAPHICAL_CMDLINE = (
+    "root=/dev/vda2 rw console=ttyS0 rootfstype=ext4 "
+    "systemd.unit=graphical.target systemd.journald.forward_to_console=1"
+)
+
 with open(path, "r", encoding="utf-8") as fh:
     doc = json.load(fh)
 
@@ -521,7 +571,7 @@ check(doc["arch"] == "x86_64", "arch")
 check(doc["base"]["kind"] == "debian", "base.kind")
 check(doc["base"]["release"] == "trixie", "base.release")
 check(doc["base"]["pin"] == "2026-11-01", "base.pin")
-check(len(doc["packages"]) == 43, "packages count (fixture plan)")
+check(len(doc["packages"]) == int(expected_packages), "packages count (fixture plan)")
 check(doc["rootfs"]["path"] == "rootfs", "rootfs.path")
 check(doc["rootfs"]["size_mb"] >= 1, "rootfs.size_mb")
 check(len(doc["images"]) == 2, "images count")
@@ -538,10 +588,19 @@ check(boot["mode"] == "uefi", "boot.mode uefi")
 check(boot["disk"] == "disk.img", "boot.disk")
 check(boot["kernel"] == "rootfs/boot/vmlinuz-6.12.3", "kernel 6.12.3")
 check(boot["initrd"] == "rootfs/boot/initrd.img-6.12.3", "initrd 6.12.3")
-check(
-    boot["cmdline"] == "root=/dev/vda2 rw console=ttyS0 rootfstype=ext4 systemd.unit=multi-user.target",
-    "cmdline",
-)
+if mode == "graphical":
+    check(doc.get("desktop") == {"session": "plasma", "display_manager": "sddm"},
+          "desktop session/display manager")
+    check(boot["graphical"] is True, "boot.graphical is true")
+    check(boot["memory_mb"] == 2048, "boot.memory_mb is 2048")
+    check(boot["cmdline"] == GRAPHICAL_CMDLINE, "graphical cmdline")
+elif mode == "plain":
+    check("desktop" not in doc, "no desktop object")
+    check(boot["graphical"] is False, "boot.graphical is false")
+    check(boot["memory_mb"] == 1024, "boot.memory_mb is 1024")
+    check(boot["cmdline"] == MULTIUSER_CMDLINE, "multi-user cmdline")
+else:
+    sys.exit("FAIL: unknown artifact mode " + mode)
 check(boot["cmdline"].startswith("root=/dev/vda2"), "cmdline starts with root=/dev/vda2")
 check(boot["grub"] == {"efi": "esp/EFI/BOOT/BOOTX64.EFI", "config": "grub.cfg"}, "boot.grub")
 check(os.path.isfile(os.path.join(out, boot["grub"]["efi"])), "grub.efi exists")
@@ -573,7 +632,7 @@ FAKE_LOG="$TMP_DIR/fake-main"
 export FAKE_LOG
 mkdir -p "$FAKE_LOG"
 
-if run_build "$OUT1" "$LOG1" --execute; then
+if run_build "$PLAN" "$OUT1" "$LOG1" --execute; then
   pass "--execute exits 0 with the fake UEFI toolchain"
 else
   cat "$LOG1" >&2
@@ -582,8 +641,8 @@ fi
 
 if [ -f "$OUT1/artifact.json" ]; then
   pass "artifact.json exists"
-  if validate_artifact "$OUT1/artifact.json" "$OUT1" "debian-kde-dev"; then
-    pass "artifact.json UEFI fields, partitions, sizes, shas, and boot entries are valid"
+  if validate_artifact "$OUT1/artifact.json" "$OUT1" "debian-kde-dev" 43 graphical; then
+    pass "artifact.json UEFI + graphical desktop fields, partitions, sizes, shas, and boot entries are valid"
   else
     fail "artifact.json validation failed"
   fi
@@ -600,6 +659,26 @@ assert_eq "4294967296" "$RAW_BYTES" "truncate created a 4096 MiB raw image"
 assert_file "$OUT1/esp/EFI/BOOT/BOOTX64.EFI" "ESP staging keeps BOOTX64.EFI"
 assert_file "$OUT1/esp/boot/grub/grub.cfg" "ESP staging keeps boot/grub/grub.cfg"
 assert_absent "$OUT1/esp.img" "successful build removes the intermediate esp.img"
+
+# P0-d1 boot evidence unit: installed only for the graphical build, with the
+# real display-manager process name and an enable link for graphical.target.
+EVIDENCE_UNIT="$OUT1/rootfs/etc/systemd/system/sysemble-boot-evidence.service"
+EVIDENCE_LINK="$OUT1/rootfs/etc/systemd/system/graphical.target.wants/sysemble-boot-evidence.service"
+assert_file "$EVIDENCE_UNIT" "graphical build installs the boot evidence unit"
+assert_contains "SYMBLE: Xorg ready" "$EVIDENCE_UNIT" \
+  "evidence unit contains the Xorg marker"
+assert_contains "SYMBLE: sddm ready" "$EVIDENCE_UNIT" \
+  "evidence unit contains the actual sddm marker"
+assert_contains "pgrep -x Xorg" "$EVIDENCE_UNIT" \
+  "evidence unit probes the Xorg process"
+assert_contains "WantedBy=graphical.target" "$EVIDENCE_UNIT" \
+  "evidence unit is wanted by graphical.target"
+if [ -L "$EVIDENCE_LINK" ] &&
+  [ "$(readlink "$EVIDENCE_LINK" 2>/dev/null || true)" = "../sysemble-boot-evidence.service" ]; then
+  pass "evidence unit is enabled via graphical.target.wants symlink"
+else
+  fail "evidence unit graphical.target.wants symlink is missing or wrong"
+fi
 
 CALLS="$FAKE_LOG/calls.log"
 if [ -f "$CALLS" ]; then
@@ -640,6 +719,8 @@ fi
 OUT1_ABS=$(cd "$OUT1" && pwd -P)
 assert_contains "serial-getty@ttyS0.service" "$CALLS" "hook enables serial-getty@ttyS0.service"
 assert_contains "include=apt,ca-certificates" "$CALLS" "mmdebstrap received the plan package list"
+assert_contains "xserver-xorg,procps" "$CALLS" \
+  "graphical mmdebstrap adds xserver-xorg and procps for Xorg/pgrep"
 assert_contains "sgdisk -Z $OUT1_ABS/disk.img" "$CALLS" "sgdisk -Z wiped disk.img"
 assert_contains "sgdisk -n 1:2048:+512M -t 1:ef00 -n 2:0:0 -t 2:8300 $OUT1_ABS/disk.img" "$CALLS" \
   "sgdisk created the frozen GPT ESP+root layout"
@@ -666,11 +747,13 @@ assert_contains "terminal_input serial" "$OUT1/grub.cfg" "grub.cfg uses serial i
 assert_contains "terminal_output serial" "$OUT1/grub.cfg" "grub.cfg uses serial output"
 assert_contains "menuentry \"Sysemble\"" "$OUT1/grub.cfg" "grub.cfg has the menu entry"
 assert_contains "set root=(hd0,gpt2)" "$OUT1/grub.cfg" "grub.cfg selects (hd0,gpt2)"
-assert_contains "linux /boot/vmlinuz-6.12.3 root=/dev/vda2 rw console=ttyS0 rootfstype=ext4 systemd.unit=multi-user.target" \
-  "$OUT1/grub.cfg" "grub.cfg linux line uses the actual kernel and vda2 cmdline"
+assert_contains "linux /boot/vmlinuz-6.12.3 root=/dev/vda2 rw console=ttyS0 rootfstype=ext4 systemd.unit=graphical.target systemd.journald.forward_to_console=1" \
+  "$OUT1/grub.cfg" "grub.cfg linux line targets graphical.target and forwards journald"
 assert_contains "initrd /boot/initrd.img-6.12.3" "$OUT1/grub.cfg" \
   "grub.cfg initrd line uses the actual initrd version"
 assert_contains "console=ttyS0" "$OUT1/grub.cfg" "grub.cfg cmdline includes console=ttyS0"
+assert_eq "$(artifact_boot_cmdline "$OUT1/artifact.json")" "$(grub_kernel_cmdline "$OUT1/grub.cfg")" \
+  "artifact boot.cmdline matches the grub.cfg kernel line byte for byte"
 if cmp -s "$OUT1/grub.cfg" "$OUT1/esp/boot/grub/grub.cfg"; then
   pass "staged grub.cfg is byte-identical to <out>/grub.cfg"
 else
@@ -687,6 +770,71 @@ assert_contains "fake dd:" "$OUT1/build.log" "build.log tees dd output"
 assert_contains "fake qemu-img:" "$OUT1/build.log" "build.log tees qemu-img output"
 assert_contains "stage 5/6: assemble GPT disk image" "$OUT1/build.log" "build.log records the GPT stage"
 assert_contains "stage 6/6: write artifact manifest" "$OUT1/build.log" "build.log records the artifact stage"
+assert_contains "desktop: session=plasma, display_manager=sddm (graphical boot, 2048 MB)" \
+  "$OUT1/build.log" "build.log records the inferred graphical desktop"
+assert_contains "boot evidence: install /etc/systemd/system/sysemble-boot-evidence.service" \
+  "$OUT1/build.log" "build.log records the installed boot evidence unit"
+
+# ---------------------------------------------------------------------------
+# Case 1b: no-DM plan keeps the frozen P0-c multi-user behavior end to end
+# ---------------------------------------------------------------------------
+
+OUT_NODM="$TMP_DIR/out-no-desktop"
+LOG_NODM="$TMP_DIR/run-no-desktop.log"
+FAKE_LOG="$TMP_DIR/fake-no-desktop"
+export FAKE_LOG
+mkdir -p "$FAKE_LOG"
+
+if run_build "$PLAN_NODM" "$OUT_NODM" "$LOG_NODM" --execute; then
+  pass "no-DM --execute exits 0 with the fake UEFI toolchain"
+else
+  cat "$LOG_NODM" >&2
+  fail "no-DM --execute did not exit 0"
+fi
+
+if [ -f "$OUT_NODM/artifact.json" ]; then
+  pass "no-DM artifact.json exists"
+  if validate_artifact "$OUT_NODM/artifact.json" "$OUT_NODM" "debian-minimal" 14 plain; then
+    pass "no-DM artifact keeps graphical=false, memory_mb=1024, no desktop, and the multi-user cmdline"
+  else
+    fail "no-DM artifact.json validation failed"
+  fi
+else
+  fail "no-DM artifact.json was not written"
+fi
+
+assert_eq "debian-minimal" "$(cat "$OUT_NODM/rootfs/etc/hostname" 2>/dev/null || true)" \
+  "no-DM customize hook writes plan.spec to /etc/hostname"
+assert_contains "linux /boot/vmlinuz-6.12.3 root=/dev/vda2 rw console=ttyS0 rootfstype=ext4 systemd.unit=multi-user.target" \
+  "$OUT_NODM/grub.cfg" "no-DM grub.cfg keeps the frozen multi-user cmdline"
+if grep -Fq -- "graphical.target" "$OUT_NODM/grub.cfg"; then
+  fail "no-DM grub.cfg unexpectedly targets graphical.target"
+else
+  pass "no-DM grub.cfg does not target graphical.target"
+fi
+if grep -Fq -- "journald.forward_to_console" "$OUT_NODM/grub.cfg"; then
+  fail "no-DM grub.cfg unexpectedly adds journald forwarding"
+else
+  pass "no-DM grub.cfg does not add journald forwarding"
+fi
+assert_eq "$(artifact_boot_cmdline "$OUT_NODM/artifact.json")" "$(grub_kernel_cmdline "$OUT_NODM/grub.cfg")" \
+  "no-DM artifact boot.cmdline matches the grub.cfg kernel line byte for byte"
+assert_contains "desktop: none detected (multi-user boot, 1024 MB)" \
+  "$OUT_NODM/build.log" "build.log records the absence of a desktop"
+assert_file "$OUT_NODM/esp/EFI/BOOT/BOOTX64.EFI" "no-DM build still stages BOOTX64.EFI"
+assert_absent "$OUT_NODM/esp.img" "no-DM build still removes the intermediate esp.img"
+assert_absent "$OUT_NODM/rootfs/etc/systemd/system/sysemble-boot-evidence.service" \
+  "no-DM build does not install the boot evidence unit"
+assert_absent "$OUT_NODM/rootfs/etc/systemd/system/graphical.target.wants/sysemble-boot-evidence.service" \
+  "no-DM build does not enable the boot evidence unit"
+NODM_CALLS="$TMP_DIR/calls-no-desktop.log"
+cp "$FAKE_LOG/calls.log" "$NODM_CALLS"
+assert_not_contains "xserver-xorg" "$NODM_CALLS" \
+  "no-DM mmdebstrap does not add the graphical Xorg runtime package"
+assert_not_contains "procps" "$NODM_CALLS" \
+  "no-DM mmdebstrap does not add the graphical procps runtime package"
+assert_not_contains "boot evidence:" "$OUT_NODM/build.log" \
+  "no-DM build.log does not record a boot evidence unit"
 
 # ---------------------------------------------------------------------------
 # Case 2: serial getty enable failure is non-fatal and lands in build.log
@@ -700,7 +848,7 @@ mkdir -p "$FAKE_LOG"
 
 export FAKE_CHROOT_RC=1
 
-if run_build "$OUT2" "$LOG2"; then
+if run_build "$PLAN" "$OUT2" "$LOG2"; then
   pass "failed systemctl enable does not fail the build (no --execute flag either)"
 else
   cat "$LOG2" >&2
@@ -730,7 +878,7 @@ mkdir -p "$FAKE_LOG"
 
 export FAKE_QEMU_FAIL=1
 RC3=0
-if run_build "$OUT3" "$LOG3" --execute; then
+if run_build "$PLAN" "$OUT3" "$LOG3" --execute; then
   RC3=0
 else
   RC3=$?
@@ -764,7 +912,7 @@ mkdir -p "$FAKE_LOG"
 
 export FAKE_GRUB_FAIL=1
 RC4=0
-if run_build "$OUT4" "$LOG4" --execute; then
+if run_build "$PLAN" "$OUT4" "$LOG4" --execute; then
   RC4=0
 else
   RC4=$?
@@ -794,7 +942,7 @@ mkdir -p "$FAKE_LOG"
 
 export FAKE_VFAT_BAD_SIZE=1
 RC_ESP=0
-if run_build "$OUT_ESP" "$LOG_ESP" --execute; then
+if run_build "$PLAN" "$OUT_ESP" "$LOG_ESP" --execute; then
   RC_ESP=0
 else
   RC_ESP=$?
@@ -824,7 +972,7 @@ export FAKE_LOG
 mkdir -p "$FAKE_LOG"
 
 RC5=0
-if run_build "$OUT5" "$LOG5" --execute; then
+if run_build "$PLAN" "$OUT5" "$LOG5" --execute; then
   RC5=0
 else
   RC5=$?

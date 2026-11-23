@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Sysemble boot-check tests (P0-b kernel mode + P0-c UEFI mode).
+# Sysemble boot-check tests (P0-b kernel mode + P0-c UEFI mode + P0-d1 desktop).
 #
 # Exercises tools/boot-check.sh without QEMU:
 #   - offline assertion mode (--log-from) on canned good/bad/empty logs
 #   - kernel mode: 3 assertions, -kernel/-initrd argv (P0-b regression)
 #   - UEFI mode: 5 assertions, OVMF pflash argv, VARS copy/cleanup, exit 3
+#   - graphical mode: 8 assertions, -vga virtio, boot.memory_mb, desktop fields
 #   - artifact validation and usage errors
 #   - QEMU availability, fake-QEMU success, fake-QEMU timeout
 #
@@ -345,6 +346,82 @@ sysemble login:
 EOF
 }
 
+# P0-d1 graphical fixture: the UEFI disk plus the desktop fields from
+# docs/plan/P0-d1-workplan.md section 2 (lightdm + xfce, graphical.target, 2 GB).
+make_graphical_fixture() {
+  local dir=$1
+
+  make_uefi_fixture "$dir"
+
+  cat >"$dir/artifact.json" <<'EOF'
+{
+  "apiVersion": "sysemble/artifact/v1",
+  "createdAt": "2026-11-23T12:00:00Z",
+  "spec": "minimal-debian",
+  "base": {"kind": "debian", "release": "trixie", "pin": "2026-11-01"},
+  "arch": "x86_64",
+  "packages": ["linux-image-amd64", "grub-efi-amd64-bin", "lightdm", "xfce4"],
+  "rootfs": {"path": "rootfs", "size_mb": 1},
+  "images": [
+    {"path": "disk.img", "format": "raw", "size_mb": 1, "sha256": "00"},
+    {"path": "disk.qcow2", "format": "qcow2", "size_mb": 1, "sha256": "00"}
+  ],
+  "desktop": {"session": "xfce", "display_manager": "lightdm"},
+  "boot": {
+    "mode": "uefi",
+    "graphical": true,
+    "memory_mb": 2048,
+    "disk": "disk.img",
+    "kernel": "rootfs/boot/vmlinuz-6.12.0-amd64",
+    "initrd": "rootfs/boot/initrd.img-6.12.0-amd64",
+    "cmdline": "root=/dev/vda2 rw console=ttyS0 rootfstype=ext4 systemd.unit=graphical.target",
+    "grub": {"efi": "esp/EFI/BOOT/BOOTX64.EFI", "config": "grub.cfg"}
+  },
+  "partitions": [
+    {"index": 1, "role": "esp", "size_mb": 512, "fs": "vfat32"},
+    {"index": 2, "role": "root", "size_mb": 3584, "fs": "ext4"}
+  ],
+  "builder": {"name": "build.sh", "version": "0.1.0"}
+}
+EOF
+}
+
+# Healthy desktop boot: firmware + GRUB + kernel + systemd + login followed by
+# a display manager, an X server, and the graphical target. LightDM's capital
+# spelling proves boot.display_manager matches case-insensitively.
+write_graphical_good_log() {
+  cat >"$1" <<'EOF'
+[    0.000000] efi: EFI v2.70 by EDK II
+GRUB loading..
+Booting `Sysemble'
+[    0.000000] Linux version 6.12.0-amd64 (debian-kernel@lists.debian.org)
+[    0.123456] systemd[1]: Detected virtualization qemu.
+[    1.234567] systemd[1]: Reached target Local File Systems.
+[    2.000000] systemd[1]: Starting LightDM Display Manager...
+[    2.100000] X.Org X Server 21.1.7
+[    2.200000] systemd[1]: Reached target Graphical Interface.
+[    2.345678] Debian GNU/Linux 13 sysemble ttyS0
+sysemble login:
+EOF
+}
+
+# Same desktop boot with no X server output at all: everything else passes, so
+# only boot.xorg may fail.
+write_graphical_no_xorg_log() {
+  cat >"$1" <<'EOF'
+[    0.000000] efi: EFI v2.70 by EDK II
+GRUB loading..
+Booting `Sysemble'
+[    0.000000] Linux version 6.12.0-amd64 (debian-kernel@lists.debian.org)
+[    0.123456] systemd[1]: Detected virtualization qemu.
+[    1.234567] systemd[1]: Reached target Local File Systems.
+[    2.000000] systemd[1]: Starting LightDM Display Manager...
+[    2.200000] systemd[1]: Reached target Graphical Interface.
+[    2.345678] Debian GNU/Linux 13 sysemble ttyS0
+sysemble login:
+EOF
+}
+
 # Fake UEFI qemu: records argv, copies the writable pflash VARS file aside (so
 # the test can prove the VARS template reached QEMU), emits a healthy UEFI log,
 # then either exits (like a powered-off VM) or keeps running (to prove the
@@ -377,6 +454,47 @@ LOG
 SCRIPT
   if [ "$mode" = "hang" ]; then
     # A real booted VM never exits; boot-check must stop it after 5 matches.
+    printf 'exec sleep 30\n' >>"$path"
+  else
+    printf 'exit 0\n' >>"$path"
+  fi
+  chmod +x "$path"
+}
+
+# Fake desktop qemu: same argv/VARS bookkeeping as write_fake_qemu_uefi, but it
+# emits the eight-assertion graphical log. 'hang' keeps the process alive so the
+# test proves the early-stop monitor now waits for all eight assertions.
+write_fake_qemu_uefi_graphical() {
+  local path=$1
+  local mode=${2:-exit}
+
+  cat >"$path" <<'SCRIPT'
+#!/bin/sh
+printf '%s\n' "$@" >"$FAKE_QEMU_ARGS"
+for arg in "$@"; do
+  case "$arg" in
+    if=pflash*readonly=on*) ;;
+    if=pflash*file=*)
+      cp "${arg##*file=}" "$FAKE_QEMU_VARS_COPY" 2>/dev/null || exit 9
+      ;;
+  esac
+done
+cat <<'LOG'
+[    0.000000] efi: EFI v2.70 by EDK II
+GRUB loading..
+Booting `Sysemble'
+[    0.000000] Linux version 6.12.0-amd64 (debian-kernel@lists.debian.org)
+[    0.123456] systemd[1]: Detected virtualization qemu.
+[    1.234567] systemd[1]: Reached target Local File Systems.
+[    2.000000] systemd[1]: Starting LightDM Display Manager...
+[    2.100000] X.Org X Server 21.1.7
+[    2.200000] systemd[1]: Reached target Graphical Interface.
+[    2.345678] Debian GNU/Linux 13 sysemble ttyS0
+sysemble login:
+LOG
+SCRIPT
+  if [ "$mode" = "hang" ]; then
+    # A real booted VM never exits; boot-check must stop it after 8 matches.
     printf 'exec sleep 30\n' >>"$path"
   else
     printf 'exit 0\n' >>"$path"
@@ -471,6 +589,35 @@ PY
   fi
 }
 
+# Set a dotted field to an arbitrary JSON literal (true, 0, ...). set_artifact_field
+# only writes strings, which is not enough to exercise boolean/number fields.
+set_artifact_json_field() {
+  local in=$1
+  local out=$2
+  local path=$3
+  local value=$4
+
+  if [ "$JSON_TOOL" = "jq" ]; then
+    jq --arg p "$path" --argjson v "$value" \
+      'setpath(($p | split(".")); $v)' "$in" >"$out" 2>/dev/null
+  else
+    python3 - "$in" "$out" "$path" "$value" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    data = json.load(fh)
+node = data
+keys = sys.argv[3].split(".")
+for key in keys[:-1]:
+    node = node[key]
+node[keys[-1]] = json.loads(sys.argv[4])
+with open(sys.argv[2], "w", encoding="utf-8") as fh:
+    json.dump(data, fh, indent=2)
+PY
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # JSON helpers
 # ---------------------------------------------------------------------------
@@ -501,6 +648,7 @@ json_query() {
       log) jq -r '.log' "$file" 2>/dev/null ;;
       log_sha256) jq -r '.log_sha256' "$file" 2>/dev/null ;;
       assertion_count) jq -r '.assertions | length' "$file" 2>/dev/null ;;
+      assertion_ids) jq -r '.assertions | map(.id) | join(",")' "$file" 2>/dev/null ;;
       assertion_result)
         jq -r --arg id "$arg" '.assertions[] | select(.id == $id) | .result' "$file" 2>/dev/null
         ;;
@@ -540,6 +688,8 @@ def main(argv):
         print(data["log_sha256"])
     elif key == "assertion_count":
         print(len(data["assertions"]))
+    elif key == "assertion_ids":
+        print(",".join(item["id"] for item in data["assertions"]))
     elif key == "assertion_result":
         for item in data["assertions"]:
             if item["id"] == arg:
@@ -1270,6 +1420,250 @@ EOF
   end_case
 }
 
+# ---------------------------------------------------------------------------
+# Graphical mode (P0-d1)
+# ---------------------------------------------------------------------------
+
+test_graphical_good_log_offline() {
+  local evidence=""
+  local stderr_text=""
+  local ids=""
+
+  begin_case "graphical canned good log -> exit 0, eight passes"
+  make_graphical_fixture "$CASE_DIR"
+  evidence="$CASE_DIR/boot-evidence.json"
+  write_graphical_good_log "$CASE_DIR/good-graphical.log"
+  ids="boot.firmware,boot.grub,boot.kernel,boot.systemd,boot.login"
+  ids="$ids,boot.display_manager,boot.xorg,boot.graphical"
+
+  invoke_boot_check "$BASH_BIN" "$BOOT_CHECK" \
+    --artifact "$CASE_DIR/artifact.json" \
+    --log-from "$CASE_DIR/good-graphical.log" --json
+
+  check_eq "exit code" 0 "$RC"
+  check_file "evidence file" "$evidence"
+  check_no_file "boot.log absent in offline mode" "$CASE_DIR/boot.log"
+  check_eq "stdout is valid JSON" 1 "$(json_valid "$OUT_FILE" && echo 1 || echo 0)"
+  check_eq "result" "pass" "$(json_query "$evidence" result)"
+  check_eq "assertion count" 8 "$(json_query "$evidence" assertion_count)"
+  check_eq "assertion ids and order" "$ids" "$(json_query "$evidence" assertion_ids)"
+  check_eq "boot.firmware" "pass" "$(json_query "$evidence" assertion_result boot.firmware)"
+  check_eq "boot.grub" "pass" "$(json_query "$evidence" assertion_result boot.grub)"
+  check_eq "boot.kernel" "pass" "$(json_query "$evidence" assertion_result boot.kernel)"
+  check_eq "boot.systemd" "pass" "$(json_query "$evidence" assertion_result boot.systemd)"
+  check_eq "boot.login" "pass" "$(json_query "$evidence" assertion_result boot.login)"
+  check_eq "boot.display_manager" "pass" "$(json_query "$evidence" assertion_result boot.display_manager)"
+  check_eq "boot.xorg" "pass" "$(json_query "$evidence" assertion_result boot.xorg)"
+  check_eq "boot.graphical" "pass" "$(json_query "$evidence" assertion_result boot.graphical)"
+  # The log spells the DM as 'LightDM': a pass here is the case-insensitive match.
+  check_contains "display manager detail" 'matched `lightdm`' "$(json_query "$evidence" assertion_detail boot.display_manager)"
+  check_contains "xorg detail" 'matched `X.Org X Server`' "$(json_query "$evidence" assertion_detail boot.xorg)"
+  check_contains "graphical detail" 'matched `Reached target Graphical Interface`' "$(json_query "$evidence" assertion_detail boot.graphical)"
+  stderr_text=$(cat "$ERR_FILE")
+  check_contains "human summary on stderr" "boot.display_manager: pass" "$stderr_text"
+  check_contains "graphical mode summary" "graphical: -vga virtio, -m 2048 (8 assertions)" "$stderr_text"
+  end_case
+}
+
+test_graphical_missing_xorg_offline() {
+  local evidence=""
+
+  begin_case "graphical log without Xorg -> boot.xorg fail, exit 1"
+  make_graphical_fixture "$CASE_DIR"
+  evidence="$CASE_DIR/boot-evidence.json"
+  write_graphical_no_xorg_log "$CASE_DIR/no-xorg.log"
+
+  invoke_boot_check "$BASH_BIN" "$BOOT_CHECK" \
+    --artifact "$CASE_DIR/artifact.json" \
+    --log-from "$CASE_DIR/no-xorg.log" --json
+
+  check_eq "exit code" 1 "$RC"
+  check_eq "result" "fail" "$(json_query "$evidence" result)"
+  check_eq "assertion count" 8 "$(json_query "$evidence" assertion_count)"
+  check_eq "boot.display_manager still evaluated" "pass" "$(json_query "$evidence" assertion_result boot.display_manager)"
+  check_eq "boot.xorg" "fail" "$(json_query "$evidence" assertion_result boot.xorg)"
+  check_contains "xorg detail" 'no `X.Org X Server` or `Xorg`' "$(json_query "$evidence" assertion_detail boot.xorg)"
+  check_eq "boot.graphical still evaluated" "pass" "$(json_query "$evidence" assertion_result boot.graphical)"
+  check_eq "boot.login still evaluated" "pass" "$(json_query "$evidence" assertion_result boot.login)"
+  end_case
+}
+
+test_graphical_qemu_arguments() {
+  local evidence=""
+  local args_file=""
+  local vars_copy=""
+  local expected=""
+  local actual=""
+  local real_case_dir=""
+  local vars_path=""
+  local duration=0
+
+  begin_case "graphical UEFI argv: -vga virtio, -m 2048, early stop at 8"
+  make_graphical_fixture "$CASE_DIR"
+  evidence="$CASE_DIR/boot-evidence.json"
+  args_file="$CASE_DIR/qemu-args.txt"
+  vars_copy="$CASE_DIR/vars-copy.bin"
+  real_case_dir=$(cd "$CASE_DIR" && pwd -P)
+  write_fake_qemu_uefi_graphical "$CASE_DIR/fake-qemu" hang
+
+  expected=$(printf '%s\n' \
+    '-machine' 'q35' \
+    '-m' '2048' \
+    '-smp' '2' \
+    '-nographic' \
+    '-no-reboot' \
+    '-vga' 'virtio' \
+    '-drive' "if=pflash,format=raw,readonly=on,file=$real_case_dir/fw/OVMF_CODE_4M.fd" \
+    '-drive' 'if=pflash,format=raw,file=<VARS>' \
+    '-drive' "file=$real_case_dir/disk.img,format=raw,if=virtio")
+
+  SECONDS=0
+  RC=0
+  FAKE_QEMU_ARGS="$args_file" FAKE_QEMU_VARS_COPY="$vars_copy" \
+    "$BASH_BIN" "$BOOT_CHECK" \
+    --artifact "$CASE_DIR/artifact.json" \
+    --qemu "$CASE_DIR/fake-qemu" --firmware "$real_case_dir/fw/OVMF_CODE_4M.fd" \
+    --timeout 10 --json >"$OUT_FILE" 2>"$ERR_FILE" || RC=$?
+  duration=$SECONDS
+
+  actual=$(normalize_uefi_args "$args_file")
+  check_eq "exit code" 0 "$RC"
+  check_eq "qemu argv" "$expected" "$actual"
+  check_eq "memory arg" "2048" "$(awk '/^-m$/{getline; print; exit}' "$args_file")"
+  check_eq "vga arg" "virtio" "$(awk '/^-vga$/{getline; print; exit}' "$args_file")"
+  # 8 matches, not the P0-c 5: the fake qemu would sleep 30s if not stopped.
+  check_le "early stop duration" 6 "$duration"
+  check_eq "result" "pass" "$(json_query "$evidence" result)"
+  check_eq "assertion count" 8 "$(json_query "$evidence" assertion_count)"
+  check_eq "boot.display_manager" "pass" "$(json_query "$evidence" assertion_result boot.display_manager)"
+  check_eq "boot.xorg" "pass" "$(json_query "$evidence" assertion_result boot.xorg)"
+  check_eq "boot.graphical" "pass" "$(json_query "$evidence" assertion_result boot.graphical)"
+  check_eq "evidence log" "boot.log" "$(json_query "$evidence" log)"
+  check_eq "no -kernel flag" 0 "$(grep -c '^-kernel$' "$args_file" || true)"
+  check_eq "no -initrd flag" 0 "$(grep -c '^-initrd$' "$args_file" || true)"
+  check_eq "no -append flag" 0 "$(grep -c '^-append$' "$args_file" || true)"
+  check_eq "VARS template copied for QEMU" "OVMF-VARS-FIXTURE" "$(cat "$vars_copy" 2>/dev/null)"
+  vars_path=$(find_uefi_vars_arg "$args_file")
+  check_contains "VARS copy in boot-check temp dir" "/sysemble-boot." "$vars_path"
+  check_no_file "VARS copy removed on exit" "$vars_path"
+  end_case
+}
+
+test_non_graphical_qemu_defaults() {
+  local evidence=""
+  local args_file=""
+  local vars_copy=""
+
+  begin_case "non-graphical UEFI keeps -m 1024, no -vga, five assertions"
+  make_uefi_fixture "$CASE_DIR"
+  evidence="$CASE_DIR/boot-evidence.json"
+  args_file="$CASE_DIR/qemu-args.txt"
+  vars_copy="$CASE_DIR/vars-copy.bin"
+  write_fake_qemu_uefi "$CASE_DIR/fake-qemu"
+  # The no-DM builder emits an explicit false plus the P0-c memory default.
+  set_artifact_json_field "$CASE_DIR/artifact.json" "$CASE_DIR/no-graphical.json" \
+    boot.graphical false
+  set_artifact_json_field "$CASE_DIR/no-graphical.json" "$CASE_DIR/no-graphical-memory.json" \
+    boot.memory_mb 1024
+
+  RC=0
+  FAKE_QEMU_ARGS="$args_file" FAKE_QEMU_VARS_COPY="$vars_copy" \
+    "$BASH_BIN" "$BOOT_CHECK" \
+    --artifact "$CASE_DIR/no-graphical-memory.json" \
+    --qemu "$CASE_DIR/fake-qemu" --firmware "$CASE_DIR/fw/OVMF_CODE_4M.fd" \
+    --timeout 10 --json >"$OUT_FILE" 2>"$ERR_FILE" || RC=$?
+
+  check_eq "exit code" 0 "$RC"
+  check_eq "default memory arg" "1024" "$(awk '/^-m$/{getline; print; exit}' "$args_file")"
+  check_eq "no -vga flag" 0 "$(grep -c '^-vga$' "$args_file" || true)"
+  check_eq "assertion count" 5 "$(json_query "$evidence" assertion_count)"
+  check_empty "no boot.display_manager assertion" "$(json_query "$evidence" assertion_result boot.display_manager)"
+  check_empty "no boot.xorg assertion" "$(json_query "$evidence" assertion_result boot.xorg)"
+  check_empty "no boot.graphical assertion" "$(json_query "$evidence" assertion_result boot.graphical)"
+  end_case
+}
+
+test_kernel_mode_ignores_graphical() {
+  local evidence=""
+  local args_file=""
+
+  begin_case "kernel mode ignores boot.graphical -> 3 assertions, no -vga"
+  make_fixture "$CASE_DIR"
+  evidence="$CASE_DIR/boot-evidence.json"
+  args_file="$CASE_DIR/qemu-args.txt"
+  set_artifact_json_field "$CASE_DIR/artifact.json" "$CASE_DIR/graphical-kernel.json" \
+    boot.graphical true
+  set_artifact_json_field "$CASE_DIR/graphical-kernel.json" "$CASE_DIR/kernel-fields.json" \
+    boot.memory_mb 1024
+
+  cat >"$CASE_DIR/fake-qemu" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$@" >"$FAKE_QEMU_ARGS"
+cat <<'LOG'
+[    0.000000] Linux version 6.12.0-amd64 (debian-kernel@lists.debian.org)
+[    0.123456] systemd[1]: Detected virtualization qemu.
+[    1.234567] systemd[1]: Reached target Local File Systems.
+[    2.345678] Debian GNU/Linux 13 sysemble ttyS0
+sysemble login:
+LOG
+exit 0
+EOF
+  chmod +x "$CASE_DIR/fake-qemu"
+
+  RC=0
+  FAKE_QEMU_ARGS="$args_file" "$BASH_BIN" "$BOOT_CHECK" \
+    --artifact "$CASE_DIR/kernel-fields.json" \
+    --qemu "$CASE_DIR/fake-qemu" --timeout 10 --json \
+    >"$OUT_FILE" 2>"$ERR_FILE" || RC=$?
+
+  check_eq "exit code" 0 "$RC"
+  check_eq "result" "pass" "$(json_query "$evidence" result)"
+  check_eq "assertion count" 3 "$(json_query "$evidence" assertion_count)"
+  check_eq "assertion ids" "boot.kernel,boot.systemd,boot.login" \
+    "$(json_query "$evidence" assertion_ids)"
+  check_eq "default memory arg" "1024" "$(awk '/^-m$/{getline; print; exit}' "$args_file")"
+  check_eq "no -vga flag" 0 "$(grep -c '^-vga$' "$args_file" || true)"
+  check_empty "no boot.display_manager assertion" "$(json_query "$evidence" assertion_result boot.display_manager)"
+  end_case
+}
+
+test_desktop_field_validation() {
+  local evidence=""
+
+  begin_case "boot.graphical / boot.memory_mb type validation -> exit 2"
+  make_graphical_fixture "$CASE_DIR"
+  write_graphical_good_log "$CASE_DIR/good-graphical.log"
+  evidence="$CASE_DIR/boot-evidence.json"
+
+  set_artifact_field "$CASE_DIR/artifact.json" "$CASE_DIR/bad-graphical.json" \
+    boot.graphical "true"
+  invoke_boot_check "$BASH_BIN" "$BOOT_CHECK" \
+    --artifact "$CASE_DIR/bad-graphical.json" \
+    --log-from "$CASE_DIR/good-graphical.log" --json
+  check_eq "string graphical exit code" 2 "$RC"
+  check_contains "graphical diagnostic" "boot.graphical must be a boolean" "$(cat "$ERR_FILE")"
+  check_no_file "no evidence after bad graphical" "$evidence"
+
+  set_artifact_field "$CASE_DIR/artifact.json" "$CASE_DIR/bad-memory.json" \
+    boot.memory_mb "2048"
+  invoke_boot_check "$BASH_BIN" "$BOOT_CHECK" \
+    --artifact "$CASE_DIR/bad-memory.json" \
+    --log-from "$CASE_DIR/good-graphical.log" --json
+  check_eq "string memory exit code" 2 "$RC"
+  check_contains "memory diagnostic" "boot.memory_mb must be a number" "$(cat "$ERR_FILE")"
+  check_no_file "no evidence after bad memory" "$evidence"
+
+  set_artifact_json_field "$CASE_DIR/artifact.json" "$CASE_DIR/zero-memory.json" \
+    boot.memory_mb 0
+  invoke_boot_check "$BASH_BIN" "$BOOT_CHECK" \
+    --artifact "$CASE_DIR/zero-memory.json" \
+    --log-from "$CASE_DIR/good-graphical.log" --json
+  check_eq "zero memory exit code" 2 "$RC"
+  check_contains "zero memory diagnostic" "must be a positive integer" "$(cat "$ERR_FILE")"
+  check_no_file "no evidence after zero memory" "$evidence"
+  end_case
+}
+
 # Runs last: every offline/QEMU path above has had a chance to leak. boot-check
 # must keep its OVMF VARS copy under $TMPDIR, never in the caller's working
 # directory (the repo root when this suite runs from there).
@@ -1318,6 +1712,12 @@ test_unknown_boot_mode
 test_kernel_mode_assertions_unchanged
 test_uefi_timeout
 test_uefi_failure_cleanup
+test_graphical_good_log_offline
+test_graphical_missing_xorg_offline
+test_graphical_qemu_arguments
+test_non_graphical_qemu_defaults
+test_kernel_mode_ignores_graphical
+test_desktop_field_validation
 test_repo_root_has_no_leftovers
 
 printf '\n----------------------------------------------------------------\n'

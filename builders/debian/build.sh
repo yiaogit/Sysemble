@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Sysemble Debian builder (P0-a + P0-b native build path + P0-c1 GPT/GRUB/UEFI).
+# Sysemble Debian builder (P0-a + P0-b native build path + P0-c1 GPT/GRUB/UEFI
+# + P0-d1 desktop boot).
 #
 # Reads a plan.json produced by `sysemble plan --json` and bootstraps a Debian
 # rootfs with mmdebstrap, either natively (Linux/root) or inside a
@@ -9,6 +10,11 @@
 #   - writes a FAT32 ESP in esp.img, installs GRUB EFI with an embedded
 #     grub.cfg, copies the ESP tree with mcopy, and merges it with dd,
 #   - converts disk.img to qcow2 with qemu-img, and writes artifact.json.
+#
+# P0-d1: when plan.packages names a display manager (gdm3/sddm/lightdm) the
+# kernel cmdline targets graphical.target (plus journald console forwarding),
+# the artifact records the inferred desktop and memory_mb=2048; otherwise the
+# frozen P0-c multi-user cmdline and memory_mb=1024 are kept.
 #
 # Contract (frozen):
 #   build.sh --plan <plan.json> --out <dir> [--dry-run] [--execute] [--engine docker|native]
@@ -325,14 +331,39 @@ plan_hostname() {
   printf '%s\n' "$host"
 }
 
-# One-line shell command passed to mmdebstrap --customize-hook. mmdebstrap runs
-# the hook on the host with the rootfs directory as $1. systemctl enable is
-# executed inside a chroot; failure is non-fatal and produces a warning in
-# build.log (P0-b workplan risk 2).
+# Shell fragment for the P0-d1 graphical boot evidence unit. Kept separate so
+# the base (no-DM) hook stays byte-identical to P0-c. The fragment is appended
+# to the --customize-hook command and runs on the host with the rootfs as $1.
+make_boot_evidence_hook_fragment() {
+  local display_manager=$1
+  local unit=""
+
+  unit=$(boot_evidence_service_text "$display_manager") || return 1
+
+  printf '; mkdir -p "$1/etc/systemd/system"\n'
+  printf "cat >\"\$1/etc/systemd/system/sysemble-boot-evidence.service\" <<'SYMBLE_EVIDENCE'\n"
+  printf '%s\n' "$unit"
+  printf 'SYMBLE_EVIDENCE\n'
+  printf 'mkdir -p "$1/etc/systemd/system/graphical.target.wants"\n'
+  printf 'ln -sfn ../sysemble-boot-evidence.service "$1/etc/systemd/system/graphical.target.wants/sysemble-boot-evidence.service"\n'
+  printf 'chroot "$1" systemctl enable sysemble-boot-evidence.service >/dev/null 2>&1 || true\n'
+}
+
+# Shell command passed to mmdebstrap --customize-hook. mmdebstrap runs the hook
+# on the host with the rootfs directory as $1. systemctl enable is executed
+# inside a chroot; failure is non-fatal and produces a warning in build.log
+# (P0-b workplan risk 2). A desktop plan also installs and enables the P0-d1
+# boot evidence oneshot.
 make_customize_hook() {
   local host=$1
+  local display_manager=${2:-}
+  local evidence=""
 
-  printf '%s' "printf '%s\\n' '$host' > \"\$1/etc/hostname\"; if chroot \"\$1\" systemctl enable serial-getty@ttyS0.service >/dev/null 2>&1; then :; else printf 'mmdebstrap customize hook: warning: could not enable serial-getty@ttyS0.service (non-fatal)\\n' >&2; fi"
+  if [ -n "$display_manager" ]; then
+    evidence=$(make_boot_evidence_hook_fragment "$display_manager") || return 1
+  fi
+
+  printf '%s' "printf '%s\\n' '$host' > \"\$1/etc/hostname\"; if chroot \"\$1\" systemctl enable serial-getty@ttyS0.service >/dev/null 2>&1; then :; else printf 'mmdebstrap customize hook: warning: could not enable serial-getty@ttyS0.service (non-fatal)\\n' >&2; fi${evidence}"
 }
 
 # ---------------------------------------------------------------------------
@@ -472,6 +503,11 @@ build_native() {
   local initrd=""
   local kernel_name=""
   local initrd_name=""
+  local graphical=0
+  local desktop_dm=""
+  local desktop_session=""
+  local include_csv=""
+  local runtime_count=0
   local rootfs_mb=0
   local disk_mb=0
   local root_part_mb=0
@@ -499,8 +535,34 @@ build_native() {
     return 6
   fi
 
+  # P0-d1: infer the desktop from plan.packages (the plan contract is frozen).
+  # The same pure helpers run again inside artifact_json(), so build.log,
+  # grub.cfg, and artifact.json always agree.
+  if desktop_dm=$(detect_display_manager "${PLAN_PACKAGES_VALUES[@]}"); then
+    desktop_session=$(detect_desktop_session "${PLAN_PACKAGES_VALUES[@]}")
+    graphical=1
+  else
+    desktop_dm=""
+    desktop_session=""
+    graphical=0
+  fi
+
+  # A desktop plan needs two runtime packages the plan itself does not name:
+  # the X server (only a Recommends in xfce4/lightdm) and procps (pgrep for the
+  # boot evidence unit, not part of --variant=minbase). artifact.packages stays
+  # the plan package list; these are build-time dependencies.
+  include_csv=$pkg_csv
+  runtime_count=0
+  if [ "$graphical" -eq 1 ]; then
+    runtime_count=${#GRAPHICAL_RUNTIME_PACKAGES[@]}
+    include_csv="$pkg_csv,$(join_values "," "${GRAPHICAL_RUNTIME_PACKAGES[@]}")"
+  fi
+
   hostname=$(plan_hostname)
-  hook=$(make_customize_hook "$hostname")
+  if ! hook=$(make_customize_hook "$hostname" "$desktop_dm"); then
+    blog_err "cannot build the mmdebstrap customize hook for display_manager='$desktop_dm'"
+    return 6
+  fi
 
   # esp/, esp.img, and grub.cfg are derived P0-c intermediates. They can only
   # survive a previous interrupted/failed attempt here, because rootfs/ and the
@@ -524,11 +586,19 @@ build_native() {
   blog "[build] stage 1/6: validate - plan is valid"
   blog "[build] stage 2/6: fetch base - $PLAN_BASE_KIND_VALUE/$PLAN_BASE_RELEASE_VALUE"
   blog "[build] stage 3/6: bootstrap rootfs - $rootfs"
-  blog "[build] stage 4/6: install packages - $PKG_COUNT packages via --include"
+  if [ "$graphical" -eq 1 ]; then
+    blog "[build] stage 4/6: install packages - $PKG_COUNT plan + $runtime_count desktop runtime packages via --include"
+    blog "[build] desktop: session=$desktop_session, display_manager=$desktop_dm (graphical boot, ${ARTIFACT_BOOT_MEMORY_MB_GRAPHICAL} MB)"
+    blog "[build] desktop runtime: add ${GRAPHICAL_RUNTIME_PACKAGES[*]} to --include (Xorg + pgrep)"
+    blog "[build] boot evidence: install /etc/systemd/system/sysemble-boot-evidence.service (enabled for graphical.target)"
+  else
+    blog "[build] stage 4/6: install packages - $PKG_COUNT packages via --include"
+    blog "[build] desktop: none detected (multi-user boot, ${ARTIFACT_BOOT_MEMORY_MB_DEFAULT} MB)"
+  fi
   blog "[build] customize: hostname=$hostname, enable serial-getty@ttyS0.service (failure is non-fatal)"
 
   export DEBIAN_FRONTEND=noninteractive
-  if ! run_logged mmdebstrap --variant=minbase --include="$pkg_csv" \
+  if ! run_logged mmdebstrap --variant=minbase --include="$include_csv" \
     --customize-hook="$hook" "$PLAN_BASE_RELEASE_VALUE" "$rootfs"; then
     blog_err "mmdebstrap failed; partial rootfs (if any) and build.log are kept"
     return 6
@@ -605,7 +675,7 @@ build_native() {
     blog_err "cannot create the ESP staging tree: $esp_dir"
     return 6
   fi
-  if ! grub_cfg_text "$kernel_name" "$initrd_name" \
+  if ! grub_cfg_text "$kernel_name" "$initrd_name" "$graphical" \
     >"$OUT_ABS/.grub.cfg.tmp" 2>"$TMP_DIR/grub.err"; then
     if [ -s "$TMP_DIR/grub.err" ]; then
       cat "$TMP_DIR/grub.err" | tee -a "$BUILD_LOG" >&2
