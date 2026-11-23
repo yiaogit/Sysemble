@@ -1,0 +1,43 @@
+apiVersion: sysemble/v1
+
+meta:
+  name: alpine-edge-node
+  description: Minimal Alpine node for an edge sensor. No desktop, no Windows layer.
+
+target:
+  base:
+    kind: alpine
+    release: "3.22"
+    pin: "2026-11-01"
+  arch: aarch64
+  firmware: uefi
+  output: [raw]
+
+system:
+  hostname: edge-01
+  locale: C.UTF-8
+  timezone: UTC
+  users:
+    - name: ops
+      groups: [wheel]
+      shell: /bin/ash
+      password: locked
+  kernel:
+    flavor: lts
+  packages:
+    include: [openssh]
+    exclude: []
+  services:
+    - name: sshd
+      enabled: true
+
+security:
+  disk_encryption: none
+  secure_boot: false
+  firewall: nftables
+  hardening: minimal
+
+verify:
+  scenarios:
+    - id: boot
+      tests: [boot, network]

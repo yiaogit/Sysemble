@@ -1,0 +1,237 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sysemble.dev/schemas/buildspec.schema.json",
+  "title": "Sysemble BuildSpec",
+  "description": "A reviewable, reproducible description of a Linux system to assemble.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "meta", "target", "system"],
+  "properties": {
+    "apiVersion": { "const": "sysemble/v1" },
+    "meta": { "$ref": "#/$defs/meta" },
+    "target": { "$ref": "#/$defs/target" },
+    "system": { "$ref": "#/$defs/system" },
+    "desktop": { "$ref": "#/$defs/desktop" },
+    "virtualization": { "$ref": "#/$defs/virtualization" },
+    "dev": { "$ref": "#/$defs/dev" },
+    "security": { "$ref": "#/$defs/security" },
+    "installer": { "$ref": "#/$defs/installer" },
+    "verify": { "$ref": "#/$defs/verify" },
+    "sharing": { "$ref": "#/$defs/sharing" }
+  },
+  "$defs": {
+    "meta": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{1,62}$" },
+        "description": { "type": "string", "maxLength": 500 },
+        "tags": { "type": "array", "items": { "type": "string" }, "uniqueItems": true }
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["base", "arch", "output"],
+      "properties": {
+        "base": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": {
+            "kind": {
+              "enum": ["debian", "ubuntu", "arch", "fedora", "opensuse", "alpine", "nixos", "lfs"]
+            },
+            "release": { "type": "string" },
+            "mirror": { "type": "string" },
+            "pin": {
+              "type": "string",
+              "description": "Snapshot date (YYYY-MM-DD) or content digest that makes the base reproducible."
+            }
+          }
+        },
+        "arch": { "enum": ["x86_64", "aarch64"] },
+        "firmware": { "enum": ["bios", "uefi"], "default": "uefi" },
+        "output": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "enum": ["qcow2", "iso", "raw", "uki", "pxe"] }
+        }
+      }
+    },
+    "system": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hostname"],
+      "properties": {
+        "hostname": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$" },
+        "locale": { "type": "string" },
+        "timezone": { "type": "string" },
+        "keyboard": { "type": "string" },
+        "users": { "type": "array", "items": { "$ref": "#/$defs/user" } },
+        "kernel": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "flavor": { "enum": ["lts", "stable", "mainline", "hwe"] },
+            "cmdline": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "packages": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "include": { "type": "array", "items": { "type": "string" } },
+            "exclude": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "services": { "type": "array", "items": { "$ref": "#/$defs/service" } }
+      }
+    },
+    "user": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string", "pattern": "^[a-z_][a-z0-9_-]{0,31}$" },
+        "groups": { "type": "array", "items": { "type": "string" } },
+        "shell": { "type": "string" },
+        "password": { "enum": ["locked", "prompt"], "default": "locked" }
+      }
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string" },
+        "enabled": { "type": "boolean", "default": true },
+        "config": { "type": "object" }
+      }
+    },
+    "desktop": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "session": { "enum": ["none", "plasma", "gnome", "xfce", "hyprland", "sway"] },
+        "display_manager": { "type": "string" },
+        "theme": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "mode": { "enum": ["light", "dark"] },
+            "accent": { "type": "string", "pattern": "^#[0-9a-fA-F]{6}$" }
+          }
+        },
+        "apps": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "virtualization": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "windows": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean", "default": false },
+            "mode": { "enum": ["wine", "remoteapp", "desktop", "looking-glass"] },
+            "edition": { "enum": ["win10", "win11"] },
+            "gpu_passthrough": { "type": "boolean", "default": false },
+            "vm": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "cpus": { "type": "integer", "minimum": 1, "maximum": 32 },
+                "memory_gb": { "type": "integer", "minimum": 2, "maximum": 128 },
+                "disk_gb": { "type": "integer", "minimum": 32, "maximum": 1024 }
+              }
+            },
+            "media": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "windows_iso": { "const": "user-supplied" },
+                "virtio_iso": { "const": "auto" }
+              }
+            }
+          }
+        },
+        "containers": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "podman": { "type": "boolean", "default": true },
+            "distrobox": { "type": "boolean", "default": false }
+          }
+        }
+      }
+    },
+    "dev": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "profiles": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "enum": ["python", "node", "rust", "go", "ml", "embedded"] }
+        },
+        "editors": { "type": "array", "items": { "type": "string" } },
+        "containers": { "type": "boolean", "default": true }
+      }
+    },
+    "security": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "disk_encryption": { "enum": ["none", "luks"], "default": "none" },
+        "secure_boot": { "type": "boolean", "default": false },
+        "firewall": { "enum": ["none", "nftables"], "default": "nftables" },
+        "hardening": { "enum": ["minimal", "standard", "strict"], "default": "standard" }
+      }
+    },
+    "installer": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean", "default": false },
+        "type": { "enum": ["calamares", "unattended"] }
+      }
+    },
+    "verify": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "scenarios": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "tests"],
+            "properties": {
+              "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{1,40}$" },
+              "tests": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "enum": ["boot", "login", "session", "network", "audio", "gpu", "apps", "windows", "dev", "installer"]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "sharing": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "team": { "type": "string" },
+        "compliance_profile": { "enum": ["none", "cis-l1", "stig", "nist-800-53"], "default": "none" },
+        "publish": { "type": "array", "uniqueItems": true, "items": { "enum": ["git", "oci"] } }
+      }
+    }
+  }
+}

@@ -1,0 +1,44 @@
+id: windows-remoteapp
+kind: virtualization
+version: 0.1.0
+description: Windows VM with per-application RDP RemoteApp windows on the Linux desktop.
+license: MIT
+
+requires:
+  - base.debian
+  - kvm
+  - firmware.uefi
+provides:
+  - windows-apps
+conflicts:
+  - windows-looking-glass
+
+packages:
+  debian: [qemu-system-x86, libvirt-daemon-system, ovmf, swtpm, freerdp2-x11, virtio-win]
+  ubuntu: [qemu-system-x86, libvirt-daemon-system, ovmf, swtpm, freerdp2-x11, virtio-win]
+
+hooks:
+  - templates/win11-domain.xml.j2
+  - files/windows-app-launcher.sh
+  - files/windows-app.desktop.j2
+
+asserts:
+  - type: service_running
+    params: { service: libvirtd }
+    description: libvirtd is active after boot.
+  - type: windows_mode
+    params: { mode: remoteapp, domain: win11 }
+    description: The Windows domain starts and serves one RemoteApp window.
+
+size_mb: 350
+build_time_min: 3
+
+boundary: >-
+  Guarantees the VM definition, virtio drivers, vTPM and launcher are installed,
+  and that the domain can boot to the Windows installer. Does not guarantee a
+  specific Windows build, application compatibility, GPU acceleration, or
+  licensing. Windows media and licence are supplied by the user.
+
+compatibility:
+  base: [debian, ubuntu]
+  arch: [x86_64]

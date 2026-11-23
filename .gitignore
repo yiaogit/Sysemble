@@ -1,0 +1,30 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Tauri
+/apps/desktop/dist/
+/apps/desktop/src-tauri/target/
+/apps/desktop/node_modules/
+
+# Build artifacts
+/out/
+/artifacts/
+*.qcow2
+*.iso
+*.img
+*.raw
+
+# Local state
+/.sysemble/
+*.db
+*.db-journal
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.idea/
+.vscode/
+*.swp

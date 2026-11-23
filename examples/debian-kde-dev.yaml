@@ -1,0 +1,89 @@
+apiVersion: sysemble/v1
+
+meta:
+  name: debian-kde-dev
+  description: KDE workstation with Windows single-app mode and a Python/Node/Rust dev stack.
+  tags: [desktop, dev, windows]
+
+target:
+  base:
+    kind: debian
+    release: trixie
+    pin: "2026-11-01"
+  arch: x86_64
+  firmware: uefi
+  output: [qcow2, iso]
+
+system:
+  hostname: ws
+  locale: zh_CN.UTF-8
+  timezone: Asia/Shanghai
+  keyboard: us
+  users:
+    - name: me
+      groups: [sudo]
+      shell: /bin/bash
+      password: locked
+  kernel:
+    flavor: lts
+  packages:
+    include: [curl, git, vim]
+  services:
+    - name: ssh
+      enabled: true
+      config:
+        port: 22
+
+desktop:
+  session: plasma
+  display_manager: sddm
+  theme:
+    mode: dark
+    accent: "#4a90d9"
+  apps: [firefox, libreoffice, vlc]
+
+virtualization:
+  windows:
+    enabled: true
+    mode: remoteapp
+    edition: win11
+    gpu_passthrough: false
+    vm:
+      cpus: 4
+      memory_gb: 8
+      disk_gb: 64
+    media:
+      windows_iso: user-supplied
+      virtio_iso: auto
+  containers:
+    podman: true
+    distrobox: true
+
+dev:
+  profiles: [python, node, rust]
+  editors: [vscode]
+  containers: true
+
+security:
+  disk_encryption: luks
+  secure_boot: true
+  firewall: nftables
+  hardening: standard
+
+installer:
+  enabled: true
+  type: calamares
+
+verify:
+  scenarios:
+    - id: desktop
+      tests: [boot, login, session, network, audio, apps]
+    - id: windows
+      tests: [windows]
+    - id: dev
+      tests: [dev]
+
+sharing:
+  team: example
+  compliance_profile: cis-l1
+  publish: [git]

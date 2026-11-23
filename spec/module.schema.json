@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sysemble.dev/schemas/module.schema.json",
+  "title": "Sysemble Module",
+  "description": "A composable unit of system configuration: packages, hooks, assertions, and an explicit proof boundary.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "kind", "version", "description", "boundary"],
+  "properties": {
+    "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{1,40}$" },
+    "kind": {
+      "enum": ["base", "system", "desktop", "app", "dev", "virtualization", "driver", "security", "installer"]
+    },
+    "version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "description": { "type": "string", "maxLength": 300 },
+    "license": { "type": "string" },
+    "requires": { "type": "array", "uniqueItems": true, "items": { "type": "string" } },
+    "provides": { "type": "array", "uniqueItems": true, "items": { "type": "string" } },
+    "conflicts": { "type": "array", "uniqueItems": true, "items": { "type": "string" } },
+    "packages": {
+      "type": "object",
+      "description": "Native package names per distribution family.",
+      "propertyNames": { "enum": ["debian", "ubuntu", "arch", "fedora", "opensuse", "alpine", "nixos"] },
+      "additionalProperties": { "type": "array", "items": { "type": "string" } }
+    },
+    "hooks": {
+      "type": "array",
+      "description": "Ordered build- or first-boot hooks. Paths are relative to the module root.",
+      "items": { "type": "string" }
+    },
+    "asserts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["type"],
+        "properties": {
+          "type": {
+            "enum": ["service_running", "service_enabled", "package_installed", "port_listening", "file_exists", "command_output", "session", "windows_mode", "custom"]
+          },
+          "params": { "type": "object" },
+          "description": { "type": "string" }
+        }
+      }
+    },
+    "size_mb": { "type": "number", "minimum": 0 },
+    "build_time_min": { "type": "number", "minimum": 0 },
+    "boundary": {
+      "type": "string",
+      "minLength": 10,
+      "description": "What this module guarantees and what it explicitly does not (e.g. hardware behavior)."
+    },
+    "compatibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "base": { "type": "array", "items": { "type": "string" } },
+        "arch": { "type": "array", "items": { "enum": ["x86_64", "aarch64"] } }
+      }
+    }
+  }
+}
