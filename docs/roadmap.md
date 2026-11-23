@@ -20,6 +20,9 @@
 
 ## P1 · 可视化（6–8 周）
 
+> **P1-a 已完成（2026-11-23）**：`apps/desktop` Tauri 2 壳，`read_spec` / `validate` / `plan` 三个 IPC 命令 + 原生 HTML/CSS/JS 面板；macOS 编译 + 4 个单测，Linux CI check/test 通过。构建按钮、层级画布、diff 在 P1-b/P1-c。
+
+
 - Tauri 2 壳 + React 画布
 - 层级块、体积/时长、冲突灰显
 - declared → resolved diff

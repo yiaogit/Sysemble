@@ -210,3 +210,6 @@ jobs:
 
       - name: Check the desktop crate
         run: cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml
+
+      - name: Test the desktop crate
+        run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml

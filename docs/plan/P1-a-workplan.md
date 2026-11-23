@@ -65,15 +65,15 @@ apps/desktop/
 新增 `desktop-check`（ubuntu-latest）：
 
 ```
-apt: libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libgtk-3-dev
-cargo check -p sysemble-desktop
+apt: libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libssl-dev patchelf（无 tray，不需要 appindicator）
+cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml
 ```
 
 ## 4. 验收
 
 | # | 检查 | 通过条件 |
 |---|---|---|
-| G1 | 本地 `cargo check -p sysemble-desktop` | macOS 通过 |
+| G1 | 本地 `cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml` | macOS 通过 |
 | G2 | CI `desktop-check` | job 绿 |
 | G3 | 命令行为 | 用 `cargo test -p sysemble-desktop`（可选）或单测验证 read/validate/plan 逻辑 |
 | G4 | 配置合法 | `tauri.conf.json` 可被 `tauri-build` 接受 |
@@ -87,3 +87,5 @@ cargo check -p sysemble-desktop
 3. `generate_context!` 需要图标与 capability；缺失会编译失败。
 4. 无 GUI 自动化验证：本切片以编译 + 命令单测为准，窗口截图留 P1-b。
 5. 路径为相对 app 启动目录；暂不做文件选择器（避免额外插件）。
+
+> 2026-11-23 修订：桌面 crate 用独立 workspace，命令改为 `--manifest-path`；CI 同时跑 `cargo test --manifest-path`。
