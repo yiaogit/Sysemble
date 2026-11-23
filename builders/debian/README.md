@@ -1,8 +1,9 @@
-# Debian builder (P0-a + P0-b + P0-c1 + P0-d1 + P0-d2 + P0-d3)
+# Debian builder (P0-a + P0-b + P0-c1 + P0-d1 + P0-d2 + P0-d3 + P0-e1)
 
 `build.sh` reads the `plan.json` produced by `sysemble plan --json` and turns
-it into bootable Debian disk images, a live ISO, or an unattended installer
-ISO, selected by `plan.target.outputs` and `--installer`:
+it into bootable Debian disk images, a live ISO, an unattended installer ISO,
+or a serial TUI installer ISO, selected by `plan.target.outputs` and
+`--installer`/`--installer-tui`:
 
 - **P0-a**: plan validation, dry run, and rootfs bootstrap with
   [mmdebstrap](https://mmdebstrap.de/) (native or `debian:trixie` Docker).
@@ -49,9 +50,17 @@ ISO, selected by `plan.target.outputs` and `--installer`:
   writes fstab + GRUB, prints `SYMBLE: install complete`, and powers off. A
   non-ISO-only plan is rejected with exit 2; Calamares stays out of scope
   (P0-d3b).
+- **P0-e1**: `--installer-tui` builds the same installer ISO with a **serial
+  TUI wizard** instead of a preselected disk. The ISO cmdline gains
+  `sysemble.install.tui=1`, the shared installer script prompts for disk,
+  hostname, user, password, and confirmation, and the artifact records
+  `boot.mode="install"`/`boot.install_tui=true` with no `install_device`.
+  The installed system gets `/etc/hostname`, `/etc/hosts`, the chosen user,
+  and the chosen password (or a locked account when the password is empty).
 
 The authoritative acceptance is the GitHub Actions `boot-smoke` (disk),
-`live-smoke` (ISO), and `install-smoke` (installer ISO) jobs on `ubuntu-latest`.
+`live-smoke` (ISO), `install-smoke` (unattended installer ISO), and
+`tui-install-smoke` (TUI installer ISO) jobs on `ubuntu-latest`.
 The development host is macOS arm64, where no real native build can run; see
 [Local checks](#local-checks).
 
@@ -59,7 +68,7 @@ The development host is macOS arm64, where no real native build can run; see
 
 ```
 builders/debian/build.sh --plan <plan.json> --out <dir> \
-  [--dry-run] [--execute] [--engine docker|native] [--installer]
+  [--dry-run] [--execute] [--engine docker|native] [--installer | --installer-tui]
 ```
 
 | Option | Meaning |
@@ -71,6 +80,7 @@ builders/debian/build.sh --plan <plan.json> --out <dir> \
 | `--engine native` | Default. Build on this Linux host (`uname -s` = Linux, euid 0, and the tools below in `PATH`). |
 | `--engine docker` | Bootstrap the rootfs inside `debian:trixie`; needs `docker` CLI and a reachable daemon. Disk/ISO assembly is **not** implemented for Docker, so `--execute` with `--engine docker` is rejected (exit 2). |
 | `--installer` | P0-d3: build the headless installer ISO. Requires an **ISO-only** plan (`target.outputs` contains `iso` and no `qcow2`/`raw`); anything else exits 2 before `<out>` is created. Works with `--dry-run` (prints the installer plan). |
+| `--installer-tui` | P0-e1: build the TUI installer ISO. Same ISO-only requirement, script, unit, and runtime packages as `--installer`; the ISO cmdline becomes `sysemble.install.tui=1` and the artifact records `boot.mode="install"`/`boot.install_tui=true` with no `install_device`. Mutually exclusive with `--installer`. |
 | `-h`, `--help` | Print usage and exit 0. |
 
 `--opt value` and `--opt=value` are both accepted. Missing or unknown
@@ -106,7 +116,9 @@ ISO-only builds produce only `rootfs/`, `live.iso`, `iso/`, `artifact.json`,
 `--installer` additionally bakes the installer script/unit into `rootfs/`
 (`usr/local/sbin/sysemble-install`, `etc/systemd/system/sysemble-install.service`
 and its `multi-user.target.wants` symlink), but still produces only `live.iso`
-as the image.
+as the image. `--installer-tui` bakes the same files plus
+`etc/systemd/system/sysemble-install.service.d/tui-cmdline.conf`, a drop-in
+that makes the unchanged unit start for either installer cmdline marker.
 `<out>/esp.img` (the FAT32 image merged into `disk.img`) and `<out>/efi.img`
 (the temporary 8 MiB live EFI image) are intermediates and are removed after
 their consumers succeed. For an iso+disk plan the live ISO uses a private
@@ -512,6 +524,60 @@ the target disk. The CI `install-smoke` job boots the ISO with QEMU/OVMF plus a
 6 GiB virtio disk, waits for the completion marker, then runs
 `tools/boot-check.sh` against the installed disk (mode `uefi`).
 
+### TUI installer ISO (P0-e1)
+
+`--installer-tui` reuses the P0-d3 ISO pipeline, installer script, unit, and
+runtime packages. Only the non-interactive preselection changes: the ISO GRUB
+cmdline appends `sysemble.install.tui=1` instead of
+`sysemble.install=/dev/vda`, and the script (started by the same unit) runs the
+serial wizard. The script also auto-detects the marker when invoked without
+arguments, so the frozen P0-d3 unit needs no `ExecStart` change.
+
+Because the unit's frozen condition is the single word `sysemble.install`
+(systemd does not treat `sysemble.install.tui` as that word), the TUI rootfs
+also gets this drop-in; it resets the condition list and ORs both markers with
+triggering conditions:
+
+```ini
+[Unit]
+ConditionKernelCommandLine=
+ConditionKernelCommandLine=|sysemble.install
+ConditionKernelCommandLine=|sysemble.install.tui
+```
+
+The wizard prompts (frozen, expect-friendly) are:
+
+```
+SYMBLE-TUI disk [/dev/vda]:
+SYMBLE-TUI hostname [sysemble]:
+SYMBLE-TUI user [ops]:
+SYMBLE-TUI password:
+SYMBLE-TUI confirm install to <disk> (yes/no):
+```
+
+The password is read with `stty -echo`; an invalid (non-block) disk re-prompts;
+a confirmation other than `yes`/`y` cancels with exit 2. The installer script
+supports `--disk`, `--hostname`, `--user`, `--password-file`, `--yes`, `--tui`,
+`--dry-run`, and `--auto`. Without `--tui` (or a TUI cmdline marker) it stays
+unattended. After rsync it writes `/etc/hostname` and `/etc/hosts`, runs
+`useradd -m -s /bin/bash -G sudo <user>` (skipped if the user exists), then
+`chpasswd` for a non-empty password or `passwd -l` for an empty one.
+
+The TUI artifact is ISO-only and headless; it has no `install_device`:
+
+```json
+"boot": {
+  "mode": "install",
+  "iso": "live.iso",
+  "install_tui": true,
+  "cmdline": "boot=live live-media-path=/live console=ttyS0 systemd.unit=multi-user.target systemd.journald.forward_to_console=1 sysemble.install.tui=1",
+  "memory_mb": 1024
+}
+```
+
+`tools/tui-install-check.sh` drives the prompts with `expect` and asserts the
+installed disk boots with the chosen hostname; CI is the authoritative check.
+
 ### Desktop inference (P0-d1)
 
 The builder reads only `plan.packages`; `desktop` in the spec is not required
@@ -678,8 +744,10 @@ An ISO-only build emits the P0-d2 shape instead (no `partitions`):
 }
 ```
 
-- `boot.mode` is `"iso"` or `"uefi"`. P0-b artifacts (and any artifact without
-  `boot.mode`) default to `"kernel"`.
+- `boot.mode` is `"iso"`, `"uefi"`, or `"install"`. P0-b artifacts (and any
+  artifact without `boot.mode`) default to `"kernel"`. `boot.install_device`
+  is present only for the P0-d3 unattended installer; the P0-e1 TUI variant has
+  `boot.install_tui=true` and no `install_device`.
 - `desktop` is present only for a UEFI build whose package list contains a
   display manager. It has exactly two fields: `session` (`plasma`/`gnome`/
   `xfce`/`unknown`) and `display_manager` (`gdm`/`sddm`/`lightdm`).
@@ -777,12 +845,13 @@ acceptance.
 - No loop devices, mounts, or host block devices are used.
 - Docker mode bind-mounts only `<out>`; no Docker socket or host directories.
 
-## Not implemented through P0-d3
+## Not implemented through P0-e1
 
-- Calamares or any installer GUI (P0-d3b); desktop *configuration* (theme,
+- Calamares or any installer GUI (P0-e2); desktop *configuration* (theme,
   apps, users, autologin) beyond installing the session packages and letting
-  the display manager start; first-boot user setup. The P0-d3 installer is
-  headless and writes no users/passwords beyond what the live rootfs carries.
+  the display manager start. The P0-e1 TUI installer creates one user,
+  writes hostname/hosts, and sets or locks that user's password; first-boot
+  setup beyond that is out of scope.
 - BIOS boot, persistence, secure boot signing, dm-verity, and PXE assembly.
   (P0-d2 implements UEFI live ISO assembly; P0-d3 implements unattended
   install to `/dev/vda`, not a reproducible installer image or Calamares.)
@@ -801,7 +870,7 @@ acceptance.
   path is covered by offline tests with a fake toolchain; the real path is only
   exercised by CI.
 
-## Known risks (tracked by P0-c/P0-d1/P0-d2/P0-d3)
+## Known risks (tracked by P0-c/P0-d1/P0-d2/P0-d3/P0-e1)
 
 1. `grub-mkstandalone`'s module set or embedded-config argument may need
    adjustment on the CI runner; the build.log from the first CI run is the
@@ -864,6 +933,19 @@ acceptance.
     predictable `<dev>1`/`<dev>2` (or nvme/mmcblk `p1`/`p2`) names are
     supported. LUKS, LVM, RAID, multi-disk, and a GUI/first-boot flow are out of
     scope for P0-d3.
+16. The TUI wizard reads/writes `/dev/ttyS0` directly and stops
+    `serial-getty@ttyS0.service` first. A getty restarting concurrently, a
+    different serial device, or a non-serial console can race or hide the
+    prompts; the `expect`-driven CI check is the authority. If no ttyS0 terminal
+    exists the script falls back to stdin/stdout (used by local pipe tests).
+17. The TUI condition drop-in relies on systemd's empty-assignment reset and
+    triggering-condition (`|`) syntax (documented and supported by trixie's
+    systemd). The real install path, the dropped getty, and the password
+    prompt's `stty` handling are only verified by CI; the offline tests prove
+    command assembly and dry-run behavior.
+18. `chpasswd` receives `user:password` verbatim. A password containing a colon
+    or newline is out of scope for P0-e1 (the CI smoke test uses a simple
+    password); `--password-file` reads only the first line.
 
 ## Local checks
 
@@ -885,17 +967,21 @@ cargo run -q -p sysemble-cli -- plan examples/minimal-debian-live.yaml > /tmp/li
 bash builders/debian/build.sh --plan /tmp/live-plan.json --out /tmp/p0d2-dry --dry-run
 
 # Offline artifact manifest tests (fixture rootfs + real sha256)
-bash builders/debian/tests/artifact_test.sh        # 121 checks
+bash builders/debian/tests/artifact_test.sh        # 131 checks
 
 # Offline native --execute command-sequence tests (fake disk + ISO toolchain)
-bash builders/debian/tests/build_exec_test.sh      # 255 checks
+bash builders/debian/tests/build_exec_test.sh      # 299 checks
 
 # Offline installer static + dynamic dry-run tests (no partition/mount)
-bash builders/debian/tests/installer_test.sh       # 122 checks
+bash builders/debian/tests/installer_test.sh       # 191 checks
 
 # Installer ISO dry run (P0-d3)
 bash builders/debian/build.sh --plan /tmp/live-plan.json \
   --out /tmp/p0d3-dry --dry-run --installer
+
+# TUI installer ISO dry run (P0-e1)
+bash builders/debian/build.sh --plan /tmp/live-plan.json \
+  --out /tmp/p0e1-dry --dry-run --installer-tui
 
 # On macOS, without --dry-run, the native preflight is expected to exit 3
 bash builders/debian/build.sh \
@@ -982,17 +1068,32 @@ Expected evidence: only `live.iso` (no `disk.img`), a serial install log with
 assertions. The installer script, unit, and packages are inside the ISO; the
 build host is never partitioned.
 
+The P0-e1 `tui-install-smoke` job builds with `--installer-tui` and drives the
+serial wizard with `expect` (default disk, hostname, user, password, `yes`):
+
+```bash
+cargo run -p sysemble-cli -- plan examples/minimal-debian-live.yaml > plan.json
+sudo -E bash builders/debian/build.sh --plan plan.json --out /tmp/out --execute --installer-tui
+sudo chown -R "$(id -u):$(id -g)" /tmp/out
+bash tools/tui-install-check.sh --artifact /tmp/out/artifact.json \
+  --hostname sysemble-tui --timeout 1200 --json
+```
+
+Expected evidence: only `live.iso`, a serial install log containing all five
+`SYMBLE-TUI` prompts and `SYMBLE: install complete`, then a boot of the installed
+disk whose login prompt is `sysemble-tui login:`.
+
 ## Files
 
 | File | Role |
 |---|---|
-| `build.sh` | CLI, output directory handling, dry run, mode-aware native GPT/ESP/GRUB/UEFI and live ISO pipelines, the P0-d3 installer ISO, docker rootfs bootstrap. |
-| `lib.sh` | JSON backends, record parsing, plan validation, mode-aware preflight, disk sizing, disk/ISO GRUB rendering, P0-d1 desktop inference/runtime packages/boot evidence unit, P0-d2 ISO + P0-d3 installer artifact helpers, usage text. |
-| `installer/sysemble-install.sh` | Headless guest installer: GPT + ESP/ext4, rsync root, fstab, grub-install `--removable`, serial markers, poweroff on success / stay-alive on failure. Testable via `SYMBLE_*` overrides and `--dry-run`. |
+| `build.sh` | CLI, output directory handling, dry run, mode-aware native GPT/ESP/GRUB/UEFI and live ISO pipelines, the P0-d3/P0-e1 installer ISO, docker rootfs bootstrap. |
+| `lib.sh` | JSON backends, record parsing, plan validation, mode-aware preflight, disk sizing, disk/ISO GRUB rendering, P0-d1 desktop inference/runtime packages/boot evidence unit, P0-d2 ISO + P0-d3/P0-e1 installer artifact helpers, usage text. |
+| `installer/sysemble-install.sh` | Guest installer: unattended backend + serial TUI wizard; GPT + ESP/ext4, rsync root, fstab, hostname/hosts/user/password, grub-install `--removable`, serial markers, poweroff on success / stay-alive on failure. Testable via `SYMBLE_*` overrides, pipe input, and `--dry-run`. |
 | `installer/sysemble-install.service` | Frozen `sysemble-install.service` oneshot (ConditionKernelCommandLine, 1800 s, WantedBy multi-user.target). |
-| `tests/artifact_test.sh` | Offline fixture tests for `artifact_json` (UEFI no-DM + graphical + P0-b fallback), `artifact_iso_json` (iso-only, graphical, iso+disk), `artifact_install_json`, ISO/installer GRUB text, plan output mode selection, desktop inference, boot evidence unit, installer runtime packages, kernel/initrd selection, hashing, and disk sizing. |
-| `tests/build_exec_test.sh` | Offline fake-toolchain end-to-end tests of the native `--execute` disk/ISO/installer command sequences, arguments, GRUB configs, include lists, baked installer script/unit/symlink, mode-aware preflight, artifacts, and failure cleanup. |
-| `tests/installer_test.sh` | Static contract checks plus a real `--dry-run` of the installer script with sentinel fake commands (no partition/mount/poweroff), command-order assertions, fstab/GRUB text, marker, and failure path. |
+| `tests/artifact_test.sh` | Offline fixture tests for `artifact_json` (UEFI no-DM + graphical + P0-b fallback), `artifact_iso_json` (iso-only, graphical, iso+disk), `artifact_install_json`/`artifact_install_tui_json`, ISO/installer GRUB text, plan output mode selection, desktop inference, boot evidence unit, installer runtime packages, kernel/initrd selection, hashing, and disk sizing. |
+| `tests/build_exec_test.sh` | Offline fake-toolchain end-to-end tests of the native `--execute` disk/ISO/installer/TUI-installer command sequences, arguments, GRUB configs, include lists, baked installer script/unit/symlink/drop-in, mode-aware preflight, artifacts, and failure cleanup. |
+| `tests/installer_test.sh` | Static contract checks plus real `--dry-run` runs with sentinel fake commands (no partition/mount/poweroff): unattended, piped TUI prompts, invalid-disk retry, cancel, `--yes`, password file, hostname/user commands, serial marker, and failure/exit-code paths. |
 | `testdata/plan.example.json` | Contract-shaped KDE plan with a display manager (`["qcow2","iso"]`). |
 | `testdata/plan.disk.json` | Same KDE plan with `["qcow2"]` for the P0-c/P0-d1 disk regression. |
 | `testdata/plan.no-desktop.json` | Minimal fixture without a display manager for the P0-d1 no-DM regression. |

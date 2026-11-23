@@ -31,9 +31,14 @@
 # boot.mode="install" + boot.install_device="/dev/vda". Images stays live.iso;
 # the installer partitions the guest disk itself.
 #
+# P0-e1: --installer-tui (ISO-only plans) uses the same script/unit/packages
+# but appends sysemble.install.tui=1 to the ISO cmdline and records
+# boot.mode="install" + boot.install_tui=true with NO install_device. The
+# shared installer script starts its serial wizard for that cmdline marker.
+#
 # Contract (frozen):
 #   build.sh --plan <plan.json> --out <dir> [--dry-run] [--execute]
-#            [--engine docker|native] [--installer]
+#            [--engine docker|native] [--installer | --installer-tui]
 #
 # Only builders/** is modified by this script at runtime: everything is written
 # under --out. The host system, network configuration, and boot configuration
@@ -65,6 +70,7 @@ DRY_RUN=0
 EXECUTE=0
 ENGINE="native"
 INSTALLER=0
+INSTALLER_TUI=0
 BUILD_LOG=""
 OUTPUTS_OWNED=0
 DISK_OUTPUTS_OWNED=0
@@ -119,6 +125,10 @@ parse_args() {
         INSTALLER=1
         shift
         ;;
+      --installer-tui)
+        INSTALLER_TUI=1
+        shift
+        ;;
       --engine)
         if [ "$#" -lt 2 ]; then
           err "--engine requires a value"
@@ -152,6 +162,18 @@ parse_args() {
         ;;
     esac
   done
+
+  if [ "$INSTALLER" -eq 1 ] && [ "$INSTALLER_TUI" -eq 1 ]; then
+    err "--installer and --installer-tui are mutually exclusive"
+    usage >&2
+    exit 2
+  fi
+  # --installer-tui is an installer variant: the shared script/unit/packages
+  # path is exactly the P0-d3 one, and INSTALLER_TUI only changes the ISO
+  # cmdline and the artifact boot object.
+  if [ "$INSTALLER_TUI" -eq 1 ]; then
+    INSTALLER=1
+  fi
 
   if [ "$DRY_RUN" -eq 1 ] && [ "$EXECUTE" -eq 1 ]; then
     err "--dry-run and --execute are mutually exclusive"
@@ -192,7 +214,11 @@ validate_installer_mode() {
   fi
   mode=$(plan_build_mode)
   if [ "$mode" != "iso" ]; then
-    err "--installer requires an ISO-only plan (target.outputs contains 'iso' and no qcow2/raw); this plan is '$mode'"
+    if [ "$INSTALLER_TUI" -eq 1 ]; then
+      err "--installer-tui requires an ISO-only plan (target.outputs contains 'iso' and no qcow2/raw); this plan is '$mode'"
+    else
+      err "--installer requires an ISO-only plan (target.outputs contains 'iso' and no qcow2/raw); this plan is '$mode'"
+    fi
     return 2
   fi
   return 0
@@ -433,19 +459,38 @@ make_installer_hook_fragment() {
   printf 'ln -sfn ../%s "$1%s"\n' "$INSTALLER_UNIT_NAME" "$INSTALLER_WANTS_LINK_PATH"
 }
 
+# P0-e1: the shared P0-d3 unit is gated on
+# "ConditionKernelCommandLine=sysemble.install". systemd matches a single-word
+# condition against a cmdline word or the left-hand side of an assignment, so
+# that condition does not match "sysemble.install.tui=1". Keep the unit file
+# byte-identical (the unattended contract) and add a drop-in that resets the
+# condition list and ORs both installer markers through triggering conditions.
+make_installer_tui_hook_fragment() {
+  printf '; mkdir -p "$1/etc/systemd/system/%s.d"\n' "$INSTALLER_UNIT_NAME"
+  printf "cat >\"\$1/etc/systemd/system/%s.d/tui-cmdline.conf\" <<'SYMBLE_INSTALL_TUI_DROPIN'\n" "$INSTALLER_UNIT_NAME"
+  printf '[Unit]\n'
+  printf 'ConditionKernelCommandLine=\n'
+  printf 'ConditionKernelCommandLine=|%s\n' "$INSTALLER_KERNEL_PARAM"
+  printf 'ConditionKernelCommandLine=|%s\n' "$INSTALLER_TUI_KERNEL_PARAM"
+  printf 'SYMBLE_INSTALL_TUI_DROPIN\n'
+}
+
 # Shell command passed to mmdebstrap --customize-hook. mmdebstrap runs the hook
 # on the host with the rootfs directory as $1. systemctl enable is executed
 # inside a chroot; failure is non-fatal and produces a warning in build.log
 # (P0-b workplan risk 2). A desktop plan also installs and enables the P0-d1
 # boot evidence oneshot; an ISO plan regenerates the initramfs for live-boot;
-# an installer ISO bakes in the P0-d3 script/unit.
+# an installer ISO bakes in the P0-d3 script/unit (plus the P0-e1 drop-in for
+# the TUI cmdline marker).
 make_customize_hook() {
   local host=$1
   local display_manager=${2:-}
   local iso=${3:-0}
   local installer=${4:-0}
+  local installer_tui=${5:-0}
   local evidence=""
   local install_fragment=""
+  local tui_fragment=""
   local initramfs=""
 
   if [ -n "$display_manager" ]; then
@@ -453,12 +498,15 @@ make_customize_hook() {
   fi
   if [ "$installer" -eq 1 ]; then
     install_fragment=$(make_installer_hook_fragment "$INSTALLER_SCRIPT_SRC" "$INSTALLER_UNIT_SRC") || return 1
+    if [ "$installer_tui" -eq 1 ]; then
+      tui_fragment=$(make_installer_tui_hook_fragment) || return 1
+    fi
   fi
   if [ "$iso" -eq 1 ]; then
     initramfs=$(make_iso_initramfs_hook_fragment) || return 1
   fi
 
-  printf '%s' "printf '%s\\n' '$host' > \"\$1/etc/hostname\"; if chroot \"\$1\" systemctl enable serial-getty@ttyS0.service >/dev/null 2>&1; then :; else printf 'mmdebstrap customize hook: warning: could not enable serial-getty@ttyS0.service (non-fatal)\\n' >&2; fi${evidence}${install_fragment}${initramfs}"
+  printf '%s' "printf '%s\\n' '$host' > \"\$1/etc/hostname\"; if chroot \"\$1\" systemctl enable serial-getty@ttyS0.service >/dev/null 2>&1; then :; else printf 'mmdebstrap customize hook: warning: could not enable serial-getty@ttyS0.service (non-fatal)\\n' >&2; fi${evidence}${install_fragment}${tui_fragment}${initramfs}"
 }
 
 
@@ -541,7 +589,7 @@ do_dry_run() {
   spec_text=$(display_field "$PLAN_SPEC_TYPE" "$PLAN_SPEC_VALUE" "(not set)")
   pin_text=$(display_field "$PLAN_BASE_PIN_TYPE" "$PLAN_BASE_PIN_VALUE" "unpinned")
 
-  printf 'Sysemble Debian builder - dry run (P0-d3)\n'
+  printf 'Sysemble Debian builder - dry run (P0-d3/P0-e1)\n'
   printf '  plan:       %s\n' "$PLAN"
   printf '  out:        %s\n' "$OUT_ABS"
   printf '  engine:     %s (not checked in dry-run)\n' "$ENGINE"
@@ -553,8 +601,13 @@ do_dry_run() {
   printf '  outputs:    %s\n' "$OUTPUTS_TEXT"
   printf '  build mode: %s\n' "$mode"
   if [ "$INSTALLER" -eq 1 ]; then
-    printf '  installer:  enabled (ISO-only, install_device=%s, memory_mb=%s)\n' \
-      "$INSTALLER_DEVICE_DEFAULT" "$ISO_BOOT_MEMORY_MB_DEFAULT"
+    if [ "$INSTALLER_TUI" -eq 1 ]; then
+      printf '  installer:  enabled (ISO-only TUI wizard, memory_mb=%s)\n' \
+        "$ISO_BOOT_MEMORY_MB_DEFAULT"
+    else
+      printf '  installer:  enabled (ISO-only, install_device=%s, memory_mb=%s)\n' \
+        "$INSTALLER_DEVICE_DEFAULT" "$ISO_BOOT_MEMORY_MB_DEFAULT"
+    fi
     printf '  installer:  script=%s unit=%s\n' \
       "$INSTALLER_SCRIPT_INSTALL_PATH" "$INSTALLER_UNIT_INSTALL_PATH"
   fi
@@ -608,10 +661,18 @@ do_dry_run() {
     if [ "$INSTALLER" -eq 1 ]; then
       printf '  customize hook: install %s (0755) + %s + multi-user.target.wants symlink\n' \
         "$INSTALLER_SCRIPT_INSTALL_PATH" "$INSTALLER_UNIT_INSTALL_PATH"
-      printf '  ISO cmdline: %s %s=%s\n' \
-        "$ISO_BOOT_CMDLINE" "$INSTALLER_KERNEL_PARAM" "$INSTALLER_DEVICE_DEFAULT"
-      printf '  artifact: boot.mode=install, boot.install_device=%s, memory_mb=%s\n' \
-        "$INSTALLER_DEVICE_DEFAULT" "$ISO_BOOT_MEMORY_MB_DEFAULT"
+      if [ "$INSTALLER_TUI" -eq 1 ]; then
+        printf '  ISO cmdline: %s %s\n' "$ISO_BOOT_CMDLINE" "$INSTALLER_TUI_MARKER"
+        printf '  installer unit drop-in: %s.d/tui-cmdline.conf (sysemble.install OR sysemble.install.tui)\n' \
+          "$INSTALLER_UNIT_NAME"
+        printf '  artifact: boot.mode=install, boot.install_tui=true, no install_device, memory_mb=%s\n' \
+          "$ISO_BOOT_MEMORY_MB_DEFAULT"
+      else
+        printf '  ISO cmdline: %s %s=%s\n' \
+          "$ISO_BOOT_CMDLINE" "$INSTALLER_KERNEL_PARAM" "$INSTALLER_DEVICE_DEFAULT"
+        printf '  artifact: boot.mode=install, boot.install_device=%s, memory_mb=%s\n' \
+          "$INSTALLER_DEVICE_DEFAULT" "$ISO_BOOT_MEMORY_MB_DEFAULT"
+      fi
     fi
   else
     printf '  docker run --rm --privileged -v %s:/out debian:trixie \\\n' "$OUT_ABS"
@@ -661,10 +722,11 @@ finish_rootfs_only() {
 # and <iso_efi> are the GRUB config, ESP staging tree, and intermediate FAT
 # image (iso-only uses <out>/grub.cfg, <out>/esp, <out>/efi.img; an iso+disk
 # plan uses a private <out>/iso-staging tree so it cannot clobber the disk
-# build). <installer> is the P0-d3 flag: 1 appends sysemble.install=<device> to
-# the live cmdline. Returns 0 on success, 6 on any failed step; the caller's
-# EXIT trap removes a half-written live.iso/efi.img and keeps rootfs/, iso/, and
-# logs.
+# build). <installer> is the P0-d3 flag: 1 appends the installer parameter to
+# the live cmdline. <installer_tui> is the P0-e1 flag: 1 selects the
+# sysemble.install.tui=1 marker instead of sysemble.install=<device>. Returns
+# 0 on success, 6 on any failed step; the caller's EXIT trap removes a
+# half-written live.iso/efi.img and keeps rootfs/, iso/, and logs.
 build_iso_image() {
   local rootfs=$1
   local kernel=$2
@@ -675,6 +737,7 @@ build_iso_image() {
   local iso_efi=$7
   local iso_dir=$8
   local installer=${9:-0}
+  local installer_tui=${10:-0}
   local iso_live="$iso_dir/live"
   local iso_boot="$iso_dir/boot/grub"
   local kernel_name=${kernel##*/}
@@ -686,7 +749,11 @@ build_iso_image() {
   blog "[build] iso tree: $iso_dir (live/filesystem.squashfs, live/vmlinuz, live/initrd.img, boot/grub/efi.img)"
   blog "[build] iso grub: menuentry \"$ISO_GRUB_MENU_TITLE\", search /live/vmlinuz, boot=live live-media-path=/live"
   if [ "$installer" -eq 1 ]; then
-    blog "[build] iso grub: installer cmdline adds $INSTALLER_KERNEL_PARAM=$INSTALLER_DEVICE_DEFAULT"
+    if [ "$installer_tui" -eq 1 ]; then
+      blog "[build] iso grub: installer TUI cmdline adds $INSTALLER_TUI_MARKER"
+    else
+      blog "[build] iso grub: installer cmdline adds $INSTALLER_KERNEL_PARAM=$INSTALLER_DEVICE_DEFAULT"
+    fi
   fi
 
   if ! mkdir -p "$iso_live" "$iso_boot" "$iso_esp/EFI/BOOT"; then
@@ -712,7 +779,7 @@ build_iso_image() {
     return 6
   fi
 
-  if ! iso_grub_cfg_text "$kernel_name" "$initrd_name" "$graphical" "$installer" \
+  if ! iso_grub_cfg_text "$kernel_name" "$initrd_name" "$graphical" "$installer" "$installer_tui" \
     >"$OUT_ABS/.iso-grub.cfg.tmp" 2>"$TMP_DIR/grub.err"; then
     if [ -s "$TMP_DIR/grub.err" ]; then
       cat "$TMP_DIR/grub.err" | tee -a "$BUILD_LOG" >&2
@@ -924,7 +991,7 @@ build_native() {
   fi
 
   hostname=$(plan_hostname)
-  if ! hook=$(make_customize_hook "$hostname" "$desktop_dm" "$iso" "$INSTALLER"); then
+  if ! hook=$(make_customize_hook "$hostname" "$desktop_dm" "$iso" "$INSTALLER" "$INSTALLER_TUI"); then
     blog_err "cannot build the mmdebstrap customize hook for display_manager='$desktop_dm'"
     return 6
   fi
@@ -990,9 +1057,17 @@ build_native() {
     blog "[build] live ISO: regenerate the initramfs in the customize hook so the live-boot hook is included"
   fi
   if [ "$INSTALLER" -eq 1 ]; then
-    blog "[build] installer: ISO-only unattended install to $INSTALLER_DEVICE_DEFAULT (memory ${ISO_BOOT_MEMORY_MB_DEFAULT} MB)"
+    if [ "$INSTALLER_TUI" -eq 1 ]; then
+      blog "[build] installer: ISO-only TUI wizard, no preselected disk (memory ${ISO_BOOT_MEMORY_MB_DEFAULT} MB)"
+      blog "[build] installer cmdline: $INSTALLER_TUI_MARKER"
+    else
+      blog "[build] installer: ISO-only unattended install to $INSTALLER_DEVICE_DEFAULT (memory ${ISO_BOOT_MEMORY_MB_DEFAULT} MB)"
+      blog "[build] installer cmdline: $INSTALLER_KERNEL_PARAM=$INSTALLER_DEVICE_DEFAULT"
+    fi
     blog "[build] installer hook: $INSTALLER_SCRIPT_INSTALL_PATH (0755), $INSTALLER_UNIT_INSTALL_PATH, multi-user.target.wants link"
-    blog "[build] installer cmdline: $INSTALLER_KERNEL_PARAM=$INSTALLER_DEVICE_DEFAULT"
+    if [ "$INSTALLER_TUI" -eq 1 ]; then
+      blog "[build] installer unit drop-in: $INSTALLER_UNIT_NAME.d/tui-cmdline.conf (sysemble.install OR sysemble.install.tui)"
+    fi
   fi
   blog "[build] customize: hostname=$hostname, enable serial-getty@ttyS0.service (failure is non-fatal)"
 
@@ -1141,7 +1216,7 @@ build_native() {
 
   if [ "$iso" -eq 1 ]; then
     if ! build_iso_image "$rootfs" "$kernel" "$initrd" "$graphical" \
-      "$iso_cfg" "$iso_esp" "$iso_efi" "$iso_dir" "$INSTALLER"; then
+      "$iso_cfg" "$iso_esp" "$iso_efi" "$iso_dir" "$INSTALLER" "$INSTALLER_TUI"; then
       return 6
     fi
   fi
@@ -1150,7 +1225,14 @@ build_native() {
   artifact_fail=0
   if [ "$iso" -eq 1 ]; then
     if [ "$INSTALLER" -eq 1 ]; then
-      if ! artifact_install_json "$OUT_ABS" "$PLAN_SPEC_VALUE" \
+      if [ "$INSTALLER_TUI" -eq 1 ]; then
+        if ! artifact_install_tui_json "$OUT_ABS" "$PLAN_SPEC_VALUE" \
+          "$PLAN_BASE_RELEASE_VALUE" "$PLAN_BASE_PIN_VALUE" \
+          "$PLAN_TARGET_ARCH_VALUE" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+          "${PLAN_PACKAGES_VALUES[@]}" >"$OUT_ABS/.artifact.json.tmp" 2>"$TMP_DIR/artifact.err"; then
+          artifact_fail=1
+        fi
+      elif ! artifact_install_json "$OUT_ABS" "$PLAN_SPEC_VALUE" \
         "$PLAN_BASE_RELEASE_VALUE" "$PLAN_BASE_PIN_VALUE" \
         "$PLAN_TARGET_ARCH_VALUE" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         "${PLAN_PACKAGES_VALUES[@]}" >"$OUT_ABS/.artifact.json.tmp" 2>"$TMP_DIR/artifact.err"; then
@@ -1205,7 +1287,11 @@ build_native() {
     blog "  iso cfg:  $iso_cfg"
   fi
   if [ "$INSTALLER" -eq 1 ]; then
-    blog "  installer: $INSTALLER_SCRIPT_INSTALL_PATH + $INSTALLER_UNIT_INSTALL_PATH (install_device $INSTALLER_DEVICE_DEFAULT)"
+    if [ "$INSTALLER_TUI" -eq 1 ]; then
+      blog "  installer: $INSTALLER_SCRIPT_INSTALL_PATH + $INSTALLER_UNIT_INSTALL_PATH (TUI wizard, no preselected disk)"
+    else
+      blog "  installer: $INSTALLER_SCRIPT_INSTALL_PATH + $INSTALLER_UNIT_INSTALL_PATH (install_device $INSTALLER_DEVICE_DEFAULT)"
+    fi
   fi
   blog "  artifact: $OUT_ABS/artifact.json"
   blog "  log:      $BUILD_LOG"

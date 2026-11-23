@@ -291,6 +291,26 @@ assert_contains "search --no-floppy --file --set=root /live/vmlinuz" "$ISO_INSTA
   "installer ISO grub.cfg still searches for /live/vmlinuz"
 assert_fails "iso_grub_cfg_text rejects an invalid installer flag" \
   iso_grub_cfg_text "$KERNEL_NAME" "$INITRD_NAME" 0 2
+
+# P0-e1: the TUI installer ISO uses sysemble.install.tui=1 and no disk.
+ISO_TUI_GRUB="$TMP_DIR/grub-iso-installer-tui.cfg"
+if iso_grub_cfg_text "$KERNEL_NAME" "$INITRD_NAME" 0 1 1 >"$ISO_TUI_GRUB"; then
+  pass "iso_grub_cfg_text renders the TUI installer ISO menu"
+else
+  fail "iso_grub_cfg_text failed for the TUI installer flag"
+fi
+assert_contains "linux /live/vmlinuz boot=live live-media-path=/live console=ttyS0 systemd.unit=multi-user.target systemd.journald.forward_to_console=1 sysemble.install.tui=1" \
+  "$ISO_TUI_GRUB" "TUI installer ISO grub.cfg appends sysemble.install.tui=1"
+assert_not_contains "sysemble.install=/dev/vda" "$ISO_TUI_GRUB" \
+  "TUI installer ISO grub.cfg has no install_device parameter"
+assert_not_contains "install_device" "$ISO_TUI_GRUB" \
+  "TUI installer ISO grub.cfg carries no install_device text"
+assert_contains "search --no-floppy --file --set=root /live/vmlinuz" "$ISO_TUI_GRUB" \
+  "TUI installer ISO grub.cfg still searches /live/vmlinuz"
+assert_fails "iso_grub_cfg_text rejects an invalid TUI installer flag" \
+  iso_grub_cfg_text "$KERNEL_NAME" "$INITRD_NAME" 0 1 2
+assert_fails "iso_grub_cfg_text rejects a TUI flag without the installer flag" \
+  iso_grub_cfg_text "$KERNEL_NAME" "$INITRD_NAME" 0 0 1
 if iso_grub_cfg_text "" "$INITRD_NAME" >/dev/null 2>&1; then
   fail "iso_grub_cfg_text must reject an empty kernel name"
 else
@@ -532,6 +552,96 @@ if artifact_install_json "$TMP_DIR/no-such" "spec" "trixie" "" "x86_64" "$CREATE
   fail "artifact_install_json must fail without rootfs"
 else
   pass "artifact_install_json fails without rootfs"
+fi
+
+# ---------------------------------------------------------------------------
+# P0-e1 TUI installer artifact (boot.mode=install, install_tui=true, no disk)
+# ---------------------------------------------------------------------------
+
+INSTALL_TUI_JSON="$TMP_DIR/artifact-install-tui.json"
+if artifact_install_tui_json "$ISO_OUT" "minimal-debian-live-install-tui" "trixie" "2026-11-01" \
+  "x86_64" "$CREATED_AT" "${PACKAGES[@]}" >"$INSTALL_TUI_JSON"; then
+  pass "artifact_install_tui_json exits 0 for a TUI installer ISO"
+else
+  fail "artifact_install_tui_json failed for a TUI installer ISO"
+fi
+INSTALL_TUI_CMDLINE="boot=live live-media-path=/live console=ttyS0 systemd.unit=multi-user.target systemd.journald.forward_to_console=1 sysemble.install.tui=1"
+if [ "$json_backend" = "python3" ]; then
+  if python3 - "$INSTALL_TUI_JSON" "$ISO_OUT" "$INSTALL_TUI_CMDLINE" <<'PY'
+import json
+import os
+import re
+import sys
+
+path, out, tui_cmdline = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(path, "r", encoding="utf-8") as fh:
+    doc = json.load(fh)
+
+def check(condition, message):
+    if not condition:
+        sys.exit("FAIL: " + message)
+    print("ok - " + message)
+
+check(
+    set(doc) == {
+        "apiVersion", "createdAt", "spec", "base", "arch", "packages",
+        "rootfs", "images", "boot", "builder",
+    },
+    "TUI installer top-level keys omit partitions and desktop",
+)
+check(doc["apiVersion"] == "sysemble/artifact/v1", "TUI apiVersion")
+check(doc["spec"] == "minimal-debian-live-install-tui", "TUI spec")
+check(doc["packages"] == ["apt", "ca-certificates", "systemd"], "TUI artifact.packages keeps the plan list")
+check(len(doc["images"]) == 1, "TUI installer images keeps exactly one entry")
+check(doc["images"][0]["path"] == "live.iso", "TUI image is live.iso")
+check(doc["images"][0]["format"] == "iso", "TUI image format is iso")
+check(
+    set(doc["boot"]) == {"mode", "iso", "install_tui", "cmdline", "memory_mb"},
+    "TUI boot keys are mode/iso/install_tui/cmdline/memory_mb",
+)
+check(doc["boot"]["mode"] == "install", "TUI boot.mode is install")
+check(doc["boot"]["iso"] == "live.iso", "TUI boot.iso is live.iso")
+check(doc["boot"]["install_tui"] is True, "TUI boot.install_tui is true")
+check("install_device" not in doc["boot"], "TUI artifact has no install_device")
+check(doc["boot"]["cmdline"] == tui_cmdline, "TUI boot.cmdline ends with the TUI marker")
+check(doc["boot"]["cmdline"].endswith("sysemble.install.tui=1"), "TUI cmdline suffix")
+check("sysemble.install=/dev/vda" not in doc["boot"]["cmdline"], "TUI cmdline has no install device")
+check(doc["boot"]["memory_mb"] == 1024, "TUI boot.memory_mb is 1024")
+check("graphical" not in doc["boot"], "TUI boot has no graphical flag")
+check("partitions" not in doc, "TUI artifact omits partitions")
+check("desktop" not in doc, "TUI artifact omits desktop")
+check(doc["builder"] == {"name": "build.sh", "version": "0.1.0"}, "TUI builder")
+check(os.path.isfile(os.path.join(out, "live.iso")), "TUI live.iso exists under <out>")
+PY
+  then
+    pass "TUI installer artifact JSON shape and values"
+  else
+    fail "TUI installer artifact JSON shape and values"
+  fi
+else
+  if jq -e --arg cmdline "$INSTALL_TUI_CMDLINE" '
+      .apiVersion == "sysemble/artifact/v1" and
+      .spec == "minimal-debian-live-install-tui" and
+      .packages == ["apt","ca-certificates","systemd"] and
+      (.images | length == 1) and
+      .images[0].path == "live.iso" and
+      .images[0].format == "iso" and
+      (has("partitions") | not) and
+      (has("desktop") | not) and
+      (.boot | has("install_device") | not) and
+      .boot == {"mode":"install","iso":"live.iso","install_tui":true,"cmdline":$cmdline,"memory_mb":1024}
+    ' "$INSTALL_TUI_JSON" >/dev/null 2>&1; then
+    pass "TUI installer artifact JSON shape and values (jq)"
+  else
+    fail "TUI installer artifact JSON shape and values (jq)"
+  fi
+fi
+
+if artifact_install_tui_json "$TMP_DIR/no-such" "spec" "trixie" "" "x86_64" "$CREATED_AT" \
+  "${PACKAGES[@]}" >/dev/null 2>&1; then
+  fail "artifact_install_tui_json must fail without rootfs"
+else
+  pass "artifact_install_tui_json fails without rootfs"
 fi
 
 ISO_DM_JSON="$TMP_DIR/artifact-iso-desktop.json"

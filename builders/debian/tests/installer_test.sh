@@ -395,6 +395,17 @@ exit 0
 SH
   chmod +x "$FAILBIN/$tool"
 done
+# The real install path checks Linux/root before touching the device; fake both
+# so this test reaches the frozen non-block-device failure marker.
+cat >"$FAILBIN/uname" <<'SH'
+#!/bin/sh
+printf 'Linux\n'
+SH
+cat >"$FAILBIN/id" <<'SH'
+#!/bin/sh
+printf '0\n'
+SH
+chmod +x "$FAILBIN/uname" "$FAILBIN/id"
 
 FAIL_RC=0
 if PATH="$FAILBIN:$PATH" \
@@ -428,7 +439,8 @@ printf 'boot=live sysemble.install=not-a-device\n' >"$INVALID_CMDLINE"
 : >"$INVALID_CONSOLE"
 INVALID_RC=0
 if SYMBLE_CMDLINE_FILE="$INVALID_CMDLINE" SYMBLE_CONSOLE="$INVALID_CONSOLE" \
-  SYMBLE_MNT="$TMP_DIR/never-mounted" sh "$SCRIPT" >"$TMP_DIR/invalid-out.log" 2>&1; then
+  SYMBLE_MNT="$TMP_DIR/never-mounted" PATH="$FAILBIN:$PATH" \
+  sh "$SCRIPT" >"$TMP_DIR/invalid-out.log" 2>&1; then
   INVALID_RC=0
 else
   INVALID_RC=$?
@@ -436,6 +448,247 @@ fi
 assert_eq "1" "$INVALID_RC" "non-/dev install device exits 1"
 assert_contains "SYMBLE: install failed: invalid install device 'not-a-device'" \
   "$INVALID_CONSOLE" "non-/dev install device prints the failure marker"
+
+# ---------------------------------------------------------------------------
+# P0-e1 CLI/TUI static contract
+# ---------------------------------------------------------------------------
+
+assert_contains "--disk" "$SCRIPT" "script documents/supports --disk"
+assert_contains "--hostname" "$SCRIPT" "script documents/supports --hostname"
+assert_contains "--user" "$SCRIPT" "script documents/supports --user"
+assert_contains "--password-file" "$SCRIPT" "script documents/supports --password-file"
+assert_contains "--yes" "$SCRIPT" "script documents/supports --yes"
+assert_contains "--tui" "$SCRIPT" "script documents/supports --tui"
+assert_contains "--auto" "$SCRIPT" "script documents/supports --auto"
+assert_contains "sysemble.install.tui=*" "$SCRIPT" \
+  "script auto-detects the sysemble.install.tui= cmdline marker"
+assert_contains 'SYMBLE-TUI $label [$default]: ' "$SCRIPT" \
+  "script renders the frozen disk/hostname/user prompts"
+assert_contains 'SYMBLE-TUI password: ' "$SCRIPT" "script renders the frozen password prompt"
+assert_contains 'SYMBLE-TUI confirm install to $INSTALL_DEVICE (yes/no): ' "$SCRIPT" \
+  "script renders the frozen confirmation prompt"
+assert_contains 'tui_prompt "disk"' "$SCRIPT" "TUI prompts for the disk"
+assert_contains 'tui_prompt "hostname"' "$SCRIPT" "TUI prompts for the hostname"
+assert_contains 'tui_prompt "user"' "$SCRIPT" "TUI prompts for the user"
+assert_contains "stty -echo" "$SCRIPT" "TUI disables password echo with stty -echo"
+assert_contains 'stty "$TUI_STTY_SAVED"' "$SCRIPT" "TUI restores the saved terminal settings"
+assert_contains "systemctl stop serial-getty@ttyS0.service" "$SCRIPT" \
+  "TUI stops the serial getty before using ttyS0"
+assert_contains "useradd -m -s /bin/bash -G sudo" "$SCRIPT" \
+  "post-install creates the user with useradd -m -s /bin/bash -G sudo"
+assert_contains "chpasswd" "$SCRIPT" "post-install sets a non-empty password with chpasswd"
+assert_contains "passwd -l" "$SCRIPT" "post-install locks an empty password with passwd -l"
+assert_contains '/etc/hostname' "$SCRIPT" "post-install writes /etc/hostname"
+assert_contains '/etc/hosts' "$SCRIPT" "post-install writes /etc/hosts"
+assert_contains '127.0.1.1 %s' "$SCRIPT" "post-install maps the hostname to 127.0.1.1"
+assert_contains "valid_tui_disk" "$SCRIPT" "TUI re-prompts until the disk is valid"
+assert_contains "installation cancelled" "$SCRIPT" "TUI reports a refused confirmation"
+assert_contains "exit 2" "$SCRIPT" "TUI cancellation exits 2"
+assert_contains "exit 3" "$SCRIPT" "non-root/non-Linux preflight exits 3"
+
+# ---------------------------------------------------------------------------
+# P0-e1 dynamic dry-run: piped TUI, cancel, retry, --yes, post-install config
+# ---------------------------------------------------------------------------
+
+TUI_ROOT="$TMP_DIR/tui"
+TUI_MNT="$TUI_ROOT/mnt"
+TUI_LIVE="$TUI_ROOT/live"
+TUI_CONSOLE="$TUI_ROOT/console"
+TUI_CMDLINE="$TUI_ROOT/cmdline"
+TUI_SENTINEL="$TUI_ROOT/sentinel"
+TUIBIN="$TUI_ROOT/bin"
+mkdir -p "$TUI_MNT/boot" "$TUI_LIVE" "$TUI_SENTINEL" "$TUIBIN"
+printf 'kernel\n' >"$TUI_MNT/boot/vmlinuz-6.12.3"
+printf 'initrd\n' >"$TUI_MNT/boot/initrd.img-6.12.3"
+: >"$TUI_CMDLINE"
+: >"$TUI_CONSOLE"
+for tool in sgdisk mkfs.vfat mkfs.ext4 mount umount chroot rsync blkid systemctl \
+  useradd chpasswd passwd stty tty; do
+  cat >"$TUIBIN/$tool" <<SH
+#!/bin/sh
+: >"$TUI_SENTINEL/$tool"
+exit 0
+SH
+  chmod +x "$TUIBIN/$tool"
+done
+
+# Run the installer with the TUI fed through stdin (SYMBLE_TUI_DEVICE points at
+# a missing node, which is the documented local pipe path). Sets TUI_RC and
+# TUI_OUT for the following assertions.
+tui_run() {
+  TUI_INPUT=$1
+  TUI_LABEL=$2
+  shift 2
+  TUI_OUT="$TMP_DIR/tui-$TUI_LABEL.out"
+  : >"$TUI_CONSOLE"
+  TUI_RC=0
+  if printf '%s' "$TUI_INPUT" |
+    PATH="$TUIBIN:$PATH" \
+      SYMBLE_CMDLINE_FILE="$TUI_CMDLINE" \
+      SYMBLE_ROOT="$TUI_LIVE" \
+      SYMBLE_MNT="$TUI_MNT" \
+      SYMBLE_CONSOLE="$TUI_CONSOLE" \
+      SYMBLE_TUI_DEVICE=/nonexistent \
+      sh "$SCRIPT" "$@" >"$TUI_OUT" 2>&1; then
+    TUI_RC=0
+  else
+    TUI_RC=$?
+  fi
+}
+
+tui_run $'\n\n\n\n\nyes\n' default --tui --dry-run
+assert_eq "0" "$TUI_RC" "piped TUI dry-run (five blank answers then yes) exits 0"
+for prompt in \
+  'SYMBLE-TUI disk [/dev/vda]:' \
+  'SYMBLE-TUI hostname [sysemble]:' \
+  'SYMBLE-TUI user [ops]:' \
+  'SYMBLE-TUI password:' \
+  'SYMBLE-TUI confirm install to /dev/vda (yes/no):'; do
+  assert_contains "$prompt" "$TUI_OUT" "piped TUI prints '$prompt'"
+done
+assert_contains "tui answers: disk=/dev/vda hostname=sysemble user=ops password=empty" \
+  "$TUI_OUT" "TUI logs the chosen answers"
+assert_contains "SYMBLE: install complete" "$TUI_CONSOLE" \
+  "piped TUI dry-run prints the completion marker"
+if [ -z "$(ls -A "$TUI_SENTINEL" 2>/dev/null)" ]; then
+  pass "piped TUI dry-run executes no destructive command"
+else
+  fail "piped TUI dry-run executed a destructive command: $(ls -A "$TUI_SENTINEL")"
+fi
+assert_before "SYMBLE-TUI confirm install" "+ sgdisk -Z" "$TUI_OUT" \
+  "TUI asks for confirmation before any install command"
+assert_contains "+ chroot $TUI_MNT useradd -m -s /bin/bash -G sudo ops" "$TUI_OUT" \
+  "TUI dry-run plans the useradd command"
+assert_contains "+ chroot $TUI_MNT passwd -l ops" "$TUI_OUT" \
+  "TUI dry-run locks the empty default password"
+assert_contains "127.0.1.1 sysemble" "$TUI_OUT" \
+  "TUI dry-run renders the /etc/hosts hostname line"
+
+tui_run $'\n\n\n\nno\n' cancel --tui --dry-run
+assert_eq "2" "$TUI_RC" "TUI confirmation 'no' exits 2"
+assert_contains "SYMBLE-TUI installation cancelled" "$TUI_OUT" \
+  "TUI cancellation is reported"
+assert_not_contains "SYMBLE: install complete" "$TUI_CONSOLE" \
+  "cancelled TUI writes no completion marker"
+assert_not_contains "+ sgdisk -Z" "$TUI_OUT" \
+  "cancelled TUI runs no install command"
+if [ -z "$(ls -A "$TUI_SENTINEL" 2>/dev/null)" ]; then
+  pass "cancelled TUI executes no destructive command"
+else
+  fail "cancelled TUI executed a destructive command: $(ls -A "$TUI_SENTINEL")"
+fi
+
+tui_run $'/dev/nope\n\n\n\n\nyes\n' retry --tui --dry-run
+assert_eq "0" "$TUI_RC" "TUI invalid disk retry eventually exits 0"
+assert_contains "SYMBLE-TUI invalid disk '/dev/nope' (not a block device); try again" \
+  "$TUI_OUT" "TUI rejects a non-block device"
+TUI_DISK_PROMPTS=$(grep -c -F -- 'SYMBLE-TUI disk [/dev/vda]:' "$TUI_OUT" 2>/dev/null || true)
+assert_eq "2" "$TUI_DISK_PROMPTS" "TUI re-prompts the disk after an invalid device"
+assert_contains "tui answers: disk=/dev/vda" "$TUI_OUT" \
+  "TUI accepts the default /dev/vda after the retry"
+
+# --yes skips the confirmation prompt entirely (the four answers already cover
+# disk/hostname/user/password, so a confirm read would hit EOF and exit 2).
+tui_run $'\n\n\ns3cret\n' yes-skip --tui --yes --dry-run
+assert_eq "0" "$TUI_RC" "TUI --yes with four answers exits 0"
+assert_not_contains "SYMBLE-TUI confirm install" "$TUI_OUT" \
+  "TUI --yes skips the confirmation prompt"
+assert_contains "tui: confirmation skipped (--yes)" "$TUI_OUT" \
+  "TUI logs that --yes skipped confirmation"
+assert_contains "password=set" "$TUI_OUT" "TUI records that a password was supplied"
+assert_contains "+ chroot $TUI_MNT chpasswd" "$TUI_OUT" \
+  "TUI with a password plans chpasswd"
+assert_not_contains "s3cret" "$TUI_OUT" "TUI dry-run never logs the password"
+
+# Unattended --yes: no prompts at all, default empty password -> passwd -l.
+TUI_OUT="$TMP_DIR/tui-unattended.out"
+: >"$TUI_CONSOLE"
+TUI_RC=0
+if SYMBLE_CMDLINE_FILE="$TUI_CMDLINE" SYMBLE_ROOT="$TUI_LIVE" \
+  SYMBLE_MNT="$TUI_MNT" SYMBLE_CONSOLE="$TUI_CONSOLE" \
+  sh "$SCRIPT" --yes --disk /dev/vda --hostname h --user u --dry-run </dev/null \
+  >"$TUI_OUT" 2>&1; then
+  TUI_RC=0
+else
+  TUI_RC=$?
+fi
+assert_eq "0" "$TUI_RC" "--yes --disk/--hostname/--user --dry-run exits 0"
+assert_not_contains "SYMBLE-TUI" "$TUI_OUT" \
+  "unattended --yes prints no TUI prompts"
+assert_contains "configuration: disk=/dev/vda hostname=h user=u password=empty" \
+  "$TUI_OUT" "unattended dry-run records disk, hostname, and user"
+assert_contains "+ chroot $TUI_MNT useradd -m -s /bin/bash -G sudo u" "$TUI_OUT" \
+  "unattended dry-run plans useradd for the requested user"
+assert_contains "+ chroot $TUI_MNT passwd -l u" "$TUI_OUT" \
+  "unattended empty password plans passwd -l"
+
+# A non-empty --password-file selects chpasswd and is never echoed.
+PASSWORD_FIXTURE="$TMP_DIR/password.txt"
+printf 's3cret\n' >"$PASSWORD_FIXTURE"
+TUI_OUT="$TMP_DIR/tui-password-file.out"
+TUI_RC=0
+if SYMBLE_CMDLINE_FILE="$TUI_CMDLINE" SYMBLE_ROOT="$TUI_LIVE" \
+  SYMBLE_MNT="$TUI_MNT" SYMBLE_CONSOLE="$TUI_CONSOLE" \
+  sh "$SCRIPT" --yes --disk /dev/vda --hostname h2 --user u2 \
+  --password-file "$PASSWORD_FIXTURE" --dry-run </dev/null >"$TUI_OUT" 2>&1; then
+  TUI_RC=0
+else
+  TUI_RC=$?
+fi
+assert_eq "0" "$TUI_RC" "--password-file --dry-run exits 0"
+assert_contains "+ chroot $TUI_MNT useradd -m -s /bin/bash -G sudo u2" "$TUI_OUT" \
+  "password-file dry-run plans useradd for the requested user"
+assert_contains "+ chroot $TUI_MNT chpasswd" "$TUI_OUT" \
+  "password-file dry-run plans chpasswd"
+assert_contains "127.0.1.1 h2" "$TUI_OUT" \
+  "password-file dry-run renders the requested hostname in /etc/hosts"
+assert_not_contains "s3cret" "$TUI_OUT" "dry-run never prints the password"
+
+# Exit 3: the real-install preflight rejects a non-Linux host before any disk
+# work. Fake uname/id so the test host does not matter.
+ENVBIN="$TMP_DIR/envbin"
+mkdir -p "$ENVBIN"
+cat >"$ENVBIN/uname" <<'SH'
+#!/bin/sh
+printf 'Darwin\n'
+SH
+cat >"$ENVBIN/id" <<'SH'
+#!/bin/sh
+printf '0\n'
+SH
+chmod +x "$ENVBIN/uname" "$ENVBIN/id"
+ENV_RC=0
+if PATH="$ENVBIN:$PATH" SYMBLE_CONSOLE="$TMP_DIR/env-console" \
+  sh "$SCRIPT" --disk /dev/vda >"$TMP_DIR/env-nonlinux.out" 2>&1; then
+  ENV_RC=0
+else
+  ENV_RC=$?
+fi
+assert_eq "3" "$ENV_RC" "non-Linux real install exits 3"
+assert_contains "requires Linux" "$TMP_DIR/env-nonlinux.out" \
+  "non-Linux preflight explains the requirement"
+
+cat >"$ENVBIN/uname" <<'SH'
+#!/bin/sh
+printf 'Linux\n'
+SH
+cat >"$ENVBIN/id" <<'SH'
+#!/bin/sh
+printf '1000\n'
+SH
+chmod +x "$ENVBIN/uname" "$ENVBIN/id"
+ENV_RC=0
+if PATH="$ENVBIN:$PATH" SYMBLE_CONSOLE="$TMP_DIR/env-console" \
+  sh "$SCRIPT" --disk /dev/vda >"$TMP_DIR/env-nonroot.out" 2>&1; then
+  ENV_RC=0
+else
+  ENV_RC=$?
+fi
+assert_eq "3" "$ENV_RC" "non-root real install exits 3"
+assert_contains "requires root" "$TMP_DIR/env-nonroot.out" \
+  "non-root preflight explains the requirement"
+
+
 
 # ---------------------------------------------------------------------------
 # Summary

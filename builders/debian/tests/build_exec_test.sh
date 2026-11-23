@@ -934,6 +934,83 @@ check(doc["builder"] == {"name": "build.sh", "version": "0.1.0"}, "builder")
 PY
 }
 
+# P0-e1 TUI installer artifact checker.
+# Usage: validate_install_tui_artifact <json> <out_dir> <spec> <package_count>
+validate_install_tui_artifact() {
+  python3 - "$1" "$2" "$3" "$4" <<'PY'
+import json
+import os
+import re
+import sys
+
+path, out, expected_spec, expected_packages = (
+    sys.argv[1],
+    sys.argv[2],
+    sys.argv[3],
+    sys.argv[4],
+)
+INSTALL_TUI_CMDLINE = (
+    "boot=live live-media-path=/live console=ttyS0 "
+    "systemd.unit=multi-user.target systemd.journald.forward_to_console=1 "
+    "sysemble.install.tui=1"
+)
+
+with open(path, "r", encoding="utf-8") as fh:
+    doc = json.load(fh)
+
+def check(condition, message):
+    if not condition:
+        sys.exit("FAIL: " + message)
+
+check(
+    set(doc) == {
+        "apiVersion", "createdAt", "spec", "base", "arch", "packages",
+        "rootfs", "images", "boot", "builder",
+    },
+    "TUI installer top-level keys omit partitions and desktop",
+)
+check(doc["apiVersion"] == "sysemble/artifact/v1", "TUI apiVersion")
+check(doc["spec"] == expected_spec, "TUI spec")
+check(doc["arch"] == "x86_64", "TUI arch")
+check(doc["base"]["kind"] == "debian", "TUI base.kind")
+check(doc["base"]["release"] == "trixie", "TUI base.release")
+check(doc["base"]["pin"] == "2026-11-01", "TUI base.pin")
+check(len(doc["packages"]) == int(expected_packages), "TUI packages count")
+check("live-boot" not in doc["packages"], "TUI artifact.packages keeps the plan list")
+check("rsync" not in doc["packages"], "TUI artifact.packages excludes installer runtime packages")
+check(doc["rootfs"]["path"] == "rootfs", "TUI rootfs.path")
+check(doc["rootfs"]["size_mb"] >= 1, "TUI rootfs.size_mb")
+check(len(doc["images"]) == 1, "TUI installer images count")
+check(doc["images"][0]["path"] == "live.iso", "TUI installer image path is live.iso")
+check(doc["images"][0]["format"] == "iso", "TUI installer image format is iso")
+check(
+    re.fullmatch(r"[0-9a-f]{64}", doc["images"][0]["sha256"]) is not None,
+    "TUI installer image sha256",
+)
+check(doc["images"][0]["size_mb"] == 1, "TUI installer image size_mb")
+check(os.path.isfile(os.path.join(out, "live.iso")), "TUI installer live.iso exists under <out>")
+
+boot = doc["boot"]
+check(
+    set(boot) == {"mode", "iso", "install_tui", "cmdline", "memory_mb"},
+    "TUI installer boot keys",
+)
+check(boot["mode"] == "install", "TUI boot.mode is install")
+check(boot["iso"] == "live.iso", "TUI boot.iso is live.iso")
+check(boot["install_tui"] is True, "TUI boot.install_tui is true")
+check("install_device" not in boot, "TUI artifact has no install_device")
+check(boot["cmdline"] == INSTALL_TUI_CMDLINE, "TUI boot.cmdline is the frozen TUI installer cmdline")
+check(boot["cmdline"].endswith("sysemble.install.tui=1"), "TUI boot.cmdline ends with the TUI marker")
+check("sysemble.install=/dev/vda" not in boot["cmdline"], "TUI cmdline has no install device")
+check(boot["memory_mb"] == 1024, "TUI boot.memory_mb is 1024")
+check("graphical" not in boot, "TUI boot has no graphical flag")
+check("partitions" not in doc, "TUI installer artifact omits partitions")
+check("desktop" not in doc, "TUI installer artifact omits desktop")
+check(re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", doc["createdAt"]) is not None, "TUI createdAt")
+check(doc["builder"] == {"name": "build.sh", "version": "0.1.0"}, "TUI builder")
+PY
+}
+
 # ---------------------------------------------------------------------------
 # Case 1: full successful --execute path
 # ---------------------------------------------------------------------------
@@ -1538,6 +1615,8 @@ if [ -L "$INSTALL_WANTS" ] &&
 else
   fail "installer multi-user.target.wants symlink is missing or wrong"
 fi
+assert_absent "$OUT_INS/rootfs/etc/systemd/system/sysemble-install.service.d" \
+  "unattended --installer bakes no TUI condition drop-in"
 
 CALLS_INS="$FAKE_LOG/calls.log"
 assert_contains "live-boot,live-boot-initramfs-tools,rsync,grub-efi-amd64,grub-efi-amd64-bin,dosfstools,gdisk" \
@@ -1634,6 +1713,158 @@ assert_absent "$OUT_INSD/rootfs/etc/systemd/system/sysemble-boot-evidence.servic
   "installer DM build does not install the boot evidence unit"
 assert_contains "forcing headless multi-user boot" "$OUT_INSD/build.log" \
   "build.log records the headless override for a DM plan"
+
+# ---------------------------------------------------------------------------
+# Case 10d: P0-e1 --installer-tui bakes the same installer + TUI marker
+# ---------------------------------------------------------------------------
+
+OUT_TUI="$TMP_DIR/out-installer-tui"
+LOG_TUI="$TMP_DIR/run-installer-tui.log"
+FAKE_LOG="$TMP_DIR/fake-installer-tui"
+export FAKE_LOG
+mkdir -p "$FAKE_LOG"
+
+if run_build "$PLAN_ISO" "$OUT_TUI" "$LOG_TUI" --execute --installer-tui; then
+  pass "TUI installer ISO --execute exits 0 with the fake live ISO toolchain"
+else
+  cat "$LOG_TUI" >&2
+  fail "TUI installer ISO --execute did not exit 0"
+fi
+
+if [ -f "$OUT_TUI/artifact.json" ]; then
+  pass "TUI installer artifact.json exists"
+  if validate_install_tui_artifact "$OUT_TUI/artifact.json" "$OUT_TUI" "minimal-debian-live" 14; then
+    pass "TUI installer artifact: mode=install, install_tui=true, no install_device, 1024 MB"
+  else
+    fail "TUI installer artifact.json validation failed"
+  fi
+else
+  fail "TUI installer artifact.json was not written"
+fi
+
+TUI_INSTALL_SCRIPT="$OUT_TUI/rootfs/usr/local/sbin/sysemble-install"
+TUI_INSTALL_UNIT="$OUT_TUI/rootfs/etc/systemd/system/sysemble-install.service"
+TUI_INSTALL_WANTS="$OUT_TUI/rootfs/etc/systemd/system/multi-user.target.wants/sysemble-install.service"
+assert_file "$TUI_INSTALL_SCRIPT" "TUI installer rootfs contains /usr/local/sbin/sysemble-install"
+assert_file "$TUI_INSTALL_UNIT" "TUI installer rootfs contains the systemd unit"
+if [ -x "$TUI_INSTALL_SCRIPT" ]; then
+  pass "TUI installer script is installed with mode 0755"
+else
+  fail "TUI installer script is missing the executable bit"
+fi
+if cmp -s "$TUI_INSTALL_SCRIPT" "$BUILDER_DIR/installer/sysemble-install.sh"; then
+  pass "TUI installed script is byte-identical to the shared installer source"
+else
+  fail "TUI installed installer script differs from the source"
+fi
+if cmp -s "$TUI_INSTALL_UNIT" "$BUILDER_DIR/installer/sysemble-install.service"; then
+  pass "TUI installed unit is byte-identical to the shared installer unit"
+else
+  fail "TUI installed installer unit differs from the source"
+fi
+if [ -L "$TUI_INSTALL_WANTS" ] &&
+  [ "$(readlink "$TUI_INSTALL_WANTS" 2>/dev/null || true)" = "../sysemble-install.service" ]; then
+  pass "TUI installer unit is enabled via the multi-user.target.wants symlink"
+else
+  fail "TUI installer multi-user.target.wants symlink is missing or wrong"
+fi
+TUI_DROPIN="$OUT_TUI/rootfs/etc/systemd/system/sysemble-install.service.d/tui-cmdline.conf"
+assert_file "$TUI_DROPIN" "TUI installer bakes the systemd condition drop-in"
+assert_contains "ConditionKernelCommandLine=" "$TUI_DROPIN" \
+  "TUI drop-in resets the inherited kernel-cmdline condition"
+assert_contains "ConditionKernelCommandLine=|sysemble.install" "$TUI_DROPIN" \
+  "TUI drop-in ORs the unattended install marker"
+assert_contains "ConditionKernelCommandLine=|sysemble.install.tui" "$TUI_DROPIN" \
+  "TUI drop-in ORs the TUI install marker"
+
+CALLS_TUI="$FAKE_LOG/calls.log"
+assert_contains "live-boot,live-boot-initramfs-tools,rsync,grub-efi-amd64,grub-efi-amd64-bin,dosfstools,gdisk" \
+  "$CALLS_TUI" "TUI installer --include uses the same package set as --installer"
+assert_not_contains "e2fsprogs,rsync" "$CALLS_TUI" \
+  "TUI installer --include does not duplicate e2fsprogs from the plan"
+assert_no_call sgdisk "TUI installer ISO build does not partition the host (sgdisk)"
+assert_no_call mkfs.ext4 "TUI installer ISO build does not format the host (mkfs.ext4)"
+
+assert_contains "linux /live/vmlinuz boot=live live-media-path=/live console=ttyS0 systemd.unit=multi-user.target systemd.journald.forward_to_console=1 sysemble.install.tui=1" \
+  "$OUT_TUI/grub.cfg" "TUI installer ISO grub.cfg appends sysemble.install.tui=1"
+assert_not_contains "sysemble.install=/dev/vda" "$OUT_TUI/grub.cfg" \
+  "TUI installer ISO grub.cfg has no install device"
+assert_contains "search --no-floppy --file --set=root /live/vmlinuz" "$OUT_TUI/grub.cfg" \
+  "TUI installer ISO grub.cfg still searches /live/vmlinuz"
+assert_eq "$(artifact_boot_cmdline "$OUT_TUI/artifact.json")" "$(iso_grub_kernel_cmdline "$OUT_TUI/grub.cfg")" \
+  "TUI installer artifact boot.cmdline matches the grub.cfg kernel line byte for byte"
+assert_file "$OUT_TUI/live.iso" "TUI installer build produces live.iso"
+assert_absent "$OUT_TUI/disk.img" "TUI installer build creates no disk.img"
+assert_absent "$OUT_TUI/disk.qcow2" "TUI installer build creates no disk.qcow2"
+assert_contains "[build] installer: ISO-only TUI wizard, no preselected disk" "$OUT_TUI/build.log" \
+  "TUI build.log records the wizard target"
+assert_contains "[build] installer cmdline: sysemble.install.tui=1" "$OUT_TUI/build.log" \
+  "TUI build.log records the TUI cmdline marker"
+assert_contains "[build] iso grub: installer TUI cmdline adds sysemble.install.tui=1" "$OUT_TUI/build.log" \
+  "TUI build.log records the ISO GRUB marker"
+assert_contains "[build] installer unit drop-in:" "$OUT_TUI/build.log" \
+  "TUI build.log records the condition drop-in"
+assert_contains "[build] complete (mode: install)" "$OUT_TUI/build.log" \
+  "TUI build.log records the install completion mode"
+
+# --installer-tui is rejected for plans that are not ISO-only, and it cannot
+# be combined with the unattended --installer flag.
+OUT_TUI_BAD="$TMP_DIR/out-installer-tui-disk-plan"
+RC_TUI_BAD=0
+if bash "$BUILD_SH" --plan "$PLAN_NODM" --out "$OUT_TUI_BAD" --execute --installer-tui \
+  >"$TMP_DIR/run-installer-tui-disk-plan.log" 2>&1; then
+  RC_TUI_BAD=0
+else
+  RC_TUI_BAD=$?
+fi
+assert_eq "2" "$RC_TUI_BAD" "--installer-tui with a disk-only plan exits 2"
+assert_contains "--installer-tui requires an ISO-only plan" "$TMP_DIR/run-installer-tui-disk-plan.log" \
+  "disk-only --installer-tui rejection explains the ISO-only requirement"
+assert_absent "$OUT_TUI_BAD" "--installer-tui with a disk-only plan creates no output directory"
+
+OUT_TUI_BOTH="$TMP_DIR/out-installer-tui-iso-disk-plan"
+RC_TUI_BOTH=0
+if bash "$BUILD_SH" --plan "$PLAN_ISO_DISK" --out "$OUT_TUI_BOTH" --execute --installer-tui \
+  >"$TMP_DIR/run-installer-tui-iso-disk-plan.log" 2>&1; then
+  RC_TUI_BOTH=0
+else
+  RC_TUI_BOTH=$?
+fi
+assert_eq "2" "$RC_TUI_BOTH" "--installer-tui with an iso+disk plan exits 2"
+assert_absent "$OUT_TUI_BOTH" "--installer-tui with an iso+disk plan creates no output directory"
+
+OUT_TUI_MUTEX="$TMP_DIR/out-installer-tui-mutex"
+RC_TUI_MUTEX=0
+if bash "$BUILD_SH" --plan "$PLAN_ISO" --out "$OUT_TUI_MUTEX" --dry-run \
+  --installer --installer-tui >"$TMP_DIR/run-installer-tui-mutex.log" 2>&1; then
+  RC_TUI_MUTEX=0
+else
+  RC_TUI_MUTEX=$?
+fi
+assert_eq "2" "$RC_TUI_MUTEX" "--installer and --installer-tui are mutually exclusive (exit 2)"
+assert_contains "mutually exclusive" "$TMP_DIR/run-installer-tui-mutex.log" \
+  "mutual-exclusion rejection explains the conflict"
+assert_absent "$OUT_TUI_MUTEX" "mutual-exclusion rejection creates no output directory"
+
+OUT_TUI_DRY="$TMP_DIR/out-installer-tui-dry"
+LOG_TUI_DRY="$TMP_DIR/run-installer-tui-dry.log"
+if bash "$BUILD_SH" --plan "$PLAN_ISO" --out "$OUT_TUI_DRY" --dry-run --installer-tui \
+  >"$LOG_TUI_DRY" 2>&1; then
+  pass "--installer-tui --dry-run exits 0"
+else
+  cat "$LOG_TUI_DRY" >&2
+  fail "--installer-tui --dry-run did not exit 0"
+fi
+assert_contains "Runtime packages (builder-added, deduplicated): live-boot,live-boot-initramfs-tools,rsync,grub-efi-amd64,grub-efi-amd64-bin,dosfstools,gdisk" \
+  "$LOG_TUI_DRY" "--installer-tui dry run lists the same runtime packages"
+assert_contains "sysemble.install.tui=1" "$LOG_TUI_DRY" \
+  "--installer-tui dry run records the TUI cmdline marker"
+assert_contains "artifact: boot.mode=install, boot.install_tui=true, no install_device, memory_mb=1024" \
+  "$LOG_TUI_DRY" "--installer-tui dry run records the TUI artifact contract"
+assert_contains "installer unit drop-in: sysemble-install.service.d/tui-cmdline.conf" \
+  "$LOG_TUI_DRY" "--installer-tui dry run records the systemd condition drop-in"
+assert_not_contains "install_device=/dev/vda" "$LOG_TUI_DRY" \
+  "--installer-tui dry run does not preselect a disk"
 
 # ---------------------------------------------------------------------------
 # Case 10b: a desktop ISO plan keeps the P0-d1 desktop fields but no partitions

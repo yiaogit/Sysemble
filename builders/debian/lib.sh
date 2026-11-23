@@ -111,6 +111,11 @@ INSTALLER_UNIT_INSTALL_PATH="/etc/systemd/system/sysemble-install.service"
 INSTALLER_WANTS_LINK_PATH="/etc/systemd/system/multi-user.target.wants/sysemble-install.service"
 INSTALLER_DEVICE_DEFAULT="/dev/vda"
 INSTALLER_KERNEL_PARAM="sysemble.install"
+# P0-e1: the TUI ISO does not pre-select a disk. Its cmdline marker makes the
+# same installer script start the serial wizard; the artifact records
+# boot.install_tui=true and no install_device.
+INSTALLER_TUI_KERNEL_PARAM="sysemble.install.tui"
+INSTALLER_TUI_MARKER="sysemble.install.tui=1"
 # Packages the installer needs inside the live rootfs (and therefore inside the
 # installed system after rsync): rsync for the copy, grub-efi-amd64(+bin) for
 # grub-install, dosfstools for mkfs.vfat, gdisk for sgdisk, e2fsprogs for
@@ -192,7 +197,7 @@ Sysemble Debian builder (P0-d3) - build bootable Debian disk images, live ISOs, 
 
 Usage:
   builders/debian/build.sh --plan <plan.json> --out <dir> [--dry-run] [--execute]
-                           [--engine docker|native] [--installer]
+                           [--engine docker|native] [--installer | --installer-tui]
 
 Options:
   --plan <path>      plan.json produced by `sysemble plan --json`
@@ -212,6 +217,12 @@ Options:
                      the ISO cmdline gains sysemble.install=/dev/vda, the
                      --include list adds the installer packages, and the
                      artifact uses boot.mode="install" with install_device.
+  --installer-tui    P0-e1: build a TUI installer ISO (ISO-only plans only).
+                     Uses the same installer script, unit, and packages as
+                     --installer, but the ISO cmdline is
+                     sysemble.install.tui=1 and the artifact records
+                     boot.mode="install", boot.install_tui=true, and no
+                     install_device. Mutually exclusive with --installer.
   -h, --help         show this help and exit 0
 
 Outputs (native --execute), selected by plan.target.outputs:
@@ -271,7 +282,10 @@ P0-d3 scope: --installer (ISO-only plans) bakes the headless
 rootfs, adds rsync/grub-efi-amd64/grub-efi-amd64-bin/dosfstools/gdisk/e2fsprogs
 to --include, appends sysemble.install=/dev/vda to the ISO cmdline, and emits
 boot.mode="install" / boot.install_device="/dev/vda" (images stays live.iso).
-The Calamares GUI installer remains out of scope (P0-d3b).
+P0-e1 adds --installer-tui: the same script/unit/packages, an ISO cmdline with
+sysemble.install.tui=1 (no install_device), and boot.install_tui=true in the
+artifact. The installer wizard is serial/stdio only; the Calamares GUI
+installer remains out of scope (P0-e2).
 USAGE
 
 usage() {
@@ -1104,13 +1118,16 @@ runtime_package_count_for() {
 # stores them as /live/vmlinuz and /live/initrd.img (P0-d2 workplan §2/§3), so
 # the source versions are recorded as comments for diagnosis while the frozen
 # boot lines use the stable live paths. The optional third argument is the
-# P0-d1 desktop flag (1 = graphical.target) and the optional fourth argument is
-# the P0-d3 installer flag (1 = append sysemble.install=<device>).
+# P0-d1 desktop flag (1 = graphical.target), the optional fourth argument is
+# the P0-d3 installer flag (1 = installer ISO), and the optional fifth argument
+# is the P0-e1 TUI flag (1 = sysemble.install.tui=1 instead of a preselected
+# sysemble.install=<device>).
 iso_grub_cfg_text() {
   local kernel_name=$1
   local initrd_name=$2
   local graphical=${3:-0}
   local installer=${4:-0}
+  local install_tui=${5:-0}
   local cmdline=$ISO_BOOT_CMDLINE
 
   case "$graphical" in
@@ -1121,9 +1138,27 @@ iso_grub_cfg_text() {
       return 2
       ;;
   esac
+  case "$install_tui" in
+    0 | 1) ;;
+    *)
+      err "iso_grub_cfg_text: TUI installer flag must be 0 or 1 (got '$install_tui')"
+      return 2
+      ;;
+  esac
   case "$installer" in
-    0) ;;
-    1) cmdline="$cmdline $INSTALLER_KERNEL_PARAM=$INSTALLER_DEVICE_DEFAULT" ;;
+    0)
+      if [ "$install_tui" -eq 1 ]; then
+        err "iso_grub_cfg_text: TUI installer flag requires the installer flag"
+        return 2
+      fi
+      ;;
+    1)
+      if [ "$install_tui" -eq 1 ]; then
+        cmdline="$cmdline $INSTALLER_TUI_MARKER"
+      else
+        cmdline="$cmdline $INSTALLER_KERNEL_PARAM=$INSTALLER_DEVICE_DEFAULT"
+      fi
+      ;;
     *)
       err "iso_grub_cfg_text: installer flag must be 0 or 1 (got '$installer')"
       return 2
@@ -1646,6 +1681,8 @@ artifact_json() {
 #                     <include_disk 0|1> [package ...]
 #   artifact_install_json <out_dir> <spec> <release> <pin> <arch> <created_at> \
 #                     [package ...]
+#   artifact_install_tui_json <out_dir> <spec> <release> <pin> <arch> \
+#                     <created_at> [package ...]
 #
 # <out_dir> must contain rootfs/ and live.iso. When <include_disk> is 1 the
 # out dir must also contain disk.img and disk.qcow2 (an iso+disk plan); the
@@ -1656,10 +1693,12 @@ artifact_json() {
 #
 # artifact_install_json is the P0-d3 installer variant: boot.mode="install",
 # boot.install_device="/dev/vda", the frozen ISO cmdline plus
-# sysemble.install=/dev/vda, and memory_mb=1024. It is always headless and
-# ISO-only (images stays exactly [live.iso]); an iso+disk build is rejected.
-# The function never writes files; build.sh writes stdout atomically to
-# <out>/artifact.json.
+# sysemble.install=/dev/vda, and memory_mb=1024. artifact_install_tui_json is
+# the P0-e1 variant: boot.mode="install", boot.install_tui=true, no
+# install_device, and sysemble.install.tui=1 appended to the frozen ISO
+# cmdline. Both are always headless and ISO-only (images stays exactly
+# [live.iso]); an iso+disk build is rejected. The functions never write files;
+# build.sh writes stdout atomically to <out>/artifact.json.
 artifact_iso_json_common() {
   local boot_mode=$1
   local install_device=$2
@@ -1708,8 +1747,16 @@ artifact_iso_json_common() {
           ;;
       esac
       ;;
+    install-tui)
+      # P0-e1: the TUI wizard has no preselected disk, so an install device is
+      # a contract violation rather than an ignored field.
+      if [ -n "$install_device" ]; then
+        err "artifact: install-tui mode must not carry an install device"
+        return 2
+      fi
+      ;;
     *)
-      err "artifact: boot mode must be 'iso' or 'install' (got '$boot_mode')"
+      err "artifact: boot mode must be 'iso', 'install', or 'install-tui' (got '$boot_mode')"
       return 2
       ;;
   esac
@@ -1734,8 +1781,8 @@ artifact_iso_json_common() {
       return 2
       ;;
   esac
-  if [ "$boot_mode" = "install" ] && [ "$include_disk" -eq 1 ]; then
-    err "artifact: installer mode is ISO-only; include_disk must be 0"
+  if [ "$boot_mode" != "iso" ] && [ "$include_disk" -eq 1 ]; then
+    err "artifact: installer modes are ISO-only; include_disk must be 0"
     return 2
   fi
 
@@ -1781,10 +1828,12 @@ artifact_iso_json_common() {
     root_part_mb=$((raw_mb - ESP_SIZE_MB))
   fi
 
-  # P0-d3 installer mode is always headless and ISO-only: boot.mode="install",
-  # the frozen multi-user live cmdline plus the install parameter, and 1024 MB.
-  # P0-d1 desktop inference is reused unchanged for plain ISO builds. Only a
-  # display manager turns on graphical boot; a session package alone does not.
+  # P0-d3/P0-e1 installer modes are always headless and ISO-only:
+  # boot.mode="install" (unattended, with install_device) or "install-tui"
+  # (wizard, with sysemble.install.tui=1 and no install_device); both use the
+  # frozen multi-user live cmdline and 1024 MB. P0-d1 desktop inference is
+  # reused unchanged for plain ISO builds. Only a display manager turns on
+  # graphical boot; a session package alone does not.
   if [ "$boot_mode" = "install" ]; then
     desktop_dm=""
     desktop_session=""
@@ -1792,6 +1841,13 @@ artifact_iso_json_common() {
     graphical_json="false"
     memory_mb=$ARTIFACT_ISO_BOOT_MEMORY_MB_DEFAULT
     cmdline="$ARTIFACT_BOOT_CMDLINE_ISO $INSTALLER_KERNEL_PARAM=$install_device"
+  elif [ "$boot_mode" = "install-tui" ]; then
+    desktop_dm=""
+    desktop_session=""
+    graphical=0
+    graphical_json="false"
+    memory_mb=$ARTIFACT_ISO_BOOT_MEMORY_MB_DEFAULT
+    cmdline="$ARTIFACT_BOOT_CMDLINE_ISO $INSTALLER_TUI_MARKER"
   elif desktop_dm=$(detect_display_manager "$@"); then
     desktop_session=$(detect_desktop_session "$@")
     graphical=1
@@ -1844,10 +1900,19 @@ artifact_iso_json_common() {
       "$(json_quote "$desktop_session")" "$(json_quote "$desktop_dm")"
   fi
   printf '  "boot": {\n'
-  printf '    "mode": %s,\n' "$(json_quote "$boot_mode")"
+  if [ "$boot_mode" = "install-tui" ]; then
+    # The artifact contract keeps boot.mode="install" for both installer
+    # variants; install_tui distinguishes the wizard.
+    printf '    "mode": "install",\n'
+  else
+    printf '    "mode": %s,\n' "$(json_quote "$boot_mode")"
+  fi
   printf '    "iso": %s,\n' "$(json_quote "$ISO_ARTIFACT_NAME")"
   if [ "$boot_mode" = "install" ]; then
     printf '    "install_device": %s,\n' "$(json_quote "$install_device")"
+  fi
+  if [ "$boot_mode" = "install-tui" ]; then
+    printf '    "install_tui": true,\n'
   fi
   if [ "$graphical" -eq 1 ]; then
     printf '    "graphical": true,\n'
@@ -1892,6 +1957,26 @@ artifact_install_json() {
 
   shift 6
   artifact_iso_json_common install "$INSTALLER_DEVICE_DEFAULT" \
+    "$out" "$spec" "$release" "$pin" "$arch" "$created_at" 0 "$@"
+}
+
+# P0-e1 wrapper: the TUI installer ISO artifact (boot.mode="install",
+# boot.install_tui=true, no install_device). The install path is selected at
+# runtime by the wizard, so the artifact deliberately has no install_device.
+artifact_install_tui_json() {
+  if [ "$#" -lt 6 ]; then
+    err "artifact_install_tui_json: expected at least 6 arguments"
+    return 2
+  fi
+  local out=$1
+  local spec=$2
+  local release=$3
+  local pin=$4
+  local arch=$5
+  local created_at=$6
+
+  shift 6
+  artifact_iso_json_common install-tui "" \
     "$out" "$spec" "$release" "$pin" "$arch" "$created_at" 0 "$@"
 }
 
