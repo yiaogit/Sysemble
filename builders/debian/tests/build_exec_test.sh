@@ -859,6 +859,81 @@ check(doc["builder"] == {"name": "build.sh", "version": "0.1.0"}, "builder")
 PY
 }
 
+# P0-d3 installer artifact checker.
+# Usage: validate_install_artifact <json> <out_dir> <spec> <package_count>
+validate_install_artifact() {
+  python3 - "$1" "$2" "$3" "$4" <<'PY'
+import json
+import os
+import re
+import sys
+
+path, out, expected_spec, expected_packages = (
+    sys.argv[1],
+    sys.argv[2],
+    sys.argv[3],
+    sys.argv[4],
+)
+INSTALL_CMDLINE = (
+    "boot=live live-media-path=/live console=ttyS0 "
+    "systemd.unit=multi-user.target systemd.journald.forward_to_console=1 "
+    "sysemble.install=/dev/vda"
+)
+
+with open(path, "r", encoding="utf-8") as fh:
+    doc = json.load(fh)
+
+def check(condition, message):
+    if not condition:
+        sys.exit("FAIL: " + message)
+
+check(
+    set(doc) == {
+        "apiVersion", "createdAt", "spec", "base", "arch", "packages",
+        "rootfs", "images", "boot", "builder",
+    },
+    "installer top-level keys omit partitions and desktop",
+)
+check(doc["apiVersion"] == "sysemble/artifact/v1", "apiVersion")
+check(doc["spec"] == expected_spec, "spec")
+check(doc["arch"] == "x86_64", "arch")
+check(doc["base"]["kind"] == "debian", "base.kind")
+check(doc["base"]["release"] == "trixie", "base.release")
+check(doc["base"]["pin"] == "2026-11-01", "base.pin")
+check(len(doc["packages"]) == int(expected_packages), "packages count")
+check("live-boot" not in doc["packages"], "artifact.packages keeps the plan list")
+check("rsync" not in doc["packages"], "artifact.packages excludes installer runtime packages")
+check(doc["rootfs"]["path"] == "rootfs", "rootfs.path")
+check(doc["rootfs"]["size_mb"] >= 1, "rootfs.size_mb")
+check(len(doc["images"]) == 1, "installer images count")
+check(doc["images"][0]["path"] == "live.iso", "installer image path is live.iso")
+check(doc["images"][0]["format"] == "iso", "installer image format is iso")
+check(
+    re.fullmatch(r"[0-9a-f]{64}", doc["images"][0]["sha256"]) is not None,
+    "installer image sha256",
+)
+check(doc["images"][0]["size_mb"] == 1, "installer image size_mb")
+check(os.path.isfile(os.path.join(out, "live.iso")), "installer live.iso exists under <out>")
+
+boot = doc["boot"]
+check(
+    set(boot) == {"mode", "iso", "install_device", "cmdline", "memory_mb"},
+    "installer boot keys",
+)
+check(boot["mode"] == "install", "boot.mode is install")
+check(boot["iso"] == "live.iso", "boot.iso is live.iso")
+check(boot["install_device"] == "/dev/vda", "boot.install_device is /dev/vda")
+check(boot["cmdline"] == INSTALL_CMDLINE, "boot.cmdline is the frozen installer cmdline")
+check(boot["cmdline"].endswith("sysemble.install=/dev/vda"), "boot.cmdline ends with the install parameter")
+check(boot["memory_mb"] == 1024, "boot.memory_mb is 1024")
+check("graphical" not in boot, "installer boot has no graphical flag")
+check("partitions" not in doc, "installer artifact omits partitions")
+check("desktop" not in doc, "installer artifact omits desktop")
+check(re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", doc["createdAt"]) is not None, "createdAt")
+check(doc["builder"] == {"name": "build.sh", "version": "0.1.0"}, "builder")
+PY
+}
+
 # ---------------------------------------------------------------------------
 # Case 1: full successful --execute path
 # ---------------------------------------------------------------------------
@@ -1388,6 +1463,12 @@ assert_contains "source kernel=vmlinuz-6.12.3 initrd=initrd.img-6.12.3" "$OUT_IS
   "ISO grub.cfg records the actual kernel/initrd versions"
 assert_not_contains "set root=(hd0,gpt2)" "$OUT_ISO/grub.cfg" \
   "ISO grub.cfg does not use the disk root"
+assert_not_contains "sysemble.install" "$OUT_ISO/grub.cfg" \
+  "non-installer ISO grub.cfg has no sysemble.install parameter"
+assert_absent "$OUT_ISO/rootfs/usr/local/sbin/sysemble-install" \
+  "non-installer ISO rootfs has no sysemble-install script"
+assert_absent "$OUT_ISO/rootfs/etc/systemd/system/sysemble-install.service" \
+  "non-installer ISO rootfs has no installer unit"
 assert_eq "$(artifact_boot_cmdline "$OUT_ISO/artifact.json")" "$(iso_grub_kernel_cmdline "$OUT_ISO/grub.cfg")" \
   "ISO artifact boot.cmdline matches the grub.cfg kernel line byte for byte"
 
@@ -1396,6 +1477,163 @@ assert_contains "fake xorriso:" "$OUT_ISO/build.log" "build.log tees xorriso out
 assert_contains "stage 5/6: assemble live ISO" "$OUT_ISO/build.log" "build.log records the live ISO stage"
 assert_contains "live ISO runtime: add live-boot,live-boot-initramfs-tools" "$OUT_ISO/build.log" \
   "build.log records the live-boot runtime packages"
+
+# ---------------------------------------------------------------------------
+# Case 10c: P0-d3 --installer ISO bakes the headless installer into the rootfs
+# ---------------------------------------------------------------------------
+
+OUT_INS="$TMP_DIR/out-installer"
+LOG_INS="$TMP_DIR/run-installer.log"
+FAKE_LOG="$TMP_DIR/fake-installer"
+export FAKE_LOG
+mkdir -p "$FAKE_LOG"
+
+if run_build "$PLAN_ISO" "$OUT_INS" "$LOG_INS" --execute --installer; then
+  pass "installer ISO --execute exits 0 with the fake live ISO toolchain"
+else
+  cat "$LOG_INS" >&2
+  fail "installer ISO --execute did not exit 0"
+fi
+
+if [ -f "$OUT_INS/artifact.json" ]; then
+  pass "installer artifact.json exists"
+  if validate_install_artifact "$OUT_INS/artifact.json" "$OUT_INS" "minimal-debian-live" 14; then
+    pass "installer artifact: mode=install, install_device, 1024 MB, ISO-only images, no partitions"
+  else
+    fail "installer artifact.json validation failed"
+  fi
+else
+  fail "installer artifact.json was not written"
+fi
+
+INSTALL_SCRIPT="$OUT_INS/rootfs/usr/local/sbin/sysemble-install"
+INSTALL_UNIT="$OUT_INS/rootfs/etc/systemd/system/sysemble-install.service"
+INSTALL_WANTS="$OUT_INS/rootfs/etc/systemd/system/multi-user.target.wants/sysemble-install.service"
+assert_file "$INSTALL_SCRIPT" "installer rootfs contains /usr/local/sbin/sysemble-install"
+assert_file "$INSTALL_UNIT" "installer rootfs contains the systemd unit"
+if [ -x "$INSTALL_SCRIPT" ]; then
+  pass "installer script is installed with mode 0755"
+else
+  fail "installer script is missing the executable bit"
+fi
+if cmp -s "$INSTALL_SCRIPT" "$BUILDER_DIR/installer/sysemble-install.sh"; then
+  pass "installed script is byte-identical to builders/debian/installer/sysemble-install.sh"
+else
+  fail "installed installer script differs from the source"
+fi
+if cmp -s "$INSTALL_UNIT" "$BUILDER_DIR/installer/sysemble-install.service"; then
+  pass "installed unit is byte-identical to builders/debian/installer/sysemble-install.service"
+else
+  fail "installed installer unit differs from the source"
+fi
+assert_contains "ConditionKernelCommandLine=sysemble.install" "$INSTALL_UNIT" \
+  "installer unit is gated on the sysemble.install cmdline"
+assert_contains "ExecStart=/usr/local/sbin/sysemble-install" "$INSTALL_UNIT" \
+  "installer unit executes the installed script"
+assert_contains "TimeoutStartSec=1800" "$INSTALL_UNIT" \
+  "installer unit has the frozen 1800 s timeout"
+if [ -L "$INSTALL_WANTS" ] &&
+  [ "$(readlink "$INSTALL_WANTS" 2>/dev/null || true)" = "../sysemble-install.service" ]; then
+  pass "installer unit is enabled via multi-user.target.wants symlink"
+else
+  fail "installer multi-user.target.wants symlink is missing or wrong"
+fi
+
+CALLS_INS="$FAKE_LOG/calls.log"
+assert_contains "live-boot,live-boot-initramfs-tools,rsync,grub-efi-amd64,grub-efi-amd64-bin,dosfstools,gdisk" \
+  "$CALLS_INS" "installer --include adds the six installer packages after live-boot"
+assert_not_contains "e2fsprogs,rsync" "$CALLS_INS" \
+  "installer --include does not duplicate e2fsprogs from the plan"
+assert_no_call sgdisk "installer ISO build does not partition the host (sgdisk)"
+assert_no_call mkfs.ext4 "installer ISO build does not format the host (mkfs.ext4)"
+
+assert_contains "linux /live/vmlinuz boot=live live-media-path=/live console=ttyS0 systemd.unit=multi-user.target systemd.journald.forward_to_console=1 sysemble.install=/dev/vda" \
+  "$OUT_INS/grub.cfg" "installer ISO grub.cfg appends sysemble.install=/dev/vda"
+assert_contains "search --no-floppy --file --set=root /live/vmlinuz" "$OUT_INS/grub.cfg" \
+  "installer ISO grub.cfg still searches /live/vmlinuz"
+assert_eq "$(artifact_boot_cmdline "$OUT_INS/artifact.json")" "$(iso_grub_kernel_cmdline "$OUT_INS/grub.cfg")" \
+  "installer artifact boot.cmdline matches the grub.cfg kernel line byte for byte"
+assert_file "$OUT_INS/live.iso" "installer build produces live.iso"
+assert_absent "$OUT_INS/disk.img" "installer build creates no disk.img"
+assert_absent "$OUT_INS/disk.qcow2" "installer build creates no disk.qcow2"
+assert_contains "[build] installer: ISO-only unattended install to /dev/vda" "$OUT_INS/build.log" \
+  "build.log records the installer target"
+assert_contains "[build] complete (mode: install)" "$OUT_INS/build.log" \
+  "build.log records the installer completion mode"
+
+# --installer is rejected for plans that are not ISO-only.
+OUT_INS_BAD="$TMP_DIR/out-installer-disk-plan"
+RC_INS_BAD=0
+if bash "$BUILD_SH" --plan "$PLAN_NODM" --out "$OUT_INS_BAD" --execute --installer \
+  >"$TMP_DIR/run-installer-disk-plan.log" 2>&1; then
+  RC_INS_BAD=0
+else
+  RC_INS_BAD=$?
+fi
+assert_eq "2" "$RC_INS_BAD" "--installer with a disk-only plan exits 2"
+assert_contains "--installer requires an ISO-only plan" "$TMP_DIR/run-installer-disk-plan.log" \
+  "disk-only --installer rejection explains the ISO-only requirement"
+assert_absent "$OUT_INS_BAD" "--installer with a disk-only plan creates no output directory"
+
+OUT_INS_BOTH="$TMP_DIR/out-installer-iso-disk-plan"
+RC_INS_BOTH=0
+if bash "$BUILD_SH" --plan "$PLAN_ISO_DISK" --out "$OUT_INS_BOTH" --execute --installer \
+  >"$TMP_DIR/run-installer-iso-disk-plan.log" 2>&1; then
+  RC_INS_BOTH=0
+else
+  RC_INS_BOTH=$?
+fi
+assert_eq "2" "$RC_INS_BOTH" "--installer with an iso+disk plan exits 2 (installer images stay ISO-only)"
+assert_absent "$OUT_INS_BOTH" "--installer with an iso+disk plan creates no output directory"
+
+OUT_INS_DRY="$TMP_DIR/out-installer-dry"
+LOG_INS_DRY="$TMP_DIR/run-installer-dry.log"
+if bash "$BUILD_SH" --plan "$PLAN_ISO" --out "$OUT_INS_DRY" --dry-run --installer \
+  >"$LOG_INS_DRY" 2>&1; then
+  pass "--installer --dry-run exits 0"
+else
+  cat "$LOG_INS_DRY" >&2
+  fail "--installer --dry-run did not exit 0"
+fi
+assert_contains "Runtime packages (builder-added, deduplicated): live-boot,live-boot-initramfs-tools,rsync,grub-efi-amd64,grub-efi-amd64-bin,dosfstools,gdisk" \
+  "$LOG_INS_DRY" "--installer dry run lists the installer runtime packages"
+assert_contains "sysemble.install=/dev/vda" "$LOG_INS_DRY" \
+  "--installer dry run records the install parameter"
+assert_contains "artifact: boot.mode=install, boot.install_device=/dev/vda, memory_mb=1024" \
+  "$LOG_INS_DRY" "--installer dry run records the artifact contract"
+
+# A DM plan stays headless under --installer: multi-user ISO cmdline, no
+# desktop runtime packages, no boot evidence unit, artifact 1024 MB.
+OUT_INSD="$TMP_DIR/out-installer-dm"
+LOG_INSD="$TMP_DIR/run-installer-dm.log"
+FAKE_LOG="$TMP_DIR/fake-installer-dm"
+export FAKE_LOG
+mkdir -p "$FAKE_LOG"
+if run_build "$PLAN_ISO_DESKTOP" "$OUT_INSD" "$LOG_INSD" --execute --installer; then
+  pass "installer build with a DM plan exits 0"
+else
+  cat "$LOG_INSD" >&2
+  fail "installer build with a DM plan did not exit 0"
+fi
+if [ -f "$OUT_INSD/artifact.json" ]; then
+  if validate_install_artifact "$OUT_INSD/artifact.json" "$OUT_INSD" "debian-live-kde" 43; then
+    pass "installer DM artifact stays headless (install mode, 1024 MB, no desktop)"
+  else
+    fail "installer DM artifact validation failed"
+  fi
+else
+  fail "installer DM artifact.json was not written"
+fi
+assert_contains "linux /live/vmlinuz boot=live live-media-path=/live console=ttyS0 systemd.unit=multi-user.target systemd.journald.forward_to_console=1 sysemble.install=/dev/vda" \
+  "$OUT_INSD/grub.cfg" "installer DM ISO grub.cfg stays multi-user and adds the install parameter"
+assert_not_contains "graphical.target" "$OUT_INSD/grub.cfg" \
+  "installer DM ISO grub.cfg does not target graphical.target"
+assert_not_contains "xserver-xorg,procps,accountsservice" "$FAKE_LOG/calls.log" \
+  "installer DM build does not add desktop runtime packages"
+assert_absent "$OUT_INSD/rootfs/etc/systemd/system/sysemble-boot-evidence.service" \
+  "installer DM build does not install the boot evidence unit"
+assert_contains "forcing headless multi-user boot" "$OUT_INSD/build.log" \
+  "build.log records the headless override for a DM plan"
 
 # ---------------------------------------------------------------------------
 # Case 10b: a desktop ISO plan keeps the P0-d1 desktop fields but no partitions

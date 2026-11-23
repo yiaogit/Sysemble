@@ -149,3 +149,46 @@ jobs:
             out/build.log
             out/boot.log
             out/boot-evidence.json
+
+  install-smoke:
+    name: Install smoke (headless)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install build and boot tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            mmdebstrap debian-archive-keyring \
+            qemu-system-x86 qemu-utils e2fsprogs jq \
+            gdisk dosfstools mtools grub-efi-amd64-bin grub-common ovmf \
+            xorriso squashfs-tools
+
+      - name: Plan installer image
+        run: cargo run -q -p sysemble-cli -- plan examples/minimal-debian-live.yaml > plan.json
+
+      - name: Build installer ISO
+        run: sudo env PATH="$PATH" bash builders/debian/build.sh --plan plan.json --out out --execute --installer
+
+      - name: Hand build output back to the runner user
+        run: sudo chown -R "$(id -u):$(id -g)" out
+
+      - name: Install to a blank disk and boot the result
+        run: bash tools/install-check.sh --artifact out/artifact.json --timeout 1200 --workdir out/install --json
+
+      - name: Upload install evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-evidence-install
+          if-no-files-found: warn
+          path: |
+            plan.json
+            out/artifact.json
+            out/build.log
+            out/install.log
+            out/install-evidence.json
+            out/install-boot.log

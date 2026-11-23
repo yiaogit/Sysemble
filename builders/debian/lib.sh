@@ -93,6 +93,30 @@ ISO_BOOT_MEMORY_MB_GRAPHICAL=2048
 # the plan list; these only reach mmdebstrap --include.
 ISO_RUNTIME_PACKAGES=(live-boot live-boot-initramfs-tools)
 
+# ---------------------------------------------------------------------------
+# P0-d3 unattended installer (frozen by docs/plan/P0-d3-workplan.md §2)
+#
+# `build.sh --installer` is valid only for an ISO-only plan. The live rootfs
+# gets the installer script/unit baked in by the customize hook, the ISO GRUB
+# cmdline gains sysemble.install=<device>, and the artifact records
+# boot.mode="install" + boot.install_device. The installer itself partitions
+# the guest's /dev/vda; no disk is built by build.sh in this mode.
+# ---------------------------------------------------------------------------
+
+INSTALLER_DIR_NAME="installer"
+INSTALLER_SCRIPT_NAME="sysemble-install.sh"
+INSTALLER_UNIT_NAME="sysemble-install.service"
+INSTALLER_SCRIPT_INSTALL_PATH="/usr/local/sbin/sysemble-install"
+INSTALLER_UNIT_INSTALL_PATH="/etc/systemd/system/sysemble-install.service"
+INSTALLER_WANTS_LINK_PATH="/etc/systemd/system/multi-user.target.wants/sysemble-install.service"
+INSTALLER_DEVICE_DEFAULT="/dev/vda"
+INSTALLER_KERNEL_PARAM="sysemble.install"
+# Packages the installer needs inside the live rootfs (and therefore inside the
+# installed system after rsync): rsync for the copy, grub-efi-amd64(+bin) for
+# grub-install, dosfstools for mkfs.vfat, gdisk for sgdisk, e2fsprogs for
+# mkfs.ext4/blkid. Deduplicated against plan.packages.
+INSTALLER_RUNTIME_PACKAGES=(rsync grub-efi-amd64 grub-efi-amd64-bin dosfstools gdisk e2fsprogs)
+
 # docker info is given this long before it is treated as unavailable, so the
 # script never hangs on a wedged daemon.
 DOCKER_INFO_TIMEOUT=20
@@ -164,10 +188,11 @@ err() {
 # ---------------------------------------------------------------------------
 
 IFS= read -r -d '' USAGE_TEXT <<'USAGE' || true
-Sysemble Debian builder (P0-d2) - build bootable Debian disk images and live ISOs from plan.json
+Sysemble Debian builder (P0-d3) - build bootable Debian disk images, live ISOs, and installer ISOs from plan.json
 
 Usage:
-  builders/debian/build.sh --plan <plan.json> --out <dir> [--dry-run] [--execute] [--engine docker|native]
+  builders/debian/build.sh --plan <plan.json> --out <dir> [--dry-run] [--execute]
+                           [--engine docker|native] [--installer]
 
 Options:
   --plan <path>      plan.json produced by `sysemble plan --json`
@@ -180,6 +205,13 @@ Options:
                      Mutually exclusive with --dry-run. The CI contract passes
                      this flag.
   --engine <name>    native (default) or docker
+  --installer        P0-d3: build an unattended installer ISO. Requires an
+                     ISO-only plan (target.outputs contains "iso" and no
+                     qcow2/raw; anything else exits 2). The live rootfs gets
+                     /usr/local/sbin/sysemble-install plus its systemd unit,
+                     the ISO cmdline gains sysemble.install=/dev/vda, the
+                     --include list adds the installer packages, and the
+                     artifact uses boot.mode="install" with install_device.
   -h, --help         show this help and exit 0
 
 Outputs (native --execute), selected by plan.target.outputs:
@@ -192,7 +224,8 @@ Outputs (native --execute), selected by plan.target.outputs:
   <out>/grub.cfg       disk GRUB config, or the live ISO config in iso-only mode
   <out>/disk.img       raw GPT image: p1 ESP (vfat32) + p2 root (ext4)
   <out>/disk.qcow2     qcow2 conversion of disk.img
-  <out>/artifact.json  sysemble/artifact/v1 manifest (boot.mode = "iso" or "uefi")
+  <out>/artifact.json  sysemble/artifact/v1 manifest (boot.mode = "iso",
+                       "install", or "uefi")
   <out>/build.log      full build output (tee)
 
   Disk mode builds disk.img/disk.qcow2. ISO-only mode skips the disk pipeline
@@ -229,9 +262,16 @@ live-boot/live-media-path; when no qcow2/raw output is requested the disk pipeli
 skipped and the manifest omits partitions. The ISO rootfs additionally gets
 live-boot and live-boot-initramfs-tools via --include (artifact.packages keeps
 the plan package list). A plan whose packages include gdm3/sddm/lightdm still
-gets the P0-d1 desktop inference and 2048 MB. Installers/Calamares, secure boot,
-BIOS boot, persistence, and cross-architecture builds are out of scope. An
-artifact without boot.mode still means the P0-b direct-kernel mode.
+gets the P0-d1 desktop inference and 2048 MB. The Calamares GUI installer,
+secure boot, BIOS boot, persistence, and cross-architecture builds are out of
+scope. An artifact without boot.mode still means the P0-b direct-kernel mode.
+
+P0-d3 scope: --installer (ISO-only plans) bakes the headless
+/usr/local/sbin/sysemble-install + sysemble-install.service into the live
+rootfs, adds rsync/grub-efi-amd64/grub-efi-amd64-bin/dosfstools/gdisk/e2fsprogs
+to --include, appends sysemble.install=/dev/vda to the ISO cmdline, and emits
+boot.mode="install" / boot.install_device="/dev/vda" (images stays live.iso).
+The Calamares GUI installer remains out of scope (P0-d3b).
 USAGE
 
 usage() {
@@ -977,13 +1017,15 @@ plan_build_mode() {
   fi
 }
 
-# Print the builder-added runtime package list for a plan. <iso> is 1/0 and
-# <graphical> is 1/0 (P0-d1 desktop inference). Packages already named by the
-# plan are skipped, so a plan that already names live-boot or xserver-xorg does
-# not pass duplicates to mmdebstrap. Runs in a subshell by design.
+# Print the builder-added runtime package list for a plan. <iso> is 1/0,
+# <graphical> is 1/0 (P0-d1 desktop inference), and <installer> is 1/0 (P0-d3).
+# Packages already named by the plan or by an earlier group are skipped, so a
+# plan that already names live-boot or e2fsprogs does not pass duplicates to
+# mmdebstrap. Runs in a subshell by design.
 runtime_packages_for() {
   local iso=$1
   local graphical=$2
+  local installer=${3:-0}
   local extras_csv=""
   local package=""
 
@@ -1019,6 +1061,22 @@ runtime_packages_for() {
       fi
     done
   fi
+  if [ "$installer" -eq 1 ]; then
+    for package in "${INSTALLER_RUNTIME_PACKAGES[@]}"; do
+      if ! package_in_list "$package" "${PLAN_PACKAGES_VALUES[@]}"; then
+        case ",$extras_csv," in
+          *",$package,"*) ;;
+          *)
+            if [ -z "$extras_csv" ]; then
+              extras_csv=$package
+            else
+              extras_csv="$extras_csv,$package"
+            fi
+            ;;
+        esac
+      fi
+    done
+  fi
 
   if [ -n "$extras_csv" ]; then
     printf '%s\n' "$extras_csv"
@@ -1030,9 +1088,10 @@ runtime_packages_for() {
 runtime_package_count_for() {
   local iso=$1
   local graphical=$2
+  local installer=${3:-0}
   local csv=""
 
-  csv=$(runtime_packages_for "$iso" "$graphical")
+  csv=$(runtime_packages_for "$iso" "$graphical" "$installer")
   if [ -z "$csv" ]; then
     printf '0\n'
     return 0
@@ -1045,11 +1104,13 @@ runtime_package_count_for() {
 # stores them as /live/vmlinuz and /live/initrd.img (P0-d2 workplan §2/§3), so
 # the source versions are recorded as comments for diagnosis while the frozen
 # boot lines use the stable live paths. The optional third argument is the
-# P0-d1 desktop flag (1 = graphical.target).
+# P0-d1 desktop flag (1 = graphical.target) and the optional fourth argument is
+# the P0-d3 installer flag (1 = append sysemble.install=<device>).
 iso_grub_cfg_text() {
   local kernel_name=$1
   local initrd_name=$2
   local graphical=${3:-0}
+  local installer=${4:-0}
   local cmdline=$ISO_BOOT_CMDLINE
 
   case "$graphical" in
@@ -1057,6 +1118,14 @@ iso_grub_cfg_text() {
     1) cmdline=$ISO_BOOT_CMDLINE_GRAPHICAL ;;
     *)
       err "iso_grub_cfg_text: graphical flag must be 0 or 1 (got '$graphical')"
+      return 2
+      ;;
+  esac
+  case "$installer" in
+    0) ;;
+    1) cmdline="$cmdline $INSTALLER_KERNEL_PARAM=$INSTALLER_DEVICE_DEFAULT" ;;
+    *)
+      err "iso_grub_cfg_text: installer flag must be 0 or 1 (got '$installer')"
       return 2
       ;;
   esac
@@ -1570,21 +1639,31 @@ artifact_json() {
   return 0
 }
 
-# Emit a P0-d2 sysemble/artifact/v1 manifest for a live ISO build on stdout.
+# Emit a sysemble/artifact/v1 manifest for a live ISO build on stdout.
 #
 # Usage:
 #   artifact_iso_json <out_dir> <spec> <release> <pin> <arch> <created_at> \
 #                     <include_disk 0|1> [package ...]
+#   artifact_install_json <out_dir> <spec> <release> <pin> <arch> <created_at> \
+#                     [package ...]
 #
 # <out_dir> must contain rootfs/ and live.iso. When <include_disk> is 1 the
 # out dir must also contain disk.img and disk.qcow2 (an iso+disk plan); the
 # manifest then records those images and the P0-c partitions as well. The boot
-# object is always mode="iso" (the ISO carries its own kernel, initrd, and
-# grub.cfg), and a package list naming a display manager selects the P0-d1
-# graphical cmdline + desktop object + 2048 MB, exactly like the UEFI manifest.
-# The function never writes files; build.sh writes its stdout atomically to
+# object is mode="iso" (the ISO carries its own kernel, initrd, and grub.cfg),
+# and a package list naming a display manager selects the P0-d1 graphical
+# cmdline + desktop object + 2048 MB, exactly like the UEFI manifest.
+#
+# artifact_install_json is the P0-d3 installer variant: boot.mode="install",
+# boot.install_device="/dev/vda", the frozen ISO cmdline plus
+# sysemble.install=/dev/vda, and memory_mb=1024. It is always headless and
+# ISO-only (images stays exactly [live.iso]); an iso+disk build is rejected.
+# The function never writes files; build.sh writes stdout atomically to
 # <out>/artifact.json.
-artifact_iso_json() {
+artifact_iso_json_common() {
+  local boot_mode=$1
+  local install_device=$2
+  shift 2
   local out=""
   local spec=""
   local release=""
@@ -1613,8 +1692,30 @@ artifact_iso_json() {
   local pin_json="null"
   local sep=""
 
+  case "$boot_mode" in
+    iso)
+      if [ -n "$install_device" ]; then
+        err "artifact: iso mode must not carry an install device"
+        return 2
+      fi
+      ;;
+    install)
+      case "$install_device" in
+        /dev/*) : ;;
+        *)
+          err "artifact: install mode requires a /dev install device (got '$install_device')"
+          return 2
+          ;;
+      esac
+      ;;
+    *)
+      err "artifact: boot mode must be 'iso' or 'install' (got '$boot_mode')"
+      return 2
+      ;;
+  esac
+
   if [ "$#" -lt 7 ]; then
-    err "artifact_iso_json: expected at least 7 arguments"
+    err "artifact: expected at least 7 arguments after the boot mode"
     return 2
   fi
   out=$1
@@ -1629,10 +1730,14 @@ artifact_iso_json() {
   case "$include_disk" in
     0 | 1) ;;
     *)
-      err "artifact_iso_json: include_disk must be 0 or 1 (got '$include_disk')"
+      err "artifact: include_disk must be 0 or 1 (got '$include_disk')"
       return 2
       ;;
   esac
+  if [ "$boot_mode" = "install" ] && [ "$include_disk" -eq 1 ]; then
+    err "artifact: installer mode is ISO-only; include_disk must be 0"
+    return 2
+  fi
 
   rootfs="$out/rootfs"
   iso="$out/$ISO_ARTIFACT_NAME"
@@ -1676,9 +1781,18 @@ artifact_iso_json() {
     root_part_mb=$((raw_mb - ESP_SIZE_MB))
   fi
 
-  # P0-d1 desktop inference is reused unchanged. Only a display manager turns
-  # on graphical boot; a session package alone does not.
-  if desktop_dm=$(detect_display_manager "$@"); then
+  # P0-d3 installer mode is always headless and ISO-only: boot.mode="install",
+  # the frozen multi-user live cmdline plus the install parameter, and 1024 MB.
+  # P0-d1 desktop inference is reused unchanged for plain ISO builds. Only a
+  # display manager turns on graphical boot; a session package alone does not.
+  if [ "$boot_mode" = "install" ]; then
+    desktop_dm=""
+    desktop_session=""
+    graphical=0
+    graphical_json="false"
+    memory_mb=$ARTIFACT_ISO_BOOT_MEMORY_MB_DEFAULT
+    cmdline="$ARTIFACT_BOOT_CMDLINE_ISO $INSTALLER_KERNEL_PARAM=$install_device"
+  elif desktop_dm=$(detect_display_manager "$@"); then
     desktop_session=$(detect_desktop_session "$@")
     graphical=1
     graphical_json="true"
@@ -1730,8 +1844,11 @@ artifact_iso_json() {
       "$(json_quote "$desktop_session")" "$(json_quote "$desktop_dm")"
   fi
   printf '  "boot": {\n'
-  printf '    "mode": "iso",\n'
+  printf '    "mode": %s,\n' "$(json_quote "$boot_mode")"
   printf '    "iso": %s,\n' "$(json_quote "$ISO_ARTIFACT_NAME")"
+  if [ "$boot_mode" = "install" ]; then
+    printf '    "install_device": %s,\n' "$(json_quote "$install_device")"
+  fi
   if [ "$graphical" -eq 1 ]; then
     printf '    "graphical": true,\n'
   fi
@@ -1750,6 +1867,32 @@ artifact_iso_json() {
     "$(json_quote "$ARTIFACT_BUILDER_NAME")" "$(json_quote "$ARTIFACT_BUILDER_VERSION")"
   printf '}\n'
   return 0
+}
+
+# P0-d2 wrapper: a plain live ISO artifact (boot.mode="iso").
+artifact_iso_json() {
+  artifact_iso_json_common iso "" "$@"
+}
+
+# P0-d3 wrapper: the headless installer ISO artifact (boot.mode="install").
+# The include_disk position of the common helper is pinned to 0 because an
+# installer build is ISO-only; the caller passes the six metadata arguments
+# followed by the plan package list.
+artifact_install_json() {
+  if [ "$#" -lt 6 ]; then
+    err "artifact_install_json: expected at least 6 arguments"
+    return 2
+  fi
+  local out=$1
+  local spec=$2
+  local release=$3
+  local pin=$4
+  local arch=$5
+  local created_at=$6
+
+  shift 6
+  artifact_iso_json_common install "$INSTALLER_DEVICE_DEFAULT" \
+    "$out" "$spec" "$release" "$pin" "$arch" "$created_at" 0 "$@"
 }
 
 # ---------------------------------------------------------------------------

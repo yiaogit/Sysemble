@@ -1,8 +1,8 @@
-# Debian builder (P0-a + P0-b + P0-c1 + P0-d1 + P0-d2)
+# Debian builder (P0-a + P0-b + P0-c1 + P0-d1 + P0-d2 + P0-d3)
 
 `build.sh` reads the `plan.json` produced by `sysemble plan --json` and turns
-it into bootable Debian disk images and/or a live ISO, selected by
-`plan.target.outputs`:
+it into bootable Debian disk images, a live ISO, or an unattended installer
+ISO, selected by `plan.target.outputs` and `--installer`:
 
 - **P0-a**: plan validation, dry run, and rootfs bootstrap with
   [mmdebstrap](https://mmdebstrap.de/) (native or `debian:trixie` Docker).
@@ -38,16 +38,28 @@ it into bootable Debian disk images and/or a live ISO, selected by
   `efi.img` with `grub-mkstandalone` + `mcopy`, and packs it with `xorriso`.
   Its artifact uses `boot.mode="iso"`/`boot.iso="live.iso"`; an ISO-only
   manifest omits `partitions`.
+- **P0-d3**: `--installer` turns an ISO-only build into an **unattended
+  installer ISO**. The live rootfs gets `/usr/local/sbin/sysemble-install`
+  (0755) and `/etc/systemd/system/sysemble-install.service` (enabled through
+  `multi-user.target.wants`), `--include` adds
+  `rsync grub-efi-amd64 grub-efi-amd64-bin dosfstools gdisk e2fsprogs`, the ISO
+  cmdline gains `sysemble.install=/dev/vda`, and the artifact records
+  `boot.mode="install"`/`boot.install_device="/dev/vda"` with `memory_mb=1024`.
+  The guest installer partitions/formats `/dev/vda`, rsyncs the live root,
+  writes fstab + GRUB, prints `SYMBLE: install complete`, and powers off. A
+  non-ISO-only plan is rejected with exit 2; Calamares stays out of scope
+  (P0-d3b).
 
-The authoritative acceptance is the GitHub Actions `boot-smoke` (disk) and
-`live-smoke` (ISO) jobs on `ubuntu-latest`. The development host is macOS
-arm64, where no real native build can run; see [Local checks](#local-checks).
+The authoritative acceptance is the GitHub Actions `boot-smoke` (disk),
+`live-smoke` (ISO), and `install-smoke` (installer ISO) jobs on `ubuntu-latest`.
+The development host is macOS arm64, where no real native build can run; see
+[Local checks](#local-checks).
 
 ## Interface
 
 ```
 builders/debian/build.sh --plan <plan.json> --out <dir> \
-  [--dry-run] [--execute] [--engine docker|native]
+  [--dry-run] [--execute] [--engine docker|native] [--installer]
 ```
 
 | Option | Meaning |
@@ -58,6 +70,7 @@ builders/debian/build.sh --plan <plan.json> --out <dir> \
 | `--execute` | Explicit alias for the default build mode (no `--dry-run`): build the rootfs plus the outputs requested by `target.outputs` (live ISO and/or GPT/UEFI disk images) and `artifact.json`. Mutually exclusive with `--dry-run`. |
 | `--engine native` | Default. Build on this Linux host (`uname -s` = Linux, euid 0, and the tools below in `PATH`). |
 | `--engine docker` | Bootstrap the rootfs inside `debian:trixie`; needs `docker` CLI and a reachable daemon. Disk/ISO assembly is **not** implemented for Docker, so `--execute` with `--engine docker` is rejected (exit 2). |
+| `--installer` | P0-d3: build the headless installer ISO. Requires an **ISO-only** plan (`target.outputs` contains `iso` and no `qcow2`/`raw`); anything else exits 2 before `<out>` is created. Works with `--dry-run` (prints the installer plan). |
 | `-h`, `--help` | Print usage and exit 0. |
 
 `--opt value` and `--opt=value` are both accepted. Missing or unknown
@@ -81,14 +94,19 @@ arguments print usage and exit 2.
     boot/grub/grub.cfg    # copy of the embedded config (disk builds)
   grub.cfg                # disk GRUB config, or the live ISO config in
                           #   iso-only mode (artifact boot.grub.config / ISO cfg)
-  artifact.json           # sysemble/artifact/v1 manifest (boot.mode = iso or
-                          #   uefi; desktop + graphical fields when a DM is planned)
+  artifact.json           # sysemble/artifact/v1 manifest (boot.mode = iso,
+                          #   install, or uefi; desktop + graphical fields when a
+                          #   DM is planned)
   build.log               # full build output (tee)
   plan.copy.json          # byte-identical copy of the input plan
 ```
 
 ISO-only builds produce only `rootfs/`, `live.iso`, `iso/`, `artifact.json`,
 `build.log`, `plan.copy.json`, plus the `esp/`/`grub.cfg` staging files.
+`--installer` additionally bakes the installer script/unit into `rootfs/`
+(`usr/local/sbin/sysemble-install`, `etc/systemd/system/sysemble-install.service`
+and its `multi-user.target.wants` symlink), but still produces only `live.iso`
+as the image.
 `<out>/esp.img` (the FAT32 image merged into `disk.img`) and `<out>/efi.img`
 (the temporary 8 MiB live EFI image) are intermediates and are removed after
 their consumers succeed. For an iso+disk plan the live ISO uses a private
@@ -107,7 +125,7 @@ partition when a later GRUB/mcopy/dd/qemu-img step failed.
 |---|---|
 | 0 | Dry run succeeded, or a complete native image build finished. |
 | 1 | Invalid plan: malformed JSON, failed plan validation, or `plan.spec` missing for a real native build. |
-| 2 | Usage or I/O error, including an unsafe `--out`, `--dry-run` + `--execute`, or `--engine docker` + `--execute`. |
+| 2 | Usage or I/O error, including an unsafe `--out`, `--dry-run` + `--execute`, `--engine docker` + `--execute`, or `--installer` without an ISO-only plan. |
 | 3 | Native engine unavailable: not Linux, not root, or a tool required by the requested outputs is missing. ISO-only needs `mmdebstrap`, `mkfs.vfat`, `mcopy`, `grub-mkstandalone`, `mksquashfs`, and `xorriso`; disk builds add `mkfs.ext4`, `qemu-img`, `sgdisk`, and `dd`. |
 | 4 | Docker engine unavailable: no `docker` CLI, or `docker info` failed/timed out. |
 | 5 | No JSON parser: neither `jq` nor `python3` is available. |
@@ -121,7 +139,7 @@ the script exits 3. It never calls `sudo`.
 ```console
 $ bash builders/debian/build.sh \
     --plan /tmp/min-plan.json --out /tmp/sysemble-dry --dry-run
-Sysemble Debian builder - dry run (P0-d2)
+Sysemble Debian builder - dry run (P0-d3)
   ...
   outputs:    qcow2
   build mode: disk
@@ -406,6 +424,94 @@ live under `<out>/iso-staging/` to keep the disk `grub.cfg`/`esp/` intact.
 `-cdrom` (no disk), and asserts firmware, GRUB, kernel, systemd, login, and the
 live markers (`live-boot`/`live-media`/`squashfs`).
 
+### Unattended installer ISO (P0-d3)
+
+`--installer` keeps the P0-d2 live ISO pipeline but makes the ISO self-install
+to a disk. It is accepted **only** for an ISO-only plan (`target.outputs`
+contains `iso` and no `qcow2`/`raw`); an iso+disk or disk-only plan exits 2 so
+the artifact can never claim `boot.mode="install"` while also carrying disk
+images.
+
+The customize hook bakes these files into the live rootfs:
+
+```
+/usr/local/sbin/sysemble-install                         0755
+/etc/systemd/system/sysemble-install.service
+/etc/systemd/system/multi-user.target.wants/sysemble-install.service -> ../sysemble-install.service
+```
+
+`--include` additionally receives `rsync grub-efi-amd64 grub-efi-amd64-bin
+dosfstools gdisk e2fsprogs` (deduplicated against the plan and the live/desktop
+runtime lists; `artifact.packages` stays the plan list). The systemd unit is
+frozen by `docs/plan/P0-d3-workplan.md`:
+
+```ini
+[Unit]
+Description=Sysemble unattended installer
+ConditionKernelCommandLine=sysemble.install
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/sysemble-install
+TimeoutStartSec=1800
+StandardOutput=journal+console
+
+[Install]
+WantedBy=multi-user.target
+```
+
+The ISO GRUB cmdline appends `sysemble.install=/dev/vda`, so the unit starts in
+the live system (and never after the installed reboot: the installed GRUB
+cmdline does not contain the parameter). The installer script then:
+
+1. parses `/proc/cmdline` (`sysemble.install=`, default `/dev/vda`); refuses
+   non-`/dev` paths, non-block devices, optical/loop devices, the live medium,
+   and any device/partition already mounted;
+2. writes the frozen GPT: `sgdisk -Z`, `-n 1:2048:+512M -t 1:ef00`,
+   `-n 2:0:0 -t 2:8300`;
+3. formats `mkfs.vfat -F 32 -n ESP <dev>1` and
+   `mkfs.ext4 -F -L SYMBLE <dev>2`;
+4. mounts root at `/mnt`, ESP at `/mnt/boot/efi`, and bind-mounts `/proc`,
+   `/sys`, `/dev`, `/run` into the target for `grub-install`;
+5. copies the live root with
+   `rsync -aHAX --exclude={/proc,/sys,/dev,/run,/tmp,/mnt,/media,/live,/lost+found} / /mnt/`;
+6. writes `/etc/fstab` from the two UUIDs;
+7. runs
+   `chroot /mnt grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=sysemble --removable --no-nvram`
+   and writes `/boot/grub/grub.cfg` (`search --fs-uuid`, the installed
+   kernel/initrd, `root=UUID=... rw console=ttyS0 systemd.unit=multi-user.target`);
+8. unmounts, prints `SYMBLE: install complete` to `/dev/ttyS0` via `tee`, and
+   runs `systemctl poweroff -f`.
+
+On any failure it prints `SYMBLE: install failed: <reason>` to `/dev/ttyS0`,
+leaves the live system running (no poweroff), and exits 1 so the journal and
+serial log survive. The script accepts `SYMBLE_CMDLINE_FILE`, `SYMBLE_ROOT`,
+`SYMBLE_MNT`, `SYMBLE_CONSOLE`, `SYMBLE_LIVE_MEDIA`, and `--dry-run` for
+offline testing; production uses the defaults above.
+
+The installer ISO artifact is ISO-only and headless:
+
+```json
+"boot": {
+  "mode": "install",
+  "iso": "live.iso",
+  "install_device": "/dev/vda",
+  "cmdline": "boot=live live-media-path=/live console=ttyS0 systemd.unit=multi-user.target systemd.journald.forward_to_console=1 sysemble.install=/dev/vda",
+  "memory_mb": 1024
+}
+```
+
+`images` is still exactly `[{"path":"live.iso","format":"iso",...}]`, and
+`partitions` is omitted. The path is always headless: a plan that names a
+display manager still gets a multi-user installer ISO (the DM packages stay in
+the rootfs, but no graphical target, desktop runtime packages, or boot-evidence
+unit is added) and 1024 MB in the artifact. `build.sh` never partitions the
+build host and creates no disk image in this mode; the guest installer writes
+the target disk. The CI `install-smoke` job boots the ISO with QEMU/OVMF plus a
+6 GiB virtio disk, waits for the completion marker, then runs
+`tools/boot-check.sh` against the installed disk (mode `uefi`).
+
 ### Desktop inference (P0-d1)
 
 The builder reads only `plan.packages`; `desktop` in the spec is not required
@@ -671,13 +777,15 @@ acceptance.
 - No loop devices, mounts, or host block devices are used.
 - Docker mode bind-mounts only `<out>`; no Docker socket or host directories.
 
-## Not implemented through P0-d2
+## Not implemented through P0-d3
 
-- Calamares or any installer flow (P0-d3); desktop *configuration* (theme,
+- Calamares or any installer GUI (P0-d3b); desktop *configuration* (theme,
   apps, users, autologin) beyond installing the session packages and letting
-  the display manager start; first boot after installation.
+  the display manager start; first-boot user setup. The P0-d3 installer is
+  headless and writes no users/passwords beyond what the live rootfs carries.
 - BIOS boot, persistence, secure boot signing, dm-verity, and PXE assembly.
-  (P0-d2 implements UEFI live ISO assembly but not installation to disk.)
+  (P0-d2 implements UEFI live ISO assembly; P0-d3 implements unattended
+  install to `/dev/vda`, not a reproducible installer image or Calamares.)
 - Cross-architecture UEFI: `grub-mkstandalone -O x86_64-efi` is x86_64 only;
   `target.arch` is validated but the native build uses the host toolchain.
 - System configuration beyond `/etc/hostname` and the serial getty enable:
@@ -693,7 +801,7 @@ acceptance.
   path is covered by offline tests with a fake toolchain; the real path is only
   exercised by CI.
 
-## Known risks (tracked by P0-c/P0-d1/P0-d2)
+## Known risks (tracked by P0-c/P0-d1/P0-d2/P0-d3)
 
 1. `grub-mkstandalone`'s module set or embedded-config argument may need
    adjustment on the CI runner; the build.log from the first CI run is the
@@ -741,14 +849,31 @@ acceptance.
    than parsing LightDM's redirected Xorg log. `TimeoutStartSec=90` bounds the
    start job; if Xorg never appears, `boot.xorg` still fails and the usual five
    boot assertions report the failure.
+13. P0-d3 rsync copies ~1 GB from the live overlay to the emulated virtio disk
+    under TCG; this can take 5–15 minutes. The systemd unit allows 1800 s and
+    the CI install job budgets 40 minutes. If the job times out, reduce the
+    rootfs package set or raise the job timeout; do not shorten
+    `TimeoutStartSec` below the observed install time.
+14. `grub-install` runs inside the chroot and needs the `/proc`, `/sys`, `/dev`,
+    and `/run` bind mounts; without them it can fail while probing the EFI
+    platform. The script mounts and always unmounts them (including on error).
+    `--removable` writes `EFI/BOOT/BOOTX64.EFI`, which is what OVMF boots from
+    the installed GPT ESP; `--no-nvram` avoids touching host/guest efivars.
+15. The installer targets `/dev/vda` (frozen). A different device can be passed
+    on the live cmdline (`sysemble.install=/dev/...`), but only whole disks with
+    predictable `<dev>1`/`<dev>2` (or nvme/mmcblk `p1`/`p2`) names are
+    supported. LUKS, LVM, RAID, multi-disk, and a GUI/first-boot flow are out of
+    scope for P0-d3.
 
 ## Local checks
 
 ```bash
 bash -n builders/debian/build.sh
 bash -n builders/debian/lib.sh
+bash -n builders/debian/installer/sysemble-install.sh
 bash -n builders/debian/tests/artifact_test.sh
 bash -n builders/debian/tests/build_exec_test.sh
+bash -n builders/debian/tests/installer_test.sh
 
 # Plan fixture / dry-run regression
 bash builders/debian/build.sh \
@@ -760,10 +885,17 @@ cargo run -q -p sysemble-cli -- plan examples/minimal-debian-live.yaml > /tmp/li
 bash builders/debian/build.sh --plan /tmp/live-plan.json --out /tmp/p0d2-dry --dry-run
 
 # Offline artifact manifest tests (fixture rootfs + real sha256)
-bash builders/debian/tests/artifact_test.sh        # 107 checks
+bash builders/debian/tests/artifact_test.sh        # 121 checks
 
 # Offline native --execute command-sequence tests (fake disk + ISO toolchain)
-bash builders/debian/tests/build_exec_test.sh      # 212 checks
+bash builders/debian/tests/build_exec_test.sh      # 255 checks
+
+# Offline installer static + dynamic dry-run tests (no partition/mount)
+bash builders/debian/tests/installer_test.sh       # 122 checks
+
+# Installer ISO dry run (P0-d3)
+bash builders/debian/build.sh --plan /tmp/live-plan.json \
+  --out /tmp/p0d3-dry --dry-run --installer
 
 # On macOS, without --dry-run, the native preflight is expected to exit 3
 bash builders/debian/build.sh \
@@ -791,8 +923,10 @@ bash builders/debian/build.sh --plan /tmp/min-plan.json --out /tmp/sysemble-dry 
 
 The tests do **not** prove that the real commands work: they prove command
 assembly, argument order/content, GRUB config text, hook text, artifact shape,
-log tee, mode-aware preflight, and failure cleanup. The authoritative real
-builds are the CI `boot-smoke` (disk) and `live-smoke` (ISO) jobs.
+log tee, mode-aware preflight, failure cleanup, and the installer's static
+command sequence plus its `--dry-run` ordering/markers. The authoritative real
+builds are the CI `boot-smoke` (disk), `live-smoke` (ISO), and `install-smoke`
+(installer ISO → installed disk) jobs.
 
 On a macOS host without the UEFI/ISO toolchain, `build.sh --execute` exits 3
 and reports every missing item for the requested mode. For an ISO-only plan
@@ -831,16 +965,36 @@ Expected evidence: only `live.iso` (plus `rootfs/`, `iso/`, `esp/`,
 `-cdrom` and asserts firmware, GRUB, kernel, systemd, login, and `live-boot`/
 `live-media`/`squashfs` (any of the live markers).
 
+The P0-d3 `install-smoke` job reuses the P0-d2 ISO toolchain and builds the
+installer variant, then runs the two-phase install check (install marker, then
+UEFI boot of the installed 6 GiB disk):
+
+```bash
+cargo run -p sysemble-cli -- plan examples/minimal-debian-live.yaml > plan.json
+sudo -E bash builders/debian/build.sh --plan plan.json --out /tmp/out --execute --installer
+sudo chown -R "$(id -u):$(id -g)" /tmp/out
+bash tools/install-check.sh --artifact /tmp/out/artifact.json --timeout 1200 --json
+```
+
+Expected evidence: only `live.iso` (no `disk.img`), a serial install log with
+`SYMBLE: install complete`, and a `boot-evidence-install` artifact whose
+`phases.boot.assertions` show the installed disk passing the five UEFI
+assertions. The installer script, unit, and packages are inside the ISO; the
+build host is never partitioned.
+
 ## Files
 
 | File | Role |
 |---|---|
-| `build.sh` | CLI, output directory handling, dry run, mode-aware native GPT/ESP/GRUB/UEFI and live ISO pipelines, docker rootfs bootstrap. |
-| `lib.sh` | JSON backends, record parsing, plan validation, mode-aware preflight, disk sizing, disk/ISO GRUB rendering, P0-d1 desktop inference/runtime packages/boot evidence unit, P0-d2 ISO artifact helpers, usage text. |
-| `tests/artifact_test.sh` | Offline fixture tests for `artifact_json` (UEFI no-DM + graphical + P0-b fallback), `artifact_iso_json` (iso-only, graphical, iso+disk), ISO GRUB text, plan output mode selection, desktop inference, boot evidence unit, kernel/initrd selection, hashing, and disk sizing. |
-| `tests/build_exec_test.sh` | Offline fake-toolchain end-to-end tests of the native `--execute` disk and ISO command sequences, arguments, GRUB configs, include lists, mode-aware preflight, artifacts, and failure cleanup. |
+| `build.sh` | CLI, output directory handling, dry run, mode-aware native GPT/ESP/GRUB/UEFI and live ISO pipelines, the P0-d3 installer ISO, docker rootfs bootstrap. |
+| `lib.sh` | JSON backends, record parsing, plan validation, mode-aware preflight, disk sizing, disk/ISO GRUB rendering, P0-d1 desktop inference/runtime packages/boot evidence unit, P0-d2 ISO + P0-d3 installer artifact helpers, usage text. |
+| `installer/sysemble-install.sh` | Headless guest installer: GPT + ESP/ext4, rsync root, fstab, grub-install `--removable`, serial markers, poweroff on success / stay-alive on failure. Testable via `SYMBLE_*` overrides and `--dry-run`. |
+| `installer/sysemble-install.service` | Frozen `sysemble-install.service` oneshot (ConditionKernelCommandLine, 1800 s, WantedBy multi-user.target). |
+| `tests/artifact_test.sh` | Offline fixture tests for `artifact_json` (UEFI no-DM + graphical + P0-b fallback), `artifact_iso_json` (iso-only, graphical, iso+disk), `artifact_install_json`, ISO/installer GRUB text, plan output mode selection, desktop inference, boot evidence unit, installer runtime packages, kernel/initrd selection, hashing, and disk sizing. |
+| `tests/build_exec_test.sh` | Offline fake-toolchain end-to-end tests of the native `--execute` disk/ISO/installer command sequences, arguments, GRUB configs, include lists, baked installer script/unit/symlink, mode-aware preflight, artifacts, and failure cleanup. |
+| `tests/installer_test.sh` | Static contract checks plus a real `--dry-run` of the installer script with sentinel fake commands (no partition/mount/poweroff), command-order assertions, fstab/GRUB text, marker, and failure path. |
 | `testdata/plan.example.json` | Contract-shaped KDE plan with a display manager (`["qcow2","iso"]`). |
 | `testdata/plan.disk.json` | Same KDE plan with `["qcow2"]` for the P0-c/P0-d1 disk regression. |
 | `testdata/plan.no-desktop.json` | Minimal fixture without a display manager for the P0-d1 no-DM regression. |
-| `testdata/plan.iso.json` | Minimal 14-package live plan with `["iso"]`. |
+| `testdata/plan.iso.json` | Minimal 14-package live plan with `["iso"]` (also the `--installer` fixture). |
 | `testdata/plan.iso-disk.json` | Minimal 14-package plan with `["qcow2","iso"]`. |

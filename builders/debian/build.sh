@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Sysemble Debian builder (P0-a + P0-b native build path + P0-c1 GPT/GRUB/UEFI
-# + P0-d1 desktop boot + P0-d2 live ISO).
+# + P0-d1 desktop boot + P0-d2 live ISO + P0-d3 unattended installer ISO).
 #
 # Reads a plan.json produced by `sysemble plan --json` and bootstraps a Debian
 # rootfs with mmdebstrap, either natively (Linux/root) or inside a
@@ -23,8 +23,17 @@
 # boot.mode="iso" / boot.iso="live.iso" in artifact.json. An ISO-only manifest
 # omits partitions.
 #
+# P0-d3: --installer (ISO-only plans) bakes the headless
+# /usr/local/sbin/sysemble-install + sysemble-install.service into the live
+# rootfs via the customize hook, adds
+# rsync/grub-efi-amd64/grub-efi-amd64-bin/dosfstools/gdisk/e2fsprogs to
+# --include, appends sysemble.install=/dev/vda to the ISO cmdline, and records
+# boot.mode="install" + boot.install_device="/dev/vda". Images stays live.iso;
+# the installer partitions the guest disk itself.
+#
 # Contract (frozen):
-#   build.sh --plan <plan.json> --out <dir> [--dry-run] [--execute] [--engine docker|native]
+#   build.sh --plan <plan.json> --out <dir> [--dry-run] [--execute]
+#            [--engine docker|native] [--installer]
 #
 # Only builders/** is modified by this script at runtime: everything is written
 # under --out. The host system, network configuration, and boot configuration
@@ -45,11 +54,17 @@ BUILD_DIR=$(cd "$BUILD_DIR" && pwd)
 # shellcheck source=builders/debian/lib.sh
 . "$BUILD_DIR/lib.sh"
 
+# P0-d3 installer sources baked into the live rootfs by the customize hook.
+INSTALLER_SRC_DIR="$BUILD_DIR/$INSTALLER_DIR_NAME"
+INSTALLER_SCRIPT_SRC="$INSTALLER_SRC_DIR/$INSTALLER_SCRIPT_NAME"
+INSTALLER_UNIT_SRC="$INSTALLER_SRC_DIR/$INSTALLER_UNIT_NAME"
+
 PLAN=""
 OUT=""
 DRY_RUN=0
 EXECUTE=0
 ENGINE="native"
+INSTALLER=0
 BUILD_LOG=""
 OUTPUTS_OWNED=0
 DISK_OUTPUTS_OWNED=0
@@ -98,6 +113,10 @@ parse_args() {
         ;;
       --execute)
         EXECUTE=1
+        shift
+        ;;
+      --installer)
+        INSTALLER=1
         shift
         ;;
       --engine)
@@ -160,6 +179,23 @@ parse_args() {
     usage >&2
     exit 2
   fi
+}
+
+# P0-d3: --installer only makes sense for a pure live ISO build. Reject it
+# before touching --out so a disk-only plan can never produce a half-built
+# installer artifact.
+validate_installer_mode() {
+  local mode=""
+
+  if [ "$INSTALLER" -eq 0 ]; then
+    return 0
+  fi
+  mode=$(plan_build_mode)
+  if [ "$mode" != "iso" ]; then
+    err "--installer requires an ISO-only plan (target.outputs contains 'iso' and no qcow2/raw); this plan is '$mode'"
+    return 2
+  fi
+  return 0
 }
 
 validate_out_arg() {
@@ -378,26 +414,51 @@ make_iso_initramfs_hook_fragment() {
   printf '; printf "mmdebstrap customize hook: update-initramfs for live-boot\\n"; chroot "$1" update-initramfs -u -k all'
 }
 
+# P0-d3: copy the frozen installer script (0755) and systemd unit into the
+# live rootfs and enable the unit through multi-user.target.wants. The script
+# and unit are embedded verbatim as quoted heredocs, so the hook does not
+# depend on the source tree being readable when mmdebstrap runs it.
+make_installer_hook_fragment() {
+  local script=$1
+  local unit=$2
+
+  printf '; mkdir -p "$1/usr/local/sbin" "$1/etc/systemd/system/multi-user.target.wants"\n'
+  printf "cat >\"\$1%s\" <<'SYMBLE_INSTALL_SCRIPT'\n" "$INSTALLER_SCRIPT_INSTALL_PATH"
+  cat "$script"
+  printf 'SYMBLE_INSTALL_SCRIPT\n'
+  printf 'chmod 0755 "$1%s"\n' "$INSTALLER_SCRIPT_INSTALL_PATH"
+  printf "cat >\"\$1%s\" <<'SYMBLE_INSTALL_UNIT'\n" "$INSTALLER_UNIT_INSTALL_PATH"
+  cat "$unit"
+  printf 'SYMBLE_INSTALL_UNIT\n'
+  printf 'ln -sfn ../%s "$1%s"\n' "$INSTALLER_UNIT_NAME" "$INSTALLER_WANTS_LINK_PATH"
+}
+
 # Shell command passed to mmdebstrap --customize-hook. mmdebstrap runs the hook
 # on the host with the rootfs directory as $1. systemctl enable is executed
 # inside a chroot; failure is non-fatal and produces a warning in build.log
 # (P0-b workplan risk 2). A desktop plan also installs and enables the P0-d1
-# boot evidence oneshot; an ISO plan regenerates the initramfs for live-boot.
+# boot evidence oneshot; an ISO plan regenerates the initramfs for live-boot;
+# an installer ISO bakes in the P0-d3 script/unit.
 make_customize_hook() {
   local host=$1
   local display_manager=${2:-}
   local iso=${3:-0}
+  local installer=${4:-0}
   local evidence=""
+  local install_fragment=""
   local initramfs=""
 
   if [ -n "$display_manager" ]; then
     evidence=$(make_boot_evidence_hook_fragment "$display_manager") || return 1
   fi
+  if [ "$installer" -eq 1 ]; then
+    install_fragment=$(make_installer_hook_fragment "$INSTALLER_SCRIPT_SRC" "$INSTALLER_UNIT_SRC") || return 1
+  fi
   if [ "$iso" -eq 1 ]; then
     initramfs=$(make_iso_initramfs_hook_fragment) || return 1
   fi
 
-  printf '%s' "printf '%s\\n' '$host' > \"\$1/etc/hostname\"; if chroot \"\$1\" systemctl enable serial-getty@ttyS0.service >/dev/null 2>&1; then :; else printf 'mmdebstrap customize hook: warning: could not enable serial-getty@ttyS0.service (non-fatal)\\n' >&2; fi${evidence}${initramfs}"
+  printf '%s' "printf '%s\\n' '$host' > \"\$1/etc/hostname\"; if chroot \"\$1\" systemctl enable serial-getty@ttyS0.service >/dev/null 2>&1; then :; else printf 'mmdebstrap customize hook: warning: could not enable serial-getty@ttyS0.service (non-fatal)\\n' >&2; fi${evidence}${install_fragment}${initramfs}"
 }
 
 
@@ -468,15 +529,19 @@ do_dry_run() {
     desktop=""
     desktop_on=0
   fi
+  if [ "$INSTALLER" -eq 1 ]; then
+    desktop=""
+    desktop_on=0
+  fi
   if [ "$iso" -eq 1 ]; then
-    runtime_csv=$(runtime_packages_for 1 "$desktop_on")
-    runtime_count=$(runtime_package_count_for 1 "$desktop_on")
+    runtime_csv=$(runtime_packages_for 1 "$desktop_on" "$INSTALLER")
+    runtime_count=$(runtime_package_count_for 1 "$desktop_on" "$INSTALLER")
   fi
 
   spec_text=$(display_field "$PLAN_SPEC_TYPE" "$PLAN_SPEC_VALUE" "(not set)")
   pin_text=$(display_field "$PLAN_BASE_PIN_TYPE" "$PLAN_BASE_PIN_VALUE" "unpinned")
 
-  printf 'Sysemble Debian builder - dry run (P0-d2)\n'
+  printf 'Sysemble Debian builder - dry run (P0-d3)\n'
   printf '  plan:       %s\n' "$PLAN"
   printf '  out:        %s\n' "$OUT_ABS"
   printf '  engine:     %s (not checked in dry-run)\n' "$ENGINE"
@@ -487,6 +552,12 @@ do_dry_run() {
   printf '  arch:       %s\n' "$PLAN_TARGET_ARCH_VALUE"
   printf '  outputs:    %s\n' "$OUTPUTS_TEXT"
   printf '  build mode: %s\n' "$mode"
+  if [ "$INSTALLER" -eq 1 ]; then
+    printf '  installer:  enabled (ISO-only, install_device=%s, memory_mb=%s)\n' \
+      "$INSTALLER_DEVICE_DEFAULT" "$ISO_BOOT_MEMORY_MB_DEFAULT"
+    printf '  installer:  script=%s unit=%s\n' \
+      "$INSTALLER_SCRIPT_INSTALL_PATH" "$INSTALLER_UNIT_INSTALL_PATH"
+  fi
 
   printf '\nStages (planned):\n'
   printf '  [1/6] validate          plan structure is valid\n'
@@ -533,6 +604,14 @@ do_dry_run() {
         "$OUT_ABS" "$OUT_ABS" "$OUT_ABS"
       printf '  xorriso -as mkisofs -R -J -joliet-long -V SYMBLE -o %s/live.iso ... %s/iso\n' \
         "$OUT_ABS" "$OUT_ABS"
+    fi
+    if [ "$INSTALLER" -eq 1 ]; then
+      printf '  customize hook: install %s (0755) + %s + multi-user.target.wants symlink\n' \
+        "$INSTALLER_SCRIPT_INSTALL_PATH" "$INSTALLER_UNIT_INSTALL_PATH"
+      printf '  ISO cmdline: %s %s=%s\n' \
+        "$ISO_BOOT_CMDLINE" "$INSTALLER_KERNEL_PARAM" "$INSTALLER_DEVICE_DEFAULT"
+      printf '  artifact: boot.mode=install, boot.install_device=%s, memory_mb=%s\n' \
+        "$INSTALLER_DEVICE_DEFAULT" "$ISO_BOOT_MEMORY_MB_DEFAULT"
     fi
   else
     printf '  docker run --rm --privileged -v %s:/out debian:trixie \\\n' "$OUT_ABS"
@@ -582,8 +661,10 @@ finish_rootfs_only() {
 # and <iso_efi> are the GRUB config, ESP staging tree, and intermediate FAT
 # image (iso-only uses <out>/grub.cfg, <out>/esp, <out>/efi.img; an iso+disk
 # plan uses a private <out>/iso-staging tree so it cannot clobber the disk
-# build). Returns 0 on success, 6 on any failed step; the caller's EXIT trap
-# removes a half-written live.iso/efi.img and keeps rootfs/, iso/, and logs.
+# build). <installer> is the P0-d3 flag: 1 appends sysemble.install=<device> to
+# the live cmdline. Returns 0 on success, 6 on any failed step; the caller's
+# EXIT trap removes a half-written live.iso/efi.img and keeps rootfs/, iso/, and
+# logs.
 build_iso_image() {
   local rootfs=$1
   local kernel=$2
@@ -593,6 +674,7 @@ build_iso_image() {
   local iso_esp=$6
   local iso_efi=$7
   local iso_dir=$8
+  local installer=${9:-0}
   local iso_live="$iso_dir/live"
   local iso_boot="$iso_dir/boot/grub"
   local kernel_name=${kernel##*/}
@@ -603,6 +685,9 @@ build_iso_image() {
   blog "[build] stage 5/6: assemble live ISO - rootfs ${rootfs##*/}, kernel $kernel_name"
   blog "[build] iso tree: $iso_dir (live/filesystem.squashfs, live/vmlinuz, live/initrd.img, boot/grub/efi.img)"
   blog "[build] iso grub: menuentry \"$ISO_GRUB_MENU_TITLE\", search /live/vmlinuz, boot=live live-media-path=/live"
+  if [ "$installer" -eq 1 ]; then
+    blog "[build] iso grub: installer cmdline adds $INSTALLER_KERNEL_PARAM=$INSTALLER_DEVICE_DEFAULT"
+  fi
 
   if ! mkdir -p "$iso_live" "$iso_boot" "$iso_esp/EFI/BOOT"; then
     blog_err "cannot create the ISO staging tree under $OUT_ABS"
@@ -627,7 +712,7 @@ build_iso_image() {
     return 6
   fi
 
-  if ! iso_grub_cfg_text "$kernel_name" "$initrd_name" "$graphical" \
+  if ! iso_grub_cfg_text "$kernel_name" "$initrd_name" "$graphical" "$installer" \
     >"$OUT_ABS/.iso-grub.cfg.tmp" 2>"$TMP_DIR/grub.err"; then
     if [ -s "$TMP_DIR/grub.err" ]; then
       cat "$TMP_DIR/grub.err" | tee -a "$BUILD_LOG" >&2
@@ -725,6 +810,7 @@ build_native() {
   local iso=0
   local disk=0
   local stale=0
+  local artifact_fail=0
 
   # P0-d2: choose the requested stages from plan.target.outputs. An ISO-only
   # plan must never touch sgdisk/mkfs.ext4/qemu-img/dd; a disk plan keeps the
@@ -798,20 +884,47 @@ build_native() {
     graphical=0
   fi
 
+  # P0-d3 is a headless installer: even if the plan names a display manager,
+  # the installer ISO boots to multi-user and the artifact stays 1024 MB /
+  # non-graphical. The DM packages remain in the rootfs if the plan asked for
+  # them; only the boot target, desktop runtime packages, and boot-evidence
+  # unit are suppressed.
+  if [ "$INSTALLER" -eq 1 ] && [ "$graphical" -eq 1 ]; then
+    blog "[build] installer: forcing headless multi-user boot (plan display manager '$desktop_dm' is not started)"
+    graphical=0
+    desktop_dm=""
+    desktop_session=""
+  fi
+
   # Builder-added runtime packages, deduplicated against the plan:
   #   - desktop: xserver-xorg/procps/accountsservice (P0-d1, unchanged);
   #   - live ISO: live-boot/live-boot-initramfs-tools (mmdebstrap installs no
-  #     Recommends, so the plan alone does not pull them in).
+  #     Recommends, so the plan alone does not pull them in);
+  #   - installer: rsync/grub-efi-amd64(+bin)/dosfstools/gdisk/e2fsprogs
+  #     (P0-d3; the guest runs sgdisk/mkfs/rsync/grub-install).
   # artifact.packages stays the plan package list.
-  runtime_csv=$(runtime_packages_for "$iso" "$graphical")
-  runtime_count=$(runtime_package_count_for "$iso" "$graphical")
+  runtime_csv=$(runtime_packages_for "$iso" "$graphical" "$INSTALLER")
+  runtime_count=$(runtime_package_count_for "$iso" "$graphical" "$INSTALLER")
   include_csv=$pkg_csv
   if [ -n "$runtime_csv" ]; then
     include_csv="$pkg_csv,$runtime_csv"
   fi
 
+  if [ "$INSTALLER" -eq 1 ]; then
+    if [ ! -f "$INSTALLER_SCRIPT_SRC" ] || [ ! -r "$INSTALLER_SCRIPT_SRC" ] ||
+      [ ! -s "$INSTALLER_SCRIPT_SRC" ]; then
+      blog_err "installer script is missing or empty: $INSTALLER_SCRIPT_SRC"
+      return 6
+    fi
+    if [ ! -f "$INSTALLER_UNIT_SRC" ] || [ ! -r "$INSTALLER_UNIT_SRC" ] ||
+      [ ! -s "$INSTALLER_UNIT_SRC" ]; then
+      blog_err "installer unit is missing or empty: $INSTALLER_UNIT_SRC"
+      return 6
+    fi
+  fi
+
   hostname=$(plan_hostname)
-  if ! hook=$(make_customize_hook "$hostname" "$desktop_dm" "$iso"); then
+  if ! hook=$(make_customize_hook "$hostname" "$desktop_dm" "$iso" "$INSTALLER"); then
     blog_err "cannot build the mmdebstrap customize hook for display_manager='$desktop_dm'"
     return 6
   fi
@@ -875,6 +988,11 @@ build_native() {
   if [ "$iso" -eq 1 ]; then
     blog "[build] live ISO runtime: add ${runtime_csv:-none} to --include (deduplicated against plan.packages)"
     blog "[build] live ISO: regenerate the initramfs in the customize hook so the live-boot hook is included"
+  fi
+  if [ "$INSTALLER" -eq 1 ]; then
+    blog "[build] installer: ISO-only unattended install to $INSTALLER_DEVICE_DEFAULT (memory ${ISO_BOOT_MEMORY_MB_DEFAULT} MB)"
+    blog "[build] installer hook: $INSTALLER_SCRIPT_INSTALL_PATH (0755), $INSTALLER_UNIT_INSTALL_PATH, multi-user.target.wants link"
+    blog "[build] installer cmdline: $INSTALLER_KERNEL_PARAM=$INSTALLER_DEVICE_DEFAULT"
   fi
   blog "[build] customize: hostname=$hostname, enable serial-getty@ttyS0.service (failure is non-fatal)"
 
@@ -1023,28 +1141,34 @@ build_native() {
 
   if [ "$iso" -eq 1 ]; then
     if ! build_iso_image "$rootfs" "$kernel" "$initrd" "$graphical" \
-      "$iso_cfg" "$iso_esp" "$iso_efi" "$iso_dir"; then
+      "$iso_cfg" "$iso_esp" "$iso_efi" "$iso_dir" "$INSTALLER"; then
       return 6
     fi
   fi
 
   blog "[build] stage 6/6: write artifact manifest"
+  artifact_fail=0
   if [ "$iso" -eq 1 ]; then
-    if ! artifact_iso_json "$OUT_ABS" "$PLAN_SPEC_VALUE" \
+    if [ "$INSTALLER" -eq 1 ]; then
+      if ! artifact_install_json "$OUT_ABS" "$PLAN_SPEC_VALUE" \
+        "$PLAN_BASE_RELEASE_VALUE" "$PLAN_BASE_PIN_VALUE" \
+        "$PLAN_TARGET_ARCH_VALUE" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        "${PLAN_PACKAGES_VALUES[@]}" >"$OUT_ABS/.artifact.json.tmp" 2>"$TMP_DIR/artifact.err"; then
+        artifact_fail=1
+      fi
+    elif ! artifact_iso_json "$OUT_ABS" "$PLAN_SPEC_VALUE" \
       "$PLAN_BASE_RELEASE_VALUE" "$PLAN_BASE_PIN_VALUE" \
       "$PLAN_TARGET_ARCH_VALUE" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
       "$disk" "${PLAN_PACKAGES_VALUES[@]}" >"$OUT_ABS/.artifact.json.tmp" 2>"$TMP_DIR/artifact.err"; then
-      if [ -s "$TMP_DIR/artifact.err" ]; then
-        cat "$TMP_DIR/artifact.err" | tee -a "$BUILD_LOG" >&2
-      fi
-      rm -f "$OUT_ABS/.artifact.json.tmp" 2>/dev/null || true
-      blog_err "artifact.json generation failed"
-      return 6
+      artifact_fail=1
     fi
   elif ! artifact_json "$OUT_ABS" "$PLAN_SPEC_VALUE" \
     "$PLAN_BASE_RELEASE_VALUE" "$PLAN_BASE_PIN_VALUE" \
     "$PLAN_TARGET_ARCH_VALUE" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     "${PLAN_PACKAGES_VALUES[@]}" >"$OUT_ABS/.artifact.json.tmp" 2>"$TMP_DIR/artifact.err"; then
+    artifact_fail=1
+  fi
+  if [ "$artifact_fail" -eq 1 ]; then
     if [ -s "$TMP_DIR/artifact.err" ]; then
       cat "$TMP_DIR/artifact.err" | tee -a "$BUILD_LOG" >&2
     fi
@@ -1062,6 +1186,8 @@ build_native() {
   blog ""
   if [ "$iso" -eq 1 ] && [ "$disk" -eq 1 ]; then
     blog "[build] complete (mode: uefi+iso)"
+  elif [ "$iso" -eq 1 ] && [ "$INSTALLER" -eq 1 ]; then
+    blog "[build] complete (mode: install)"
   elif [ "$iso" -eq 1 ]; then
     blog "[build] complete (mode: iso)"
   else
@@ -1077,6 +1203,9 @@ build_native() {
     blog "  iso:      $OUT_ABS/$ISO_ARTIFACT_NAME (UEFI El Torito)"
     blog "  iso tree: $iso_dir (live/vmlinuz, live/initrd.img, live/filesystem.squashfs, boot/grub/efi.img)"
     blog "  iso cfg:  $iso_cfg"
+  fi
+  if [ "$INSTALLER" -eq 1 ]; then
+    blog "  installer: $INSTALLER_SCRIPT_INSTALL_PATH + $INSTALLER_UNIT_INSTALL_PATH (install_device $INSTALLER_DEVICE_DEFAULT)"
   fi
   blog "  artifact: $OUT_ABS/artifact.json"
   blog "  log:      $BUILD_LOG"
@@ -1135,7 +1264,10 @@ build_docker() {
   if detect_display_manager "${PLAN_PACKAGES_VALUES[@]}" >/dev/null 2>&1; then
     graphical=1
   fi
-  runtime_csv=$(runtime_packages_for "$iso" "$graphical")
+  if [ "$INSTALLER" -eq 1 ]; then
+    graphical=0
+  fi
+  runtime_csv=$(runtime_packages_for "$iso" "$graphical" "$INSTALLER")
   if [ -n "$runtime_csv" ]; then
     pkg_csv="$pkg_csv,$runtime_csv"
   fi
@@ -1180,6 +1312,7 @@ main() {
   make_tmpdir || exit 2
   load_plan_records || exit 1
   validate_plan || exit 1
+  validate_installer_mode || exit 2
 
   if [ "$DRY_RUN" -eq 1 ]; then
     do_dry_run || exit $?

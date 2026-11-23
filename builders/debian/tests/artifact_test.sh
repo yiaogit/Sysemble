@@ -269,12 +269,28 @@ assert_contains "source kernel=$KERNEL_NAME initrd=$INITRD_NAME" "$ISO_GRUB" \
 assert_not_contains "set root=(hd0,gpt2)" "$ISO_GRUB" "ISO grub.cfg has no disk root"
 assert_not_contains "root=/dev/vda2" "$ISO_GRUB" "ISO grub.cfg has no disk root= cmdline"
 assert_not_contains "graphical.target" "$ISO_GRUB" "no-DM ISO grub.cfg keeps multi-user.target"
+assert_not_contains "sysemble.install" "$ISO_GRUB" \
+  "plain ISO grub.cfg has no installer parameter"
 assert_contains "linux /live/vmlinuz boot=live live-media-path=/live console=ttyS0 systemd.unit=graphical.target systemd.journald.forward_to_console=1" \
   "$ISO_GRAPHICAL_GRUB" "graphical ISO grub.cfg targets graphical.target"
 assert_not_contains "systemd.unit=multi-user.target" "$ISO_GRAPHICAL_GRUB" \
   "graphical ISO grub.cfg does not keep multi-user.target"
 assert_fails "iso_grub_cfg_text rejects an invalid graphical flag" \
   iso_grub_cfg_text "$KERNEL_NAME" "$INITRD_NAME" 2
+
+# P0-d3: installer ISO cmdline appends sysemble.install=/dev/vda.
+ISO_INSTALL_GRUB="$TMP_DIR/grub-iso-installer.cfg"
+if iso_grub_cfg_text "$KERNEL_NAME" "$INITRD_NAME" 0 1 >"$ISO_INSTALL_GRUB"; then
+  pass "iso_grub_cfg_text renders the installer ISO menu"
+else
+  fail "iso_grub_cfg_text failed for the installer flag"
+fi
+assert_contains "linux /live/vmlinuz boot=live live-media-path=/live console=ttyS0 systemd.unit=multi-user.target systemd.journald.forward_to_console=1 sysemble.install=/dev/vda" \
+  "$ISO_INSTALL_GRUB" "installer ISO grub.cfg appends sysemble.install=/dev/vda"
+assert_contains "search --no-floppy --file --set=root /live/vmlinuz" "$ISO_INSTALL_GRUB" \
+  "installer ISO grub.cfg still searches for /live/vmlinuz"
+assert_fails "iso_grub_cfg_text rejects an invalid installer flag" \
+  iso_grub_cfg_text "$KERNEL_NAME" "$INITRD_NAME" 0 2
 if iso_grub_cfg_text "" "$INITRD_NAME" >/dev/null 2>&1; then
   fail "iso_grub_cfg_text must reject an empty kernel name"
 else
@@ -356,6 +372,8 @@ check(
 check(doc["boot"]["mode"] == "iso", "boot.mode is iso")
 check(doc["boot"]["iso"] == "live.iso", "boot.iso is live.iso")
 check(doc["boot"]["cmdline"] == ISO_CMDLINE, "boot.cmdline is the frozen ISO multi-user cmdline")
+check("sysemble.install" not in doc["boot"]["cmdline"], "plain ISO cmdline has no installer parameter")
+check("install_device" not in doc["boot"], "plain ISO artifact has no install_device")
 check(doc["boot"]["memory_mb"] == 1024, "boot.memory_mb is 1024")
 check("partitions" not in doc, "iso-only artifact omits partitions")
 check("desktop" not in doc, "iso-only artifact omits desktop")
@@ -380,12 +398,140 @@ else
       .images[0].size_mb == 1 and
       (has("partitions") | not) and
       (has("desktop") | not) and
+      (.boot | has("install_device") | not) and
+      (.boot.cmdline | contains("sysemble.install") | not) and
       .boot == {"mode":"iso","iso":"live.iso","cmdline":"boot=live live-media-path=/live console=ttyS0 systemd.unit=multi-user.target systemd.journald.forward_to_console=1","memory_mb":1024}
     ' "$ISO_JSON" >/dev/null 2>&1; then
     pass "iso-only artifact JSON shape and values (jq)"
   else
     fail "iso-only artifact JSON shape and values (jq)"
   fi
+fi
+
+# ---------------------------------------------------------------------------
+# P0-d3 installer artifact (boot.mode=install, ISO-only, headless)
+# ---------------------------------------------------------------------------
+
+INSTALL_JSON="$TMP_DIR/artifact-install.json"
+if artifact_install_json "$ISO_OUT" "minimal-debian-live-install" "trixie" "2026-11-01" \
+  "x86_64" "$CREATED_AT" "${PACKAGES[@]}" >"$INSTALL_JSON"; then
+  pass "artifact_install_json exits 0 for an installer ISO"
+else
+  fail "artifact_install_json failed for an installer ISO"
+fi
+INSTALL_CMDLINE="boot=live live-media-path=/live console=ttyS0 systemd.unit=multi-user.target systemd.journald.forward_to_console=1 sysemble.install=/dev/vda"
+if [ "$json_backend" = "python3" ]; then
+  if python3 - "$INSTALL_JSON" "$ISO_OUT" "$INSTALL_CMDLINE" <<'PY'
+import json
+import os
+import re
+import sys
+
+path, out, install_cmdline = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(path, "r", encoding="utf-8") as fh:
+    doc = json.load(fh)
+
+def check(condition, message):
+    if not condition:
+        sys.exit("FAIL: " + message)
+    print("ok - " + message)
+
+check(
+    set(doc) == {
+        "apiVersion", "createdAt", "spec", "base", "arch", "packages",
+        "rootfs", "images", "boot", "builder",
+    },
+    "installer top-level keys omit partitions and desktop",
+)
+check(doc["apiVersion"] == "sysemble/artifact/v1", "apiVersion")
+check(doc["spec"] == "minimal-debian-live-install", "spec")
+check(doc["packages"] == ["apt", "ca-certificates", "systemd"], "artifact.packages keeps the plan list")
+check(len(doc["images"]) == 1, "installer images keeps exactly one entry")
+check(doc["images"][0]["path"] == "live.iso", "installer image is live.iso")
+check(doc["images"][0]["format"] == "iso", "installer image format is iso")
+check(
+    set(doc["boot"]) == {"mode", "iso", "install_device", "cmdline", "memory_mb"},
+    "installer boot keys are mode/iso/install_device/cmdline/memory_mb",
+)
+check(doc["boot"]["mode"] == "install", "boot.mode is install")
+check(doc["boot"]["iso"] == "live.iso", "boot.iso is live.iso")
+check(doc["boot"]["install_device"] == "/dev/vda", "boot.install_device is /dev/vda")
+check(doc["boot"]["cmdline"] == install_cmdline, "installer boot.cmdline appends the install parameter")
+check(doc["boot"]["cmdline"].endswith("sysemble.install=/dev/vda"), "installer cmdline ends with sysemble.install=/dev/vda")
+check(doc["boot"]["memory_mb"] == 1024, "installer boot.memory_mb is 1024")
+check("graphical" not in doc["boot"], "installer boot has no graphical flag")
+check("partitions" not in doc, "installer artifact omits partitions")
+check("desktop" not in doc, "installer artifact omits desktop")
+check(doc["builder"] == {"name": "build.sh", "version": "0.1.0"}, "builder")
+check(os.path.isfile(os.path.join(out, "live.iso")), "live.iso exists under <out>")
+PY
+  then
+    pass "installer artifact JSON shape and values"
+  else
+    fail "installer artifact JSON shape and values"
+  fi
+else
+  if jq -e --arg cmdline "$INSTALL_CMDLINE" '
+      .apiVersion == "sysemble/artifact/v1" and
+      .spec == "minimal-debian-live-install" and
+      .packages == ["apt","ca-certificates","systemd"] and
+      (.images | length == 1) and
+      .images[0].path == "live.iso" and
+      .images[0].format == "iso" and
+      (has("partitions") | not) and
+      (has("desktop") | not) and
+      .boot == {"mode":"install","iso":"live.iso","install_device":"/dev/vda","cmdline":$cmdline,"memory_mb":1024}
+    ' "$INSTALL_JSON" >/dev/null 2>&1; then
+    pass "installer artifact JSON shape and values (jq)"
+  else
+    fail "installer artifact JSON shape and values (jq)"
+  fi
+fi
+
+# A display manager cannot turn an installer ISO graphical: it stays 1024 MB,
+# multi-user, and without a desktop object (headless install contract).
+INSTALL_DM_JSON="$TMP_DIR/artifact-install-dm.json"
+artifact_install_json "$ISO_OUT" "debian-live-xfce-install" "trixie" "" \
+  "x86_64" "$CREATED_AT" apt lightdm xfce4 >"$INSTALL_DM_JSON"
+if [ "$json_backend" = "python3" ]; then
+  if python3 - "$INSTALL_DM_JSON" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    doc = json.load(fh)
+if doc["boot"]["memory_mb"] != 1024:
+    sys.exit("installer memory_mb must stay 1024")
+if "graphical" in doc["boot"]:
+    sys.exit("installer boot must not be graphical")
+if "desktop" in doc:
+    sys.exit("installer artifact must not have a desktop object")
+if doc["boot"]["cmdline"].find("systemd.unit=multi-user.target") < 0:
+    sys.exit("installer cmdline must stay multi-user")
+PY
+  then
+    pass "installer artifact ignores display-manager packages (headless 1024 MB)"
+  else
+    fail "installer artifact changed the headless contract for a DM plan"
+  fi
+else
+  if jq -e '
+      .boot.memory_mb == 1024 and
+      (.boot | has("graphical") | not) and
+      (has("desktop") | not) and
+      (.boot.cmdline | contains("systemd.unit=multi-user.target"))
+    ' "$INSTALL_DM_JSON" >/dev/null 2>&1; then
+    pass "installer artifact ignores display-manager packages (headless 1024 MB) (jq)"
+  else
+    fail "installer artifact changed the headless contract for a DM plan (jq)"
+  fi
+fi
+
+if artifact_install_json "$TMP_DIR/no-such" "spec" "trixie" "" "x86_64" "$CREATED_AT" \
+  "${PACKAGES[@]}" >/dev/null 2>&1; then
+  fail "artifact_install_json must fail without rootfs"
+else
+  pass "artifact_install_json fails without rootfs"
 fi
 
 ISO_DM_JSON="$TMP_DIR/artifact-iso-desktop.json"
@@ -532,6 +678,23 @@ PLAN_PACKAGES_VALUES=(apt)
 assert_eq "xserver-xorg,procps,accountsservice,live-boot,live-boot-initramfs-tools" \
   "$(runtime_packages_for 1 1)" "desktop ISO runtime list keeps desktop then live packages"
 assert_eq "5" "$(runtime_package_count_for 1 1)" "desktop ISO runtime count is 5"
+
+# P0-d3 installer packages are appended after the live runtime list and
+# deduplicated against plan.packages (e2fsprogs is commonly already planned).
+assert_eq "rsync grub-efi-amd64 grub-efi-amd64-bin dosfstools gdisk e2fsprogs" \
+  "${INSTALLER_RUNTIME_PACKAGES[*]}" \
+  "installer runtime packages are rsync/grub/dosfstools/gdisk/e2fsprogs"
+PLAN_PACKAGES_VALUES=(apt e2fsprogs)
+assert_eq "live-boot,live-boot-initramfs-tools,rsync,grub-efi-amd64,grub-efi-amd64-bin,dosfstools,gdisk" \
+  "$(runtime_packages_for 1 0 1)" \
+  "installer runtime packages append after live-boot and dedupe e2fsprogs"
+assert_eq "7" "$(runtime_package_count_for 1 0 1)" \
+  "installer runtime count reflects the deduplicated list"
+PLAN_PACKAGES_VALUES=(apt)
+assert_eq "8" "$(runtime_package_count_for 1 0 1)" \
+  "installer runtime count includes e2fsprogs when the plan omits it"
+assert_eq "live-boot,live-boot-initramfs-tools" "$(runtime_packages_for 1 0 0)" \
+  "installer flag 0 keeps the P0-d2 live runtime list unchanged"
 PLAN_PACKAGES_VALUES=()
 
 # ---------------------------------------------------------------------------

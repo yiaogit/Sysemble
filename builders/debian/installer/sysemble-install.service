@@ -1,0 +1,13 @@
+[Unit]
+Description=Sysemble unattended installer
+ConditionKernelCommandLine=sysemble.install
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/sysemble-install
+TimeoutStartSec=1800
+StandardOutput=journal+console
+
+[Install]
+WantedBy=multi-user.target
