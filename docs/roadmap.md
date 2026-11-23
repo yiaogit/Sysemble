@@ -4,7 +4,7 @@
 
 ## P0 · CLI 闭环（3–4 周）
 
-> **P0-a / P0-b / P0-c1 / P0-d1 / P0-d2 已完成（2026-11-23）**：validate/plan、真实 Debian rootfs、GPT 分区 + GRUB EFI + OVMF 启动（控制台 5 条、XFCE 桌面 8 条断言）、278 MB live ISO（UEFI El Torito + live-boot，6 条断言）；CI `boot-smoke` / `desktop-smoke` / `live-smoke` 均通过。安装器留给 P0-d3。
+> **P0 已完成（2026-11-23）**：validate/plan、真实 Debian rootfs、GPT 分区 + GRUB EFI + OVMF 启动（控制台 5 条、XFCE 桌面 8 条断言）、278 MB live ISO（6 条断言）、无头安装器（安装到空白磁盘并从磁盘启动，5 条断言）。CI `boot-smoke` / `desktop-smoke` / `live-smoke` / `install-smoke` 全过。Calamares UI 与 Arch/Nix 后端进入 P0-e/P1。
 
 **目标**：一条命令从 spec 到可登录的 Debian KDE 桌面。
 
