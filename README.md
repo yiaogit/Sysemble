@@ -4,7 +4,7 @@
 
 Sysemble is a local-first desktop application for composing a complete Linux system — base, desktop, applications, a Windows VM layer, and development environments — from a declarative spec, then building and verifying it on your own machine.
 
-> **Status: design phase (v0.0.1).** This repository currently contains the design, JSON schemas, examples, and a project skeleton. The build engine is **not** implemented yet. See [docs/roadmap.md](docs/roadmap.md).
+> **Status: P0-a (v0.0.1).** `sysemble validate`, `sysemble plan`, and a Debian builder dry-run are implemented and covered by 61 tests. The image build (mmdebstrap → qcow2 → QEMU) is **not** implemented yet. See [docs/roadmap.md](docs/roadmap.md) and the [P0 acceptance report](docs/acceptance/P0.md).
 
 ---
 

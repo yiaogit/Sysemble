@@ -1,0 +1,105 @@
+{
+  "apiVersion": "sysemble/plan/v1",
+  "spec": "debian-kde-dev",
+  "base": {
+    "kind": "debian",
+    "release": "trixie",
+    "pin": "2026-11-01"
+  },
+  "target": {
+    "arch": "x86_64",
+    "outputs": [
+      "qcow2",
+      "iso"
+    ]
+  },
+  "packages": [
+    "apt",
+    "ca-certificates",
+    "calamares",
+    "cargo",
+    "console-setup",
+    "cryptsetup",
+    "curl",
+    "dbus",
+    "distrobox",
+    "dolphin",
+    "e2fsprogs",
+    "firefox-esr",
+    "freerdp2-x11",
+    "git",
+    "initramfs-tools",
+    "kde-config-screenlocker",
+    "kmod",
+    "konsole",
+    "libreoffice",
+    "libvirt-daemon-system",
+    "linux-image-amd64",
+    "locales",
+    "nftables",
+    "nodejs",
+    "npm",
+    "ovmf",
+    "plasma-desktop",
+    "plasma-workspace",
+    "podman",
+    "python3",
+    "python3-pip",
+    "python3-venv",
+    "qemu-system-x86",
+    "sddm",
+    "sudo",
+    "swtpm",
+    "systemd",
+    "systemd-sysv",
+    "tzdata",
+    "udev",
+    "unattended-upgrades",
+    "vim",
+    "vlc"
+  ],
+  "modules": [
+    {
+      "id": "base-debian",
+      "version": "0.1.0"
+    },
+    {
+      "id": "desktop-plasma",
+      "version": "0.1.0"
+    },
+    {
+      "id": "windows-remoteapp",
+      "version": "0.1.0"
+    },
+    {
+      "id": "dev-python",
+      "version": "0.1.0"
+    },
+    {
+      "id": "dev-node",
+      "version": "0.1.0"
+    },
+    {
+      "id": "dev-rust",
+      "version": "0.1.0"
+    },
+    {
+      "id": "security",
+      "version": "0.1.0"
+    },
+    {
+      "id": "containers",
+      "version": "0.1.0"
+    },
+    {
+      "id": "installer",
+      "version": "0.1.0"
+    }
+  ],
+  "estimates": {
+    "image_mb": 5280,
+    "build_minutes": 50,
+    "disk_mb": 11584
+  },
+  "warnings": []
+}

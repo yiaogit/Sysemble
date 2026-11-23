@@ -1,9 +1,15 @@
 [package]
 name = "sysemble-core"
-description = "Core types and state machine for Sysemble"
+description = "Core spec model, validation, planning, and state machine for Sysemble"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+thiserror = "2"
+
+[dev-dependencies]
+serde_json = "1"

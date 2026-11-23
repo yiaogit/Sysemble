@@ -12,3 +12,4 @@ path = "src/main.rs"
 
 [dependencies]
 sysemble-core = { path = "../sysemble-core" }
+serde_json = "1"

@@ -1,8 +1,33 @@
 //! Core types for Sysemble.
 //!
-//! The build engine is not implemented yet. This crate currently holds the
-//! state machine that the engine will enforce, so the rules can be reviewed
-//! and tested before any build code exists.
+//! This crate owns the parts of the system that must be reviewable without a
+//! build sandbox:
+//!
+//! - the [`BuildSpec`] model, mirroring `spec/buildspec.schema.json`;
+//! - [`load_spec`] for reading YAML/JSON specs;
+//! - [`validate_spec`], which turns a spec into stable, path-addressed
+//!   [`Diagnostic`]s;
+//! - [`resolve_plan`], which turns a valid spec into a deterministic [`Plan`];
+//! - the [`Stage`] state machine the engine will enforce.
+//!
+//! The build engine itself is not implemented yet. Plans are data: nothing in
+//! this crate writes to the host, runs a builder, or performs network IO.
+
+mod error;
+mod loader;
+mod model;
+mod packages;
+mod plan;
+mod validate;
+
+pub use error::{PlanError, SpecError};
+pub use loader::load_spec;
+pub use model::*;
+pub use plan::{
+    resolve_plan, Estimates, Plan, PlanBase, PlanModule, PlanTarget, PlanWarning, MODULE_VERSION,
+    PLAN_API_VERSION,
+};
+pub use validate::{codes, validate_spec, Diagnostic, Severity};
 
 /// Crate version, wired to `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
