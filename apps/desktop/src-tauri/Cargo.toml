@@ -1,0 +1,30 @@
+[package]
+name = "sysemble-desktop"
+description = "Tauri desktop shell for Sysemble (P1-a: load spec, validate, plan)"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/yiaogit/Sysemble"
+
+# This package deliberately belongs to its own workspace. Keeping Tauri out of
+# the root workspace means `cargo test` at the repository root never has to
+# compile a WebView stack.
+[workspace]
+
+[lib]
+name = "sysemble_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+sysemble-core = { path = "../../../crates/sysemble-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.dev]
+# Keeping debug symbols out of the WebView stack keeps the first cold build
+# (and the resulting binary) much smaller; P1-a is a shell, not a debugger target.
+debug = 0

@@ -549,6 +549,7 @@ while IFS= read -r line; do
       crates/sysemble-core/* | crates/sysemble-cli/* | \
       builders/* | docs/plan/* | \
       tools/* | .github/workflows/* | examples/minimal-debian.yaml | examples/debian-xfce.yaml | examples/minimal-debian-live.yaml | \
+      apps/desktop/* | \
       tests/acceptance/* | docs/acceptance/*)
       ;;
     *)

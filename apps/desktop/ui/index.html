@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Sysemble</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header class="toolbar">
+      <div class="toolbar-row brand-row">
+        <div class="brand">
+          <span class="logo" aria-hidden="true"></span>
+          <div class="brand-text">
+            <h1>Sysemble</h1>
+            <p>Desktop shell &middot; spec &rarr; plan</p>
+          </div>
+        </div>
+        <div id="status" class="status" role="status" aria-live="polite">Ready</div>
+      </div>
+
+      <div class="toolbar-row path-row">
+        <label class="path-field" for="spec-path">
+          <span class="path-label">spec</span>
+          <input
+            id="spec-path"
+            type="text"
+            value="examples/debian-xfce.yaml"
+            spellcheck="false"
+            autocomplete="off"
+            autocapitalize="off"
+          />
+        </label>
+        <div class="actions">
+          <button id="load-btn" class="button" type="button">Load</button>
+          <button id="validate-btn" class="button" type="button">Validate</button>
+          <button id="plan-btn" class="button primary" type="button">Plan</button>
+        </div>
+      </div>
+    </header>
+
+    <div id="bridge-warning" class="banner" hidden>
+      <strong>Browser preview.</strong> <code>window.__TAURI__</code> is missing, so
+      <strong>Load</strong>, <strong>Validate</strong>, and <strong>Plan</strong> are
+      disabled. Launch the desktop window with
+      <code>cargo run --manifest-path apps/desktop/src-tauri/Cargo.toml</code> from the
+      repository root, or with <code>cargo tauri dev</code>.
+    </div>
+
+    <main class="panes">
+      <section class="pane spec-pane" aria-labelledby="spec-heading">
+        <div class="pane-head">
+          <h2 id="spec-heading">Spec</h2>
+          <span id="spec-meta" class="meta">not loaded</span>
+        </div>
+        <pre id="spec-source" class="source">Load a spec to see its YAML here.</pre>
+      </section>
+
+      <aside class="pane detail-pane" aria-label="Validation and plan">
+        <div class="pane-head">
+          <h2>Diagnostics</h2>
+          <span id="diagnostics-meta" class="meta">not run</span>
+        </div>
+        <div id="diagnostics" class="stack">
+          <p class="empty">Run <strong>Validate</strong> to check the spec.</p>
+        </div>
+
+        <div class="pane-head section-gap">
+          <h2>Plan</h2>
+          <span id="plan-meta" class="meta">not run</span>
+        </div>
+        <div id="plan" class="stack">
+          <p class="empty">Run <strong>Plan</strong> to resolve packages and estimates.</p>
+        </div>
+      </aside>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>
