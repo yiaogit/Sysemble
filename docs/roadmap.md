@@ -4,7 +4,7 @@
 
 ## P0 · CLI 闭环（3–4 周）
 
-> **P0-a / P0-b / P0-c1 已完成（2026-11-23）**：validate/plan、真实 Debian rootfs、GPT 分区（ESP + ext4 root）、GRUB EFI、OVMF/UEFI 启动 + 5 条断言；CI `boot-smoke` 通过。安装器/桌面留给 P0-d。
+> **P0-a / P0-b / P0-c1 / P0-d1 已完成（2026-11-23）**：validate/plan、真实 Debian rootfs、GPT 分区（ESP + ext4 root）、GRUB EFI、OVMF/UEFI 启动（控制台 5 条断言；XFCE 桌面 8 条断言）；CI `boot-smoke` 与 `desktop-smoke` 均通过。live ISO/安装器留给 P0-d2/d3。
 
 **目标**：一条命令从 spec 到可登录的 Debian KDE 桌面。
 

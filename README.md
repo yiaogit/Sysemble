@@ -4,7 +4,7 @@
 
 Sysemble is a local-first desktop application for composing a complete Linux system — base, desktop, applications, a Windows VM layer, and development environments — from a declarative spec, then building and verifying it on your own machine.
 
-> **Status: P0-c1 (v0.0.1).** `validate`, `plan`, a real Debian build, GPT partitioning (ESP + ext4 root), GRUB EFI, and an OVMF/UEFI boot check with five serial-console assertions run end to end in CI. Next: the installer and a desktop image. See [docs/roadmap.md](docs/roadmap.md) and the acceptance reports for [P0-a](docs/acceptance/P0.md), [P0-b](docs/acceptance/P0-b.md), and [P0-c1](docs/acceptance/P0-c.md).
+> **Status: P0-d1 (v0.0.1).** `validate`, `plan`, a real Debian build, GPT partitioning, GRUB EFI, and OVMF/UEFI boot with console or XFCE-desktop assertions all run end to end in CI. Next: a live ISO and the installer. See [docs/roadmap.md](docs/roadmap.md) and the acceptance reports for [P0-a](docs/acceptance/P0.md), [P0-b](docs/acceptance/P0-b.md), [P0-c1](docs/acceptance/P0-c.md), and [P0-d1](docs/acceptance/P0-d1.md).
 
 ---
 
