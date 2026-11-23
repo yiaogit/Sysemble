@@ -547,10 +547,11 @@ build_native() {
     graphical=0
   fi
 
-  # A desktop plan needs two runtime packages the plan itself does not name:
-  # the X server (only a Recommends in xfce4/lightdm) and procps (pgrep for the
-  # boot evidence unit, not part of --variant=minbase). artifact.packages stays
-  # the plan package list; these are build-time dependencies.
+  # A desktop plan needs three runtime packages the plan itself does not name:
+  # the X server (only a Recommends in xfce4/lightdm), procps (pgrep for the
+  # boot evidence unit, not part of --variant=minbase), and accountsservice
+  # (LightDM's greeter user list; only a Suggests in lightdm). artifact.packages
+  # stays the plan package list; these are builder-added runtime packages.
   include_csv=$pkg_csv
   runtime_count=0
   if [ "$graphical" -eq 1 ]; then
@@ -589,7 +590,7 @@ build_native() {
   if [ "$graphical" -eq 1 ]; then
     blog "[build] stage 4/6: install packages - $PKG_COUNT plan + $runtime_count desktop runtime packages via --include"
     blog "[build] desktop: session=$desktop_session, display_manager=$desktop_dm (graphical boot, ${ARTIFACT_BOOT_MEMORY_MB_GRAPHICAL} MB)"
-    blog "[build] desktop runtime: add ${GRAPHICAL_RUNTIME_PACKAGES[*]} to --include (Xorg + pgrep)"
+    blog "[build] desktop runtime: add ${GRAPHICAL_RUNTIME_PACKAGES[*]} to --include (Xorg + pgrep + Accounts)"
     blog "[build] boot evidence: install /etc/systemd/system/sysemble-boot-evidence.service (enabled for graphical.target)"
   else
     blog "[build] stage 4/6: install packages - $PKG_COUNT packages via --include"

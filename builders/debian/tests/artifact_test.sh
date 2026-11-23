@@ -272,6 +272,8 @@ else
 fi
 boot_evidence_service_text sddm >"$EVIDENCE_SDDM"
 boot_evidence_service_text gdm >"$EVIDENCE_GDM"
+assert_eq "xserver-xorg procps accountsservice" "${GRAPHICAL_RUNTIME_PACKAGES[*]}" \
+  "graphical runtime packages are xserver-xorg, procps, and accountsservice"
 assert_contains "Description=Sysemble boot evidence markers" "$EVIDENCE_LIGHTDM" \
   "evidence unit has the Sysemble description"
 assert_contains "After=graphical.target" "$EVIDENCE_LIGHTDM" \
@@ -291,6 +293,16 @@ assert_not_contains "SYMBLE: gdm ready" "$EVIDENCE_GDM" \
   "gdm marker uses gdm3, not the artifact string gdm"
 assert_contains "pgrep -x Xorg" "$EVIDENCE_LIGHTDM" \
   "evidence unit probes the Xorg process"
+assert_contains 'i=0; while [ $$i -lt 60 ]' "$EVIDENCE_LIGHTDM" \
+  "evidence unit retries the markers for up to 60 seconds"
+assert_contains 'i=$$((i+1)); sleep 1' "$EVIDENCE_LIGHTDM" \
+  "evidence unit waits one second between marker polls"
+assert_not_contains 'while [ $i -lt 60 ]' "$EVIDENCE_LIGHTDM" \
+  "evidence unit escapes systemd dollar substitution in the loop condition"
+assert_not_contains 'i=$((i+1))' "$EVIDENCE_LIGHTDM" \
+  "evidence unit escapes systemd dollar substitution in the loop increment"
+assert_contains "TimeoutStartSec=90" "$EVIDENCE_LIGHTDM" \
+  "evidence unit has a 90 second systemd start timeout"
 assert_fails "boot_evidence_service_text rejects an unknown display manager" \
   boot_evidence_service_text nope
 

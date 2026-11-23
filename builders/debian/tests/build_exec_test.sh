@@ -15,9 +15,9 @@
 #     desktop object, graphical=true, memory_mb=2048, and a graphical.target +
 #     journald-forwarding cmdline; grub.cfg and artifact.json agree byte for
 #     byte
-#   - P0-d1: a graphical build adds xserver-xorg/procps and installs + enables
-#     the sysemble-boot-evidence.service marker unit; a no-DM build adds none
-#     of them
+#   - P0-d1: a graphical build adds xserver-xorg/procps/accountsservice and
+#     installs + enables the sysemble-boot-evidence.service marker unit; a no-DM
+#     build adds none of them
 #   - P0-d1: a no-DM plan keeps graphical=false, memory_mb=1024, no desktop
 #     object, and the frozen multi-user cmdline; grub.cfg agrees
 #   - failure cleanup keeps rootfs + disk.img + build.log, removes esp.img and
@@ -671,6 +671,16 @@ assert_contains "SYMBLE: sddm ready" "$EVIDENCE_UNIT" \
   "evidence unit contains the actual sddm marker"
 assert_contains "pgrep -x Xorg" "$EVIDENCE_UNIT" \
   "evidence unit probes the Xorg process"
+assert_contains 'i=0; while [ $$i -lt 60 ]' "$EVIDENCE_UNIT" \
+  "evidence unit retries the markers for up to 60 seconds"
+assert_contains 'i=$$((i+1)); sleep 1' "$EVIDENCE_UNIT" \
+  "evidence unit waits one second between marker polls"
+assert_not_contains 'while [ $i -lt 60 ]' "$EVIDENCE_UNIT" \
+  "evidence unit escapes systemd dollar substitution in the loop condition"
+assert_not_contains 'i=$((i+1))' "$EVIDENCE_UNIT" \
+  "evidence unit escapes systemd dollar substitution in the loop increment"
+assert_contains "TimeoutStartSec=90" "$EVIDENCE_UNIT" \
+  "evidence unit has a 90 second systemd start timeout"
 assert_contains "WantedBy=graphical.target" "$EVIDENCE_UNIT" \
   "evidence unit is wanted by graphical.target"
 if [ -L "$EVIDENCE_LINK" ] &&
@@ -719,8 +729,8 @@ fi
 OUT1_ABS=$(cd "$OUT1" && pwd -P)
 assert_contains "serial-getty@ttyS0.service" "$CALLS" "hook enables serial-getty@ttyS0.service"
 assert_contains "include=apt,ca-certificates" "$CALLS" "mmdebstrap received the plan package list"
-assert_contains "xserver-xorg,procps" "$CALLS" \
-  "graphical mmdebstrap adds xserver-xorg and procps for Xorg/pgrep"
+assert_contains "xserver-xorg,procps,accountsservice" "$CALLS" \
+  "graphical mmdebstrap adds xserver-xorg, procps, and accountsservice"
 assert_contains "sgdisk -Z $OUT1_ABS/disk.img" "$CALLS" "sgdisk -Z wiped disk.img"
 assert_contains "sgdisk -n 1:2048:+512M -t 1:ef00 -n 2:0:0 -t 2:8300 $OUT1_ABS/disk.img" "$CALLS" \
   "sgdisk created the frozen GPT ESP+root layout"
@@ -833,6 +843,8 @@ assert_not_contains "xserver-xorg" "$NODM_CALLS" \
   "no-DM mmdebstrap does not add the graphical Xorg runtime package"
 assert_not_contains "procps" "$NODM_CALLS" \
   "no-DM mmdebstrap does not add the graphical procps runtime package"
+assert_not_contains "accountsservice" "$NODM_CALLS" \
+  "no-DM mmdebstrap does not add the graphical accountsservice runtime package"
 assert_not_contains "boot evidence:" "$OUT_NODM/build.log" \
   "no-DM build.log does not record a boot evidence unit"
 

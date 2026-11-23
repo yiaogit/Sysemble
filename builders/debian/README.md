@@ -202,8 +202,9 @@ rm -f <out>/esp.img
 qemu-img convert -O qcow2 <out>/disk.img <out>/disk.qcow2
 ```
 
-For a graphical plan the `--include` list gains `,xserver-xorg,procps` and the
-customize hook also installs/enables the boot evidence unit described above.
+For a graphical plan the `--include` list gains
+`,xserver-xorg,procps,accountsservice` and the customize hook also
+installs/enables the boot evidence unit described above.
 
 All stage messages and all command stdout/stderr are teed to
 `<out>/build.log`.
@@ -306,12 +307,13 @@ The builder reads only `plan.packages`; `desktop` in the spec is not required
 - The 18-package XFCE plan (`xfce4`, `lightdm`, `thunar`,
   `xfce4-terminal`, ...) infers `session=xfce`, `display_manager=lightdm`.
 
-A graphical build also adds two packages that the plan does not name:
+A graphical build also adds three packages that the plan does not name:
 
 | Runtime package | Why |
 |---|---|
 | `xserver-xorg` | `xfce4` and `lightdm` only **Recommend** the X server, and mmdebstrap installs no Recommends. Without it LightDM cannot start Xorg. |
 | `procps` | Provides `pgrep` for the boot evidence unit. procps is `Priority: important`, so `--variant=minbase` does not install it. |
+| `accountsservice` | Provides `org.freedesktop.Accounts`, which LightDM uses for the greeter user list. It is only a **Suggests** of lightdm, so it is not installed by default. |
 
 These packages are appended to `--include` only for graphical plans.
 `artifact.packages` stays the plan package list; no-DM builds keep the exact
@@ -332,11 +334,21 @@ After=graphical.target
 
 [Service]
 Type=oneshot
-ExecStart=/bin/sh -c 'pgrep -x Xorg ... && echo "SYMBLE: Xorg ready" > /dev/ttyS0; (...) && echo "SYMBLE: lightdm ready" > /dev/ttyS0; true'
+ExecStart=/bin/sh -c 'i=0; while [ $$i -lt 60 ]; do if pgrep -x Xorg ...; then echo "SYMBLE: Xorg ready" > /dev/ttyS0; break; fi; i=$$((i+1)); sleep 1; done; ... echo "SYMBLE: lightdm ready" ...; true'
+TimeoutStartSec=90
 
 [Install]
 WantedBy=graphical.target
 ```
+
+`$$` is required because systemd consumes one `$` in `ExecStart=` environment
+substitution; the shell receives the intended `$i` / `$((i+1))` loop. Both
+markers are polled once per second for up to 60 seconds. This matters because
+`graphical.target` can be reached before LightDM has spawned the greeter/Xorg
+session; the P0-d1 CI run showed `SYMBLE: lightdm ready` at 17 s but Xorg
+starting only around 23 s. The oneshot exits 0 (trailing `true`) and never
+blocks the boot transaction, though a missing marker can keep the unit running
+for up to 60 s after the target.
 
 The marker names the real Debian process (`lightdm`, `sddm`, or `gdm3` for the
 artifact's `gdm`), so boot-check's existing `boot.xorg` (`Xorg`) and
@@ -531,10 +543,11 @@ acceptance.
    slow or fail to start. `systemd.journald.forward_to_console=1` is what makes
    the LightDM/Xorg failure (or success) visible in `boot.log`; the P0-d1
    workplan allows falling back to `-vga std` or `nomodeset` if needed.
-   The boot evidence unit re-checks Xorg/display-manager processes and prints
-   `SYMBLE:` markers, which is more reliable than parsing LightDM's redirected
-   Xorg log. It runs only after `graphical.target`; if the target itself fails,
-   the usual five boot assertions still report the failure.
+   The boot evidence unit polls Xorg/display-manager processes for up to 60 s
+   after `graphical.target` and prints `SYMBLE:` markers, which is more reliable
+   than parsing LightDM's redirected Xorg log. `TimeoutStartSec=90` bounds the
+   start job; if Xorg never appears, `boot.xorg` still fails and the usual five
+   boot assertions report the failure.
 
 ## Local checks
 
@@ -550,10 +563,10 @@ bash builders/debian/build.sh \
   --out /tmp/sysemble-dry --dry-run
 
 # Offline artifact manifest tests (fixture rootfs + real sha256)
-bash builders/debian/tests/artifact_test.sh        # 68 checks
+bash builders/debian/tests/artifact_test.sh        # 74 checks
 
 # Offline native --execute command-sequence test (fake UEFI toolchain)
-bash builders/debian/tests/build_exec_test.sh      # 110 checks
+bash builders/debian/tests/build_exec_test.sh      # 116 checks
 
 # On macOS, without --dry-run, the native preflight is expected to exit 3
 bash builders/debian/build.sh \

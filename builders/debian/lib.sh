@@ -182,10 +182,11 @@ P0-d1 scope: GPT partition table, FAT32 ESP, GRUB EFI (embedded config), UEFI
 artifact extensions, and desktop inference from plan.packages. A plan whose
 packages include gdm3/sddm/lightdm boots graphical.target with 2048 MB and gains
 artifact.desktop + boot.graphical/memory_mb; the rootfs also gets xserver-xorg,
-procps, and an enabled sysemble-boot-evidence.service marker unit. A plan
-without a display manager keeps the frozen P0-c multi-user cmdline and 1024 MB.
-Installers, ISO/squashfs, secure boot, and cross-architecture builds are out of
-scope. An artifact without boot.mode still means the P0-b direct-kernel mode.
+procps, accountsservice, and an enabled sysemble-boot-evidence.service marker
+unit. A plan without a display manager keeps the frozen P0-c multi-user cmdline
+and 1024 MB. Installers, ISO/squashfs, secure boot, and cross-architecture
+builds are out of scope. An artifact without boot.mode still means the P0-b
+direct-kernel mode.
 USAGE
 
 usage() {
@@ -892,12 +893,14 @@ detect_desktop_session() {
 }
 
 # Packages the builder adds to a graphical build beyond plan.packages:
-#   xserver-xorg  xfce4/lightdm only *Recommend* the X server and mmdebstrap
-#                 installs no Recommends, so Xorg would otherwise be absent;
-#   procps        provides pgrep, which the boot evidence unit uses. procps is
-#                 Priority:important, so --variant=minbase does not install it.
+#   xserver-xorg   xfce4/lightdm only *Recommend* the X server and mmdebstrap
+#                  installs no Recommends, so Xorg would otherwise be absent;
+#   procps         provides pgrep, which the boot evidence unit polls. procps
+#                  is Priority:important, so --variant=minbase omits it;
+#   accountsservice provides org.freedesktop.Accounts, which LightDM uses for
+#                  the greeter user list (only a Suggests in lightdm).
 # No-DM builds keep the frozen P0-c package list unchanged.
-GRAPHICAL_RUNTIME_PACKAGES=(xserver-xorg procps)
+GRAPHICAL_RUNTIME_PACKAGES=(xserver-xorg procps accountsservice)
 
 # Debian process name for an artifact display_manager value. gdm3 is the
 # package/process name for the "gdm" display manager.
@@ -921,7 +924,9 @@ desktop_manager_process_name() {
 # LightDM redirects Xorg's stdout to /var/log/lightdm/x-0.log, so journald
 # console forwarding alone does not guarantee an "Xorg" line on the serial
 # console. This oneshot unit deliberately writes the boot-check marker words
-# (Xorg plus the real display-manager process name) to /dev/ttyS0.
+# (Xorg plus the real display-manager process name) to /dev/ttyS0. Each marker
+# is polled for up to 60 seconds because graphical.target can be reached before
+# LightDM has spawned the greeter/Xorg session.
 boot_evidence_service_text() {
   local display_manager=$1
   local process=""
@@ -934,7 +939,8 @@ boot_evidence_service_text() {
   printf '\n'
   printf '[Service]\n'
   printf 'Type=oneshot\n'
-  printf "ExecStart=/bin/sh -c 'pgrep -x Xorg >/dev/null 2>&1 && echo \"SYMBLE: Xorg ready\" > /dev/ttyS0; (pgrep -x lightdm >/dev/null 2>&1 || pgrep -x sddm >/dev/null 2>&1 || pgrep -x gdm3 >/dev/null 2>&1) && echo \"SYMBLE: %s ready\" > /dev/ttyS0; true'\n" "$process"
+  printf "ExecStart=/bin/sh -c 'i=0; while [ \$\$i -lt 60 ]; do if pgrep -x Xorg >/dev/null 2>&1; then echo \"SYMBLE: Xorg ready\" > /dev/ttyS0; break; fi; i=\$\$((i+1)); sleep 1; done; i=0; while [ \$\$i -lt 60 ]; do if pgrep -x lightdm >/dev/null 2>&1 || pgrep -x sddm >/dev/null 2>&1 || pgrep -x gdm3 >/dev/null 2>&1; then echo \"SYMBLE: %s ready\" > /dev/ttyS0; break; fi; i=\$\$((i+1)); sleep 1; done; true'\n" "$process"
+  printf 'TimeoutStartSec=90\n'
   printf '\n'
   printf '[Install]\n'
   printf 'WantedBy=graphical.target\n'
