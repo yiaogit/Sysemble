@@ -4,6 +4,8 @@
 
 ## P0 · CLI 闭环（3–4 周）
 
+> **P0-a / P0-b 已完成（2026-11-23）**：validate/plan、真实 Debian rootfs、ext4 磁盘、qcow2、QEMU 启动 + 3 条断言；CI `boot-smoke` 通过。分区/引导/安装器留给 P0-c。
+
 **目标**：一条命令从 spec 到可登录的 Debian KDE 桌面。
 
 - `buildspec.yaml` + JSON Schema + `sysemble validate`
