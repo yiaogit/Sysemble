@@ -1598,6 +1598,26 @@ if cmp -s "$INSTALL_SCRIPT" "$BUILDER_DIR/installer/sysemble-install.sh"; then
 else
   fail "installed installer script differs from the source"
 fi
+assert_contains 'grub-mkstandalone -O x86_64-efi' "$INSTALL_SCRIPT" \
+  "baked installer builds a self-contained EFI image with grub-mkstandalone"
+assert_contains 'GRUB_EFI_DIR="$MNT/boot/efi/EFI/BOOT"' "$INSTALL_SCRIPT" \
+  "baked installer targets the ESP path /EFI/BOOT"
+assert_contains 'GRUB_EFI_MODULES="part_gpt fat ext2 normal linux search search_fs_uuid configfile serial terminal echo test"' \
+  "$INSTALL_SCRIPT" "baked installer embeds the frozen module set"
+assert_contains '"boot/grub/grub.cfg=$GRUB_CFG"' "$INSTALL_SCRIPT" \
+  "baked installer embeds its generated grub.cfg"
+assert_contains 'search --no-floppy --fs-uuid --set=root' "$INSTALL_SCRIPT" \
+  "baked installer grub.cfg searches by filesystem UUID"
+assert_contains 'insmod serial' "$INSTALL_SCRIPT" \
+  "baked installer grub.cfg loads the serial module"
+assert_contains 'set timeout=3' "$INSTALL_SCRIPT" \
+  "baked installer grub.cfg sets the boot timeout"
+assert_contains 'linux /boot/%s root=UUID=%s rw console=ttyS0 systemd.unit=multi-user.target' \
+  "$INSTALL_SCRIPT" "baked installer grub.cfg has the installed kernel cmdline"
+assert_contains 'initrd /boot/%s' "$INSTALL_SCRIPT" \
+  "baked installer grub.cfg loads the installed initrd"
+assert_not_contains "grub-install" "$INSTALL_SCRIPT" \
+  "baked installer no longer depends on grub-install"
 if cmp -s "$INSTALL_UNIT" "$BUILDER_DIR/installer/sysemble-install.service"; then
   pass "installed unit is byte-identical to builders/debian/installer/sysemble-install.service"
 else
@@ -1757,6 +1777,12 @@ if cmp -s "$TUI_INSTALL_SCRIPT" "$BUILDER_DIR/installer/sysemble-install.sh"; th
 else
   fail "TUI installed installer script differs from the source"
 fi
+assert_contains 'grub-mkstandalone -O x86_64-efi' "$TUI_INSTALL_SCRIPT" \
+  "TUI installer uses the shared self-contained EFI build"
+assert_contains 'boot/grub/grub.cfg=$GRUB_CFG' "$TUI_INSTALL_SCRIPT" \
+  "TUI installer embeds its generated grub.cfg"
+assert_not_contains "grub-install" "$TUI_INSTALL_SCRIPT" \
+  "TUI installer no longer depends on grub-install"
 if cmp -s "$TUI_INSTALL_UNIT" "$BUILDER_DIR/installer/sysemble-install.service"; then
   pass "TUI installed unit is byte-identical to the shared installer unit"
 else

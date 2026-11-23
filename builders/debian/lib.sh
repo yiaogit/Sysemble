@@ -118,8 +118,9 @@ INSTALLER_TUI_KERNEL_PARAM="sysemble.install.tui"
 INSTALLER_TUI_MARKER="sysemble.install.tui=1"
 # Packages the installer needs inside the live rootfs (and therefore inside the
 # installed system after rsync): rsync for the copy, grub-efi-amd64(+bin) for
-# grub-install, dosfstools for mkfs.vfat, gdisk for sgdisk, e2fsprogs for
-# mkfs.ext4/blkid. Deduplicated against plan.packages.
+# the self-contained grub-mkstandalone EFI binary (grub-common, which provides
+# the tool, is pulled in as a dependency), dosfstools for mkfs.vfat, gdisk for
+# sgdisk, e2fsprogs for mkfs.ext4/blkid. Deduplicated against plan.packages.
 INSTALLER_RUNTIME_PACKAGES=(rsync grub-efi-amd64 grub-efi-amd64-bin dosfstools gdisk e2fsprogs)
 
 # docker info is given this long before it is treated as unavailable, so the

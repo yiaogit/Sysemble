@@ -485,14 +485,18 @@ cmdline does not contain the parameter). The installer script then:
 3. formats `mkfs.vfat -F 32 -n ESP <dev>1` and
    `mkfs.ext4 -F -L SYMBLE <dev>2`;
 4. mounts root at `/mnt`, ESP at `/mnt/boot/efi`, and bind-mounts `/proc`,
-   `/sys`, `/dev`, `/run` into the target for `grub-install`;
+   `/sys`, `/dev`, `/run` into the target for the chroot user/password setup;
 5. copies the live root with
    `rsync -aHAX --exclude={/proc,/sys,/dev,/run,/tmp,/mnt,/media,/live,/lost+found} / /mnt/`;
 6. writes `/etc/fstab` from the two UUIDs;
-7. runs
-   `chroot /mnt grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=sysemble --removable --no-nvram`
-   and writes `/boot/grub/grub.cfg` (`search --fs-uuid`, the installed
-   kernel/initrd, `root=UUID=... rw console=ttyS0 systemd.unit=multi-user.target`);
+7. writes `/boot/grub/grub.cfg` (`search --fs-uuid`, the installed
+   kernel/initrd, `root=UUID=... rw console=ttyS0 systemd.unit=multi-user.target`)
+   and builds a **self-contained** EFI binary with
+   `grub-mkstandalone -O x86_64-efi --modules="part_gpt fat ext2 normal linux search search_fs_uuid configfile serial terminal echo test" "boot/grub/grub.cfg=/mnt/boot/grub/grub.cfg" -o /mnt/boot/efi/EFI/BOOT/BOOTX64.EFI`.
+   The modules and config are embedded, so the firmware fallback
+   `EFI/BOOT/BOOTX64.EFI` never tries to load `/boot/grub/x86_64-efi` from the
+   root partition (the P0-d3 `grub-install --removable` core did, which caused
+   `grub rescue: file '/boot/grub/x86_64-efi/normal.mod' not found`);
 8. unmounts, prints `SYMBLE: install complete` to `/dev/ttyS0` via `tee`, and
    runs `systemctl poweroff -f`.
 
@@ -923,11 +927,13 @@ acceptance.
     the CI install job budgets 40 minutes. If the job times out, reduce the
     rootfs package set or raise the job timeout; do not shorten
     `TimeoutStartSec` below the observed install time.
-14. `grub-install` runs inside the chroot and needs the `/proc`, `/sys`, `/dev`,
-    and `/run` bind mounts; without them it can fail while probing the EFI
-    platform. The script mounts and always unmounts them (including on error).
-    `--removable` writes `EFI/BOOT/BOOTX64.EFI`, which is what OVMF boots from
-    the installed GPT ESP; `--no-nvram` avoids touching host/guest efivars.
+14. The installed ESP gets a self-contained `grub-mkstandalone` binary at
+    `EFI/BOOT/BOOTX64.EFI` with the module set and grub.cfg embedded; it no
+    longer relies on `grub-install --removable` or a `/boot/grub/x86_64-efi`
+    directory on the root partition. The `/proc`, `/sys`, `/dev`, and `/run`
+    bind mounts are kept for the chroot user/password setup and are always
+    unmounted, including on error. The real OVMF handoff is only proved by CI;
+    local tests assert the EFI target path, module list, and embedded cfg text.
 15. The installer targets `/dev/vda` (frozen). A different device can be passed
     on the live cmdline (`sysemble.install=/dev/...`), but only whole disks with
     predictable `<dev>1`/`<dev>2` (or nvme/mmcblk `p1`/`p2`) names are
@@ -970,10 +976,10 @@ bash builders/debian/build.sh --plan /tmp/live-plan.json --out /tmp/p0d2-dry --d
 bash builders/debian/tests/artifact_test.sh        # 131 checks
 
 # Offline native --execute command-sequence tests (fake disk + ISO toolchain)
-bash builders/debian/tests/build_exec_test.sh      # 299 checks
+bash builders/debian/tests/build_exec_test.sh      # 312 checks
 
 # Offline installer static + dynamic dry-run tests (no partition/mount)
-bash builders/debian/tests/installer_test.sh       # 191 checks
+bash builders/debian/tests/installer_test.sh       # 201 checks
 
 # Installer ISO dry run (P0-d3)
 bash builders/debian/build.sh --plan /tmp/live-plan.json \
@@ -1089,7 +1095,7 @@ disk whose login prompt is `sysemble-tui login:`.
 |---|---|
 | `build.sh` | CLI, output directory handling, dry run, mode-aware native GPT/ESP/GRUB/UEFI and live ISO pipelines, the P0-d3/P0-e1 installer ISO, docker rootfs bootstrap. |
 | `lib.sh` | JSON backends, record parsing, plan validation, mode-aware preflight, disk sizing, disk/ISO GRUB rendering, P0-d1 desktop inference/runtime packages/boot evidence unit, P0-d2 ISO + P0-d3/P0-e1 installer artifact helpers, usage text. |
-| `installer/sysemble-install.sh` | Guest installer: unattended backend + serial TUI wizard; GPT + ESP/ext4, rsync root, fstab, hostname/hosts/user/password, grub-install `--removable`, serial markers, poweroff on success / stay-alive on failure. Testable via `SYMBLE_*` overrides, pipe input, and `--dry-run`. |
+| `installer/sysemble-install.sh` | Guest installer: unattended backend + serial TUI wizard; GPT + ESP/ext4, rsync root, fstab, hostname/hosts/user/password, self-contained `grub-mkstandalone` EFI with embedded cfg, serial markers, poweroff on success / stay-alive on failure. Testable via `SYMBLE_*` overrides, pipe input, and `--dry-run`. |
 | `installer/sysemble-install.service` | Frozen `sysemble-install.service` oneshot (ConditionKernelCommandLine, 1800 s, WantedBy multi-user.target). |
 | `tests/artifact_test.sh` | Offline fixture tests for `artifact_json` (UEFI no-DM + graphical + P0-b fallback), `artifact_iso_json` (iso-only, graphical, iso+disk), `artifact_install_json`/`artifact_install_tui_json`, ISO/installer GRUB text, plan output mode selection, desktop inference, boot evidence unit, installer runtime packages, kernel/initrd selection, hashing, and disk sizing. |
 | `tests/build_exec_test.sh` | Offline fake-toolchain end-to-end tests of the native `--execute` disk/ISO/installer/TUI-installer command sequences, arguments, GRUB configs, include lists, baked installer script/unit/symlink/drop-in, mode-aware preflight, artifacts, and failure cleanup. |

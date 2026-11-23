@@ -25,8 +25,9 @@
 #   - creates GPT: p1 ESP (512 MiB, ef00), p2 root (rest, 8300)
 #   - formats the ESP (vfat32/ESP) and root (ext4/SYMBLE)
 #   - copies the live system with rsync, writes /etc/fstab, /etc/hostname,
-#     /etc/hosts, creates the user and sets/locks the password, and installs
-#     GRUB to the ESP with --removable
+#     /etc/hosts, creates the user and sets/locks the password, then writes a
+#     self-contained GRUB EFI binary (grub-mkstandalone with embedded modules
+#     and grub.cfg) to the ESP at /EFI/BOOT/BOOTX64.EFI
 #   - on success prints "SYMBLE: install complete" and powers off; on failure
 #     prints "SYMBLE: install failed: <reason>" and exits 1 WITHOUT powering
 #     off so the live journal/console can be inspected.
@@ -871,7 +872,7 @@ log "root UUID: $ROOT_UUID"
 log "ESP UUID:  $ESP_UUID"
 
 # ---------------------------------------------------------------------------
-# 3. Mount the target and bind the host pseudo-filesystems for grub-install
+# 3. Mount the target and bind the host pseudo-filesystems for the chroot
 # ---------------------------------------------------------------------------
 
 log "step 3/8: mount target and bind /proc /sys /dev /run"
@@ -981,20 +982,25 @@ if [ ! -f "$MNT/boot/$INITRD_NAME" ]; then
 fi
 log "kernel: $KERNEL_NAME, initrd: $INITRD_NAME"
 
-log "step 7/8: install GRUB to the ESP and write /boot/grub/grub.cfg"
-run "grub-install failed" chroot "$MNT" grub-install \
-  --target=x86_64-efi --efi-directory=/boot/efi \
-  --bootloader-id=sysemble --removable --no-nvram
+log "step 7/8: write /boot/grub/grub.cfg and build a self-contained EFI image"
+
+GRUB_CFG="$MNT/boot/grub/grub.cfg"
+GRUB_EFI_DIR="$MNT/boot/efi/EFI/BOOT"
+GRUB_EFI="$GRUB_EFI_DIR/BOOTX64.EFI"
+# The EFI core must not look up /boot/grub/x86_64-efi at runtime: the module
+# directory lives on the ext4 root, while the firmware-visible ESP only has
+# EFI/BOOT. grub-mkstandalone embeds every module below plus grub.cfg into
+# BOOTX64.EFI, which is the same self-contained approach as the live ISO.
+GRUB_EFI_MODULES="part_gpt fat ext2 normal linux search search_fs_uuid configfile serial terminal echo test"
 
 write_grub_cfg() {
-  printf 'set timeout=3\n'
-  # grub-install's removable core may not embed serial.mod; load it from the
-  # installed /boot/grub/x86_64-efi so GRUB's own messages reach ttyS0 (boot
-  # check needs a GRUB marker before the kernel cmdline console=ttyS0 takes over).
+  # Load the serial module from the embedded core before switching I/O, so
+  # GRUB's own messages reach ttyS0 for the boot assertions.
   printf 'insmod serial\n'
   printf 'serial --unit=0 --speed=115200\n'
   printf 'terminal_input serial\n'
   printf 'terminal_output serial\n'
+  printf 'set timeout=3\n'
   printf 'menuentry "Sysemble" {\n'
   printf '  search --no-floppy --fs-uuid --set=root %s\n' "$ROOT_UUID"
   printf '  linux /boot/%s root=UUID=%s rw console=ttyS0 systemd.unit=multi-user.target\n' \
@@ -1004,13 +1010,27 @@ write_grub_cfg() {
 }
 
 if [ "$DRY_RUN" -eq 1 ]; then
-  log "dry-run: /boot/grub/grub.cfg would contain:"
+  log "dry-run: $GRUB_CFG would contain:"
   write_grub_cfg
 else
   run "cannot create $MNT/boot/grub" mkdir -p "$MNT/boot/grub"
-  write_grub_cfg >"$MNT/boot/grub/grub.cfg" ||
-    fail "cannot write $MNT/boot/grub/grub.cfg"
+  write_grub_cfg >"$GRUB_CFG" || fail "cannot write $GRUB_CFG"
 fi
+
+if [ "$DRY_RUN" -eq 0 ] && ! command -v grub-mkstandalone >/dev/null 2>&1; then
+  fail "grub-mkstandalone not found on PATH (install grub-efi-amd64-bin in the live rootfs)"
+fi
+if [ "$DRY_RUN" -eq 0 ]; then
+  run "cannot create $GRUB_EFI_DIR" mkdir -p "$GRUB_EFI_DIR"
+fi
+run "grub-mkstandalone failed" grub-mkstandalone -O x86_64-efi \
+  -o "$GRUB_EFI" \
+  --modules="$GRUB_EFI_MODULES" \
+  "boot/grub/grub.cfg=$GRUB_CFG"
+if [ "$DRY_RUN" -eq 0 ] && { [ ! -f "$GRUB_EFI" ] || [ ! -s "$GRUB_EFI" ]; }; then
+  fail "grub-mkstandalone reported success but $GRUB_EFI is missing or empty"
+fi
+log "EFI: self-contained GRUB at $GRUB_EFI (embedded cfg $GRUB_CFG)"
 
 # ---------------------------------------------------------------------------
 # 7. Unmount and finish

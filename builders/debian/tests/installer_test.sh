@@ -203,21 +203,33 @@ done
 assert_contains '"$ROOT_SRC" "$MNT/"' "$SCRIPT" \
   "rsync copies the live root into the target mountpoint"
 
-# fstab and GRUB.
+# fstab and the self-contained GRUB EFI image.
 assert_contains 'UUID=%s / ext4 errors=remount-ro 0 1' "$SCRIPT" \
   "script writes the root UUID to /etc/fstab"
 assert_contains 'UUID=%s /boot/efi vfat umask=0077 0 1' "$SCRIPT" \
   "script writes the ESP UUID to /etc/fstab"
-assert_contains 'chroot "$MNT" grub-install' "$SCRIPT" \
-  "script runs grub-install inside the chroot"
-assert_contains '--target=x86_64-efi --efi-directory=/boot/efi' "$SCRIPT" \
-  "grub-install uses the x86_64-efi target and /boot/efi"
-assert_contains '--bootloader-id=sysemble --removable --no-nvram' "$SCRIPT" \
-  "grub-install uses the frozen bootloader id/removable/no-nvram flags"
+assert_contains 'grub-mkstandalone -O x86_64-efi' "$SCRIPT" \
+  "script builds a self-contained EFI image with grub-mkstandalone"
+assert_contains 'GRUB_EFI_DIR="$MNT/boot/efi/EFI/BOOT"' "$SCRIPT" \
+  "EFI image targets the ESP path /EFI/BOOT"
+assert_contains 'GRUB_EFI="$GRUB_EFI_DIR/BOOTX64.EFI"' "$SCRIPT" \
+  "EFI fallback binary is EFI/BOOT/BOOTX64.EFI"
+assert_contains 'GRUB_EFI_MODULES="part_gpt fat ext2 normal linux search search_fs_uuid configfile serial terminal echo test"' "$SCRIPT" \
+  "grub-mkstandalone embeds the frozen module set"
+assert_contains '"boot/grub/grub.cfg=$GRUB_CFG"' "$SCRIPT" \
+  "grub-mkstandalone embeds /boot/grub/grub.cfg"
+assert_contains 'write_grub_cfg >"$GRUB_CFG"' "$SCRIPT" \
+  "script keeps a human-readable /boot/grub/grub.cfg copy"
+assert_not_contains 'grub-install' "$SCRIPT" \
+  "script no longer depends on grub-install"
+assert_not_contains '--removable --no-nvram' "$SCRIPT" \
+  "script no longer uses the removable GRUB install path"
 assert_contains 'search --no-floppy --fs-uuid --set=root' "$SCRIPT" \
   "installed grub.cfg searches by filesystem UUID"
 assert_contains 'insmod serial' "$SCRIPT" \
   "installed grub.cfg loads serial.mod for ttyS0 GRUB output"
+assert_before 'insmod serial' 'set timeout=3' "$SCRIPT" \
+  "installed grub.cfg configures the serial console before the timeout"
 assert_contains 'linux /boot/%s root=UUID=%s rw console=ttyS0 systemd.unit=multi-user.target' "$SCRIPT" \
   "installed grub.cfg uses root=UUID, console=ttyS0, and multi-user.target"
 assert_contains 'initrd /boot/%s' "$SCRIPT" "installed grub.cfg loads the initrd"
@@ -275,7 +287,7 @@ printf 'initrd\n' >"$DRY_MNT/boot/initrd.img-6.12.3"
 printf 'boot=live console=ttyS0 sysemble.install=/dev/vda\n' >"$DRY_CMDLINE"
 : >"$DRY_CONSOLE"
 
-for tool in sgdisk mkfs.vfat mkfs.ext4 mount umount chroot rsync blkid systemctl; do
+for tool in sgdisk mkfs.vfat mkfs.ext4 mount umount chroot rsync blkid systemctl grub-mkstandalone; do
   cat >"$FAKEBIN/$tool" <<SH
 #!/bin/sh
 : >"$SENTINEL/$tool"
@@ -334,8 +346,14 @@ assert_contains "UUID=11111111-1111-1111-1111-111111111111 / ext4 errors=remount
   "$DRY_OUT" "dry-run renders the root fstab line"
 assert_contains "UUID=22222222-2222-2222-2222-222222222222 /boot/efi vfat umask=0077 0 1" \
   "$DRY_OUT" "dry-run renders the ESP fstab line"
-assert_contains "+ chroot $DRY_MNT grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=sysemble --removable --no-nvram" \
-  "$DRY_OUT" "dry-run logs the frozen grub-install command"
+assert_contains "+ grub-mkstandalone -O x86_64-efi -o $DRY_MNT/boot/efi/EFI/BOOT/BOOTX64.EFI" \
+  "$DRY_OUT" "dry-run logs grub-mkstandalone writing EFI/BOOT/BOOTX64.EFI"
+assert_contains "--modules=part_gpt fat ext2 normal linux search search_fs_uuid configfile serial terminal echo test" \
+  "$DRY_OUT" "dry-run logs the frozen embedded module set"
+assert_contains "boot/grub/grub.cfg=$DRY_MNT/boot/grub/grub.cfg" \
+  "$DRY_OUT" "dry-run logs the embedded grub.cfg source path"
+assert_not_contains "grub-install" "$DRY_OUT" \
+  "dry-run no longer invokes grub-install"
 assert_contains "search --no-floppy --fs-uuid --set=root 11111111-1111-1111-1111-111111111111" \
   "$DRY_OUT" "dry-run renders the UUID GRUB search"
 assert_contains "insmod serial" "$DRY_OUT" \
@@ -362,10 +380,12 @@ assert_before "+ mount --bind /run" "+ rsync -aHAX" "$DRY_OUT" \
   "order: all bind mounts before rsync"
 assert_before "+ rsync -aHAX" "UUID=11111111" "$DRY_OUT" \
   "order: rsync before fstab"
-assert_before "UUID=11111111" "+ chroot" "$DRY_OUT" \
-  "order: fstab before grub-install"
-assert_before "+ chroot" "search --no-floppy --fs-uuid" "$DRY_OUT" \
-  "order: grub-install before writing the installed grub.cfg"
+assert_before "UUID=11111111" "+ grub-mkstandalone" "$DRY_OUT" \
+  "order: fstab before building the EFI image"
+assert_before "insmod serial" "+ grub-mkstandalone" "$DRY_OUT" \
+  "order: embedded grub.cfg content before grub-mkstandalone"
+assert_before "+ grub-mkstandalone" "+ umount" "$DRY_OUT" \
+  "order: EFI image before unmounting"
 assert_before "initrd /boot/initrd.img-6.12.3" "+ umount" "$DRY_OUT" \
   "order: grub.cfg before unmounting"
 assert_before "+ umount" "SYMBLE: install complete" "$DRY_OUT" \
@@ -387,7 +407,7 @@ FAILBIN="$FAIL_ROOT/bin"
 mkdir -p "$FAIL_MNT/boot" "$FAIL_SENTINEL" "$FAILBIN"
 printf 'boot=live sysemble.install=/dev/sysemble-not-a-block-device\n' >"$FAIL_CMDLINE"
 : >"$FAIL_CONSOLE"
-for tool in sgdisk mkfs.vfat mkfs.ext4 mount umount chroot rsync blkid systemctl; do
+for tool in sgdisk mkfs.vfat mkfs.ext4 mount umount chroot rsync blkid systemctl grub-mkstandalone; do
   cat >"$FAILBIN/$tool" <<SH
 #!/bin/sh
 : >"$FAIL_SENTINEL/$tool"
@@ -503,7 +523,7 @@ printf 'initrd\n' >"$TUI_MNT/boot/initrd.img-6.12.3"
 : >"$TUI_CMDLINE"
 : >"$TUI_CONSOLE"
 for tool in sgdisk mkfs.vfat mkfs.ext4 mount umount chroot rsync blkid systemctl \
-  useradd chpasswd passwd stty tty; do
+  grub-mkstandalone useradd chpasswd passwd stty tty; do
   cat >"$TUIBIN/$tool" <<SH
 #!/bin/sh
 : >"$TUI_SENTINEL/$tool"

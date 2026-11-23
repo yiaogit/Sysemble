@@ -968,7 +968,7 @@ build_native() {
   #   - live ISO: live-boot/live-boot-initramfs-tools (mmdebstrap installs no
   #     Recommends, so the plan alone does not pull them in);
   #   - installer: rsync/grub-efi-amd64(+bin)/dosfstools/gdisk/e2fsprogs
-  #     (P0-d3; the guest runs sgdisk/mkfs/rsync/grub-install).
+  #     (P0-d3; the guest runs sgdisk/mkfs/rsync/grub-mkstandalone).
   # artifact.packages stays the plan package list.
   runtime_csv=$(runtime_packages_for "$iso" "$graphical" "$INSTALLER")
   runtime_count=$(runtime_package_count_for "$iso" "$graphical" "$INSTALLER")
