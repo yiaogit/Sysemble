@@ -83,7 +83,7 @@ tools/boot-check.sh --artifact <artifact.json> [--timeout 600] [--json]
 
 - `boot.mode=iso`：QEMU 用 `-cdrom <iso>`，不挂磁盘；q35 + OVMF pflash 不变。
 - 断言（6 条）：firmware、grub、kernel、systemd、login、**live**。
-  - `boot.live`：日志含 `live-boot` 或 `live-media` 或 `squashfs` 或 `overlay`。
+  - `boot.live`：日志含 `live-boot` 或 `live-media` 或 `squashfs`（不接受泛化的 `overlay`）。
 - 退出码沿用 0/1/2/3/4。
 
 ## 5. CI
@@ -133,4 +133,4 @@ artifact: boot-evidence-live
 boot=live live-media-path=/live console=ttyS0 ...
 ```
 
-`boot.live` 断言接受 `live-boot` / `live-media` / `squashfs` / `overlay` 任一。
+`boot.live` 断言只接受 `live-boot` / `live-media` / `squashfs` 三者（`overlay` 被排除：`evm: overlay not supported` 这类负向行也含该词，不构成 live 证据）。

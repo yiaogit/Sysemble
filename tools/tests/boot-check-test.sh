@@ -596,13 +596,16 @@ EOF
 }
 
 # Same boot but the live medium was never recognised: firmware, GRUB, kernel,
-# systemd, and login all pass, so only boot.live may fail.
+# systemd, and login all pass, so only boot.live may fail. The EVM line is the
+# regression guard against the false positive where 'overlay' in
+# "evm: overlay not supported" was mistaken for live evidence.
 write_iso_no_live_log() {
   cat >"$1" <<'EOF'
 [    0.000000] efi: EFI v2.70 by EDK II
 GRUB loading..
 Booting `Sysemble Live'
 [    0.000000] Linux version 6.12.0-amd64 (debian-kernel@lists.debian.org)
+[    0.400000] evm: overlay not supported
 [    0.123456] systemd[1]: Detected virtualization qemu.
 [    1.234567] systemd[1]: Reached target Local Filesystem.
 [    2.345678] Debian GNU/Linux 13 sysemble ttyS0
@@ -611,8 +614,9 @@ EOF
 }
 
 # Desktop live boot: all six live assertions plus LightDM, Xorg, and the
-# graphical target (9 in total). Its live markers are `live-boot` and `overlay`
-# (a second marker set, distinct from the plain log's live-media + squashfs).
+# graphical target (9 in total). Its live markers are `live-boot` and
+# `squashfs` (linux live-boot naming, distinct from the plain log's
+# live-media + squashfs combination).
 write_iso_graphical_good_log() {
   cat >"$1" <<'EOF'
 [    0.000000] efi: EFI v2.70 by EDK II
@@ -620,7 +624,7 @@ GRUB loading..
 Booting `Sysemble Live'
 [    0.000000] Linux version 6.12.0-amd64 (debian-kernel@lists.debian.org)
 [    0.200000] live-boot: mounting /dev/sr0 on /run/live/medium
-[    0.300000] overlay: upperdir=/run/live/overlay/upper, workdir=/run/live/overlay/work
+[    0.300000] SQUASHFS: version 4.0 (2009/01/31) Phillip Lougher
 [    0.123456] systemd[1]: Detected virtualization qemu.
 [    1.234567] systemd[1]: Reached target Local Filesystem.
 [    2.000000] systemd[1]: Starting LightDM Display Manager...
@@ -694,7 +698,7 @@ GRUB loading..
 Booting `Sysemble Live'
 [    0.000000] Linux version 6.12.0-amd64 (debian-kernel@lists.debian.org)
 [    0.200000] live-boot: mounting /dev/sr0 on /run/live/medium
-[    0.300000] overlay: upperdir=/run/live/overlay/upper, workdir=/run/live/overlay/work
+[    0.300000] SQUASHFS: version 4.0 (2009/01/31) Phillip Lougher
 [    0.123456] systemd[1]: Detected virtualization qemu.
 [    1.234567] systemd[1]: Reached target Local Filesystem.
 [    2.000000] systemd[1]: Starting LightDM Display Manager...
@@ -1939,7 +1943,7 @@ test_iso_missing_live_offline() {
   check_eq "boot.login still evaluated" "pass" "$(json_query "$evidence" assertion_result boot.login)"
   check_eq "boot.live" "fail" "$(json_query "$evidence" assertion_result boot.live)"
   check_contains "live detail" \
-    'no `live-boot`, `live-media`, `squashfs`, or `overlay`' \
+    'no `live-boot`, `live-media`, or `squashfs`' \
     "$(json_query "$evidence" assertion_detail boot.live)"
   end_case
 }
@@ -2065,7 +2069,7 @@ test_iso_graphical_good_log_offline() {
   check_eq "assertion ids and order" "$ids" "$(json_query "$evidence" assertion_ids)"
   check_eq "boot.live" "pass" "$(json_query "$evidence" assertion_result boot.live)"
   check_contains "live detail uses the alternate markers" \
-    'matched `live-boot` and `overlay`' "$(json_query "$evidence" assertion_detail boot.live)"
+    'matched `live-boot` and `squashfs`' "$(json_query "$evidence" assertion_detail boot.live)"
   check_eq "boot.display_manager" "pass" "$(json_query "$evidence" assertion_result boot.display_manager)"
   check_eq "boot.xorg" "pass" "$(json_query "$evidence" assertion_result boot.xorg)"
   check_eq "boot.graphical" "pass" "$(json_query "$evidence" assertion_result boot.graphical)"

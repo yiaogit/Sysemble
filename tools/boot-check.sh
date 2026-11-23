@@ -227,8 +227,8 @@ Assertions (all required):
   boot.kernel    serial log contains 'Linux version'
   boot.systemd   serial log contains 'systemd[1]' or 'Reached target'
   boot.login     serial log contains 'login:'
-  boot.live      (iso) log contains 'live-boot', 'live-media', 'squashfs', or
-                 'overlay' (case-insensitive)
+  boot.live      (iso) log contains 'live-boot', 'live-media', or 'squashfs'
+                 (case-insensitive)
   boot.display_manager  (uefi/iso + graphical) log contains 'lightdm', 'sddm',
                         or 'gdm' (case-insensitive)
   boot.xorg             (uefi/iso + graphical) log contains 'X.Org X Server' or
@@ -1070,7 +1070,7 @@ all_assertions_pass() {
   log_has 'login:' || return 1
   if [ "$BOOT_MODE" = "iso" ]; then
     log_has_ci 'live-boot' || log_has_ci 'live-media' || \
-      log_has_ci 'squashfs' || log_has_ci 'overlay' || return 1
+      log_has_ci 'squashfs' || return 1
   fi
   if { [ "$BOOT_MODE" = "uefi" ] || [ "$BOOT_MODE" = "iso" ]; } &&
     [ "$GRAPHICAL_MODE" -eq 1 ]; then
@@ -1194,13 +1194,15 @@ evaluate_assertions() {
   record_assertion boot.login "$LOGIN_RESULT" "$LOGIN_DETAIL"
 
   # The live marker proves the initramfs used the live medium (live-boot /
-  # live-media-path) and that the live filesystem was recognised (squashfs /
-  # overlayfs). Kernel messages spell 'SQUASHFS' and 'OVERLAYFS' in upper case,
-  # so this assertion is case-insensitive.
+  # live-media-path) and that the live filesystem was recognised (squashfs).
+  # Kernel messages spell 'SQUASHFS' in upper case, so this assertion is
+  # case-insensitive. A generic 'overlay' string is deliberately not accepted:
+  # negative lines such as "evm: overlay not supported" contain it, so it is
+  # not evidence of a live boot.
   if [ "$BOOT_MODE" = "iso" ]; then
     evaluate_assertion_ci LIVE_RESULT LIVE_DETAIL \
-      'no `live-boot`, `live-media`, `squashfs`, or `overlay`' \
-      'live-boot' 'live-media' 'squashfs' 'overlay'
+      'no `live-boot`, `live-media`, or `squashfs`' \
+      'live-boot' 'live-media' 'squashfs'
     record_assertion boot.live "$LIVE_RESULT" "$LIVE_DETAIL"
   fi
 
