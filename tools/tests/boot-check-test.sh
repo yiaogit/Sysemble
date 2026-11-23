@@ -1,0 +1,785 @@
+#!/usr/bin/env bash
+# Sysemble boot-check tests (P0-b).
+#
+# Exercises tools/boot-check.sh without QEMU:
+#   - offline assertion mode (--log-from) on canned good/bad/empty logs
+#   - artifact validation and usage errors
+#   - QEMU availability, fake-QEMU success, fake-QEMU timeout
+#
+# Every test builds a self-contained artifact fixture in a temp directory.
+# Nothing outside the temp directory is written. The suite exits non-zero if
+# any test fails.
+#
+# Requires bash 3.2+ (macOS /bin/bash). Do not use bash 4 features.
+
+set -u
+
+case "$0" in
+  */*) TEST_DIR=${0%/*} ;;
+  *) TEST_DIR=. ;;
+esac
+TEST_DIR=$(cd "$TEST_DIR" && pwd -P)
+REPO_ROOT=$(cd "$TEST_DIR/../.." && pwd -P)
+BOOT_CHECK="$REPO_ROOT/tools/boot-check.sh"
+
+if [ -n "${BASH:-}" ] && [ -x "${BASH:-}" ]; then
+  BASH_BIN=$BASH
+else
+  BASH_BIN=/bin/bash
+fi
+
+TMP_ROOT=""
+CASE_DIR=""
+OUT_FILE=""
+ERR_FILE=""
+RC=0
+CASE_NUM=0
+PASS_COUNT=0
+FAIL_COUNT=0
+CASE_NAME=""
+CASE_OK=1
+JSON_TOOL=""
+
+cleanup() {
+  if [ -n "${TMP_ROOT:-}" ] && [ -d "$TMP_ROOT" ]; then
+    case "$TMP_ROOT" in
+      */sysemble-boot-test.*)
+        rm -rf "$TMP_ROOT" 2>/dev/null || true
+        ;;
+    esac
+  fi
+  return 0
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+fail_fatal() {
+  printf 'boot-check-test: FATAL: %s\n' "$*" >&2
+  exit 1
+}
+
+if [ ! -f "$BOOT_CHECK" ]; then
+  fail_fatal "missing $BOOT_CHECK"
+fi
+
+if ! TMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/sysemble-boot-test.XXXXXX" 2>/dev/null); then
+  fail_fatal "cannot create a temporary directory"
+fi
+
+if command -v jq >/dev/null 2>&1; then
+  JSON_TOOL=jq
+elif command -v python3 >/dev/null 2>&1; then
+  JSON_TOOL=python3
+else
+  fail_fatal "tests need jq or python3 to inspect evidence JSON"
+fi
+
+# ---------------------------------------------------------------------------
+# Small test harness
+# ---------------------------------------------------------------------------
+
+begin_case() {
+  CASE_NUM=$((CASE_NUM + 1))
+  CASE_NAME=$1
+  CASE_OK=1
+  CASE_DIR="$TMP_ROOT/case-$CASE_NUM"
+  OUT_FILE="$CASE_DIR/stdout"
+  ERR_FILE="$CASE_DIR/stderr"
+  mkdir -p "$CASE_DIR"
+  printf '\n[%d] %s\n' "$CASE_NUM" "$CASE_NAME"
+}
+
+end_case() {
+  if [ "$CASE_OK" -eq 1 ]; then
+    PASS_COUNT=$((PASS_COUNT + 1))
+    printf 'PASS  %s\n' "$CASE_NAME"
+  else
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    printf 'FAIL  %s\n' "$CASE_NAME"
+  fi
+}
+
+check_eq() {
+  local label=$1
+  local expected=$2
+  local actual=$3
+
+  if [ "$expected" = "$actual" ]; then
+    printf '  ok    %s == %s\n' "$label" "$expected"
+  else
+    printf '  FAIL  %s: expected [%s], got [%s]\n' "$label" "$expected" "$actual"
+    CASE_OK=0
+  fi
+}
+
+check_contains() {
+  local label=$1
+  local needle=$2
+  local haystack=$3
+
+  case "$haystack" in
+    *"$needle"*)
+      printf '  ok    %s contains [%s]\n' "$label" "$needle"
+      ;;
+    *)
+      printf '  FAIL  %s: [%s] not found in:\n%s\n' "$label" "$needle" "$haystack"
+      CASE_OK=0
+      ;;
+  esac
+}
+
+check_empty() {
+  local label=$1
+  local actual=$2
+
+  if [ -z "$actual" ]; then
+    printf '  ok    %s is empty\n' "$label"
+  else
+    printf '  FAIL  %s: expected empty, got [%s]\n' "$label" "$actual"
+    CASE_OK=0
+  fi
+}
+
+check_file() {
+  local label=$1
+  local path=$2
+
+  if [ -f "$path" ]; then
+    printf '  ok    %s exists: %s\n' "$label" "$path"
+  else
+    printf '  FAIL  %s: missing file %s\n' "$label" "$path"
+    CASE_OK=0
+  fi
+}
+
+check_no_file() {
+  local label=$1
+  local path=$2
+
+  if [ ! -e "$path" ]; then
+    printf '  ok    %s does not exist: %s\n' "$label" "$path"
+  else
+    printf '  FAIL  %s: unexpected file %s\n' "$label" "$path"
+    CASE_OK=0
+  fi
+}
+
+check_ge() {
+  local label=$1
+  local minimum=$2
+  local actual=$3
+
+  if [ "$actual" -ge "$minimum" ] 2>/dev/null; then
+    printf '  ok    %s (%s) >= %s\n' "$label" "$actual" "$minimum"
+  else
+    printf '  FAIL  %s: expected >= %s, got [%s]\n' "$label" "$minimum" "$actual"
+    CASE_OK=0
+  fi
+}
+
+check_le() {
+  local label=$1
+  local maximum=$2
+  local actual=$3
+
+  if [ "$actual" -le "$maximum" ] 2>/dev/null; then
+    printf '  ok    %s (%s) <= %s\n' "$label" "$actual" "$maximum"
+  else
+    printf '  FAIL  %s: expected <= %s, got [%s]\n' "$label" "$maximum" "$actual"
+    CASE_OK=0
+  fi
+}
+
+invoke_boot_check() {
+  RC=0
+  "$@" >"$OUT_FILE" 2>"$ERR_FILE" || RC=$?
+}
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+make_fixture() {
+  local dir=$1
+
+  mkdir -p "$dir/rootfs/boot"
+  : >"$dir/rootfs/boot/vmlinuz-6.12.0-amd64"
+  : >"$dir/rootfs/boot/initrd.img-6.12.0-amd64"
+  : >"$dir/disk.img"
+  : >"$dir/disk.qcow2"
+
+  cat >"$dir/artifact.json" <<'EOF'
+{
+  "apiVersion": "sysemble/artifact/v1",
+  "createdAt": "2026-11-23T12:00:00Z",
+  "spec": "minimal-debian",
+  "base": {"kind": "debian", "release": "trixie", "pin": "2026-11-01"},
+  "arch": "x86_64",
+  "packages": ["linux-image-amd64"],
+  "rootfs": {"path": "rootfs", "size_mb": 1},
+  "images": [
+    {"path": "disk.img", "format": "raw", "size_mb": 1, "sha256": "00"},
+    {"path": "disk.qcow2", "format": "qcow2", "size_mb": 1, "sha256": "00"}
+  ],
+  "boot": {
+    "kernel": "rootfs/boot/vmlinuz-6.12.0-amd64",
+    "initrd": "rootfs/boot/initrd.img-6.12.0-amd64",
+    "cmdline": "console=ttyS0 root=/dev/vda rw rootfstype=ext4 systemd.unit=multi-user.target"
+  },
+  "builder": {"name": "build.sh", "version": "0.1.0"}
+}
+EOF
+}
+
+write_good_log() {
+  cat >"$1" <<'EOF'
+[    0.000000] Linux version 6.12.0-amd64 (debian-kernel@lists.debian.org)
+[    0.123456] systemd[1]: Detected virtualization qemu.
+[    1.234567] systemd[1]: Reached target Local File Systems.
+[    2.345678] Debian GNU/Linux 13 sysemble ttyS0
+sysemble login:
+EOF
+}
+
+write_bad_log() {
+  cat >"$1" <<'EOF'
+[    0.000000] Linux version 6.12.0-amd64 (debian-kernel@lists.debian.org)
+[    0.123456] systemd[1]: Detected virtualization qemu.
+[    1.234567] systemd[1]: Reached target Local File Systems.
+EOF
+}
+
+write_fake_qemu_good() {
+  cat >"$1" <<'EOF'
+#!/bin/sh
+# Fake qemu: emit a healthy serial log, then exit like a powered-off VM.
+cat <<'LOG'
+[    0.000000] Linux version 6.12.0-amd64 (debian-kernel@lists.debian.org)
+[    0.123456] systemd[1]: Detected virtualization qemu.
+[    1.234567] systemd[1]: Reached target Local File Systems.
+[    2.345678] Debian GNU/Linux 13 sysemble ttyS0
+sysemble login:
+LOG
+exit 0
+EOF
+  chmod +x "$1"
+}
+
+write_fake_qemu_hang() {
+  cat >"$1" <<'EOF'
+#!/bin/sh
+# Fake qemu: prove the kernel started, then hang until the boot-check watchdog
+# kills this process group.
+echo '[    0.000000] Linux version 6.12.0-amd64 (debian-kernel@lists.debian.org)'
+exec sleep 10
+EOF
+  chmod +x "$1"
+}
+
+# ---------------------------------------------------------------------------
+# JSON helpers
+# ---------------------------------------------------------------------------
+
+json_valid() {
+  local file=$1
+
+  if [ "$JSON_TOOL" = "jq" ]; then
+    jq -e . "$file" >/dev/null 2>&1
+  else
+    python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$file" >/dev/null 2>&1
+  fi
+}
+
+json_query() {
+  local file=$1
+  local key=$2
+  local arg=${3:-}
+
+  if [ "$JSON_TOOL" = "jq" ]; then
+    case "$key" in
+      result) jq -r '.result' "$file" 2>/dev/null ;;
+      apiVersion) jq -r '.apiVersion' "$file" 2>/dev/null ;;
+      artifact) jq -r '.artifact' "$file" 2>/dev/null ;;
+      qemu) jq -r '.qemu' "$file" 2>/dev/null ;;
+      timeout_seconds) jq -r '.timeout_seconds' "$file" 2>/dev/null ;;
+      elapsed_seconds) jq -r '.elapsed_seconds' "$file" 2>/dev/null ;;
+      log) jq -r '.log' "$file" 2>/dev/null ;;
+      log_sha256) jq -r '.log_sha256' "$file" 2>/dev/null ;;
+      assertion_count) jq -r '.assertions | length' "$file" 2>/dev/null ;;
+      assertion_result)
+        jq -r --arg id "$arg" '.assertions[] | select(.id == $id) | .result' "$file" 2>/dev/null
+        ;;
+      assertion_detail)
+        jq -r --arg id "$arg" '.assertions[] | select(.id == $id) | .detail' "$file" 2>/dev/null
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+  else
+    python3 - "$file" "$key" "$arg" <<'PY'
+import json
+import sys
+
+
+def main(argv):
+    with open(argv[1], "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    key = argv[2]
+    arg = argv[3] if len(argv) > 3 else ""
+    if key == "result":
+        print(data["result"])
+    elif key == "apiVersion":
+        print(data["apiVersion"])
+    elif key == "artifact":
+        print(data["artifact"])
+    elif key == "qemu":
+        print(data["qemu"])
+    elif key == "timeout_seconds":
+        print(data["timeout_seconds"])
+    elif key == "elapsed_seconds":
+        print(data["elapsed_seconds"])
+    elif key == "log":
+        print(data["log"])
+    elif key == "log_sha256":
+        print(data["log_sha256"])
+    elif key == "assertion_count":
+        print(len(data["assertions"]))
+    elif key == "assertion_result":
+        for item in data["assertions"]:
+            if item["id"] == arg:
+                print(item["result"])
+                return 0
+        return 2
+    elif key == "assertion_detail":
+        for item in data["assertions"]:
+            if item["id"] == arg:
+                print(item["detail"])
+                return 0
+        return 2
+    else:
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
+PY
+  fi
+}
+
+file_sha256() {
+  local out=""
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    out=$(sha256sum "$1" 2>/dev/null) || return 1
+    printf '%s' "${out%% *}"
+    return 0
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    out=$(shasum -a 256 "$1" 2>/dev/null) || return 1
+    printf '%s' "${out%% *}"
+    return 0
+  fi
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+test_good_log_offline() {
+  local evidence=""
+  local stderr_text=""
+  local hash=""
+
+  begin_case "canned good log -> exit 0, three passes"
+  make_fixture "$CASE_DIR"
+  evidence="$CASE_DIR/boot-evidence.json"
+  write_good_log "$CASE_DIR/good.log"
+
+  invoke_boot_check "$BASH_BIN" "$BOOT_CHECK" \
+    --artifact "$CASE_DIR/artifact.json" \
+    --log-from "$CASE_DIR/good.log" --json
+
+  check_eq "exit code" 0 "$RC"
+  check_file "evidence file" "$evidence"
+  check_no_file "boot.log absent in offline mode" "$CASE_DIR/boot.log"
+  check_eq "stdout is valid JSON" 1 "$(json_valid "$OUT_FILE" && echo 1 || echo 0)"
+  check_eq "evidence API version" "sysemble/boot-evidence/v1" "$(json_query "$evidence" apiVersion)"
+  check_eq "result" "pass" "$(json_query "$evidence" result)"
+  check_eq "assertion count" 3 "$(json_query "$evidence" assertion_count)"
+  check_eq "boot.kernel" "pass" "$(json_query "$evidence" assertion_result boot.kernel)"
+  check_eq "boot.systemd" "pass" "$(json_query "$evidence" assertion_result boot.systemd)"
+  check_eq "boot.login" "pass" "$(json_query "$evidence" assertion_result boot.login)"
+  check_eq "evidence log" "$CASE_DIR/good.log" "$(json_query "$evidence" log)"
+  hash=$(json_query "$evidence" log_sha256)
+  check_eq "sha256 length" 64 "${#hash}"
+  check_eq "log sha256 matches file" "$(file_sha256 "$CASE_DIR/good.log")" "$hash"
+  stderr_text=$(cat "$ERR_FILE")
+  check_contains "human summary on stderr" "result: pass" "$stderr_text"
+  end_case
+}
+
+test_bad_log_offline() {
+  local evidence=""
+
+  begin_case "canned bad log (no login) -> exit 1, login fail, valid evidence"
+  make_fixture "$CASE_DIR"
+  evidence="$CASE_DIR/boot-evidence.json"
+  write_bad_log "$CASE_DIR/bad.log"
+
+  invoke_boot_check "$BASH_BIN" "$BOOT_CHECK" \
+    --artifact "$CASE_DIR/artifact.json" \
+    --log-from "$CASE_DIR/bad.log" --json
+
+  check_eq "exit code" 1 "$RC"
+  check_file "evidence file" "$evidence"
+  check_eq "stdout is valid JSON" 1 "$(json_valid "$OUT_FILE" && echo 1 || echo 0)"
+  check_eq "result" "fail" "$(json_query "$evidence" result)"
+  check_eq "boot.kernel" "pass" "$(json_query "$evidence" assertion_result boot.kernel)"
+  check_eq "boot.systemd" "pass" "$(json_query "$evidence" assertion_result boot.systemd)"
+  check_eq "boot.login" "fail" "$(json_query "$evidence" assertion_result boot.login)"
+  check_contains "login detail" "no \`login:\`" "$(json_query "$evidence" assertion_detail boot.login)"
+  end_case
+}
+
+test_missing_log_from() {
+  begin_case "--log-from missing file -> exit 2"
+  make_fixture "$CASE_DIR"
+
+  invoke_boot_check "$BASH_BIN" "$BOOT_CHECK" \
+    --artifact "$CASE_DIR/artifact.json" \
+    --log-from "$CASE_DIR/does-not-exist.log" --json
+
+  check_eq "exit code" 2 "$RC"
+  check_empty "stdout" "$(cat "$OUT_FILE")"
+  check_contains "diagnostic" "log-from file not found" "$(cat "$ERR_FILE")"
+  check_no_file "no evidence on I/O error" "$CASE_DIR/boot-evidence.json"
+  end_case
+}
+
+test_missing_artifact_argument() {
+  begin_case "--artifact missing -> exit 2, usage"
+  make_fixture "$CASE_DIR"
+
+  invoke_boot_check "$BASH_BIN" "$BOOT_CHECK" --json
+
+  check_eq "exit code" 2 "$RC"
+  check_empty "stdout" "$(cat "$OUT_FILE")"
+  check_contains "diagnostic" "--artifact is required" "$(cat "$ERR_FILE")"
+  check_contains "usage shown" "Usage:" "$(cat "$ERR_FILE")"
+  end_case
+}
+
+test_qemu_unavailable() {
+  begin_case "PATH cleared + --qemu /nonexistent -> exit 3"
+  make_fixture "$CASE_DIR"
+
+  RC=0
+  PATH=/nonexistent "$BASH_BIN" "$BOOT_CHECK" \
+    --artifact "$CASE_DIR/artifact.json" \
+    --qemu /nonexistent --json >"$OUT_FILE" 2>"$ERR_FILE" || RC=$?
+
+  check_eq "exit code" 3 "$RC"
+  check_empty "stdout" "$(cat "$OUT_FILE")"
+  check_contains "diagnostic" "QEMU binary is not executable" "$(cat "$ERR_FILE")"
+  check_no_file "no boot.log" "$CASE_DIR/boot.log"
+  check_no_file "no evidence" "$CASE_DIR/boot-evidence.json"
+  end_case
+}
+
+test_fake_qemu_good() {
+  local evidence=""
+
+  begin_case "fake qemu writes good log then exits -> exit 0, boot.log"
+  make_fixture "$CASE_DIR"
+  evidence="$CASE_DIR/boot-evidence.json"
+  write_fake_qemu_good "$CASE_DIR/fake-qemu"
+
+  invoke_boot_check "$BASH_BIN" "$BOOT_CHECK" \
+    --artifact "$CASE_DIR/artifact.json" \
+    --qemu "$CASE_DIR/fake-qemu" --timeout 10 --json
+
+  check_eq "exit code" 0 "$RC"
+  check_file "boot.log" "$CASE_DIR/boot.log"
+  check_file "evidence file" "$evidence"
+  check_eq "stdout is valid JSON" 1 "$(json_valid "$OUT_FILE" && echo 1 || echo 0)"
+  check_eq "result" "pass" "$(json_query "$evidence" result)"
+  check_eq "assertion count" 3 "$(json_query "$evidence" assertion_count)"
+  check_eq "boot.kernel" "pass" "$(json_query "$evidence" assertion_result boot.kernel)"
+  check_eq "boot.login" "pass" "$(json_query "$evidence" assertion_result boot.login)"
+  check_eq "evidence log" "boot.log" "$(json_query "$evidence" log)"
+  check_eq "boot.log sha256 matches evidence" "$(file_sha256 "$CASE_DIR/boot.log")" "$(json_query "$evidence" log_sha256)"
+  check_contains "boot.log has kernel line" "Linux version" "$(cat "$CASE_DIR/boot.log")"
+  end_case
+}
+
+test_qemu_arguments() {
+  local evidence=""
+  local args_file=""
+  local expected=""
+  local actual=""
+  local real_case_dir=""
+
+  begin_case "QEMU argv maps artifact fields and resolves paths"
+  make_fixture "$CASE_DIR"
+  evidence="$CASE_DIR/boot-evidence.json"
+  args_file="$CASE_DIR/qemu-args.txt"
+  real_case_dir=$(cd "$CASE_DIR" && pwd -P)
+
+  cat >"$CASE_DIR/fake-qemu" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$@" >"$FAKE_QEMU_ARGS"
+cat <<'LOG'
+[    0.000000] Linux version 6.12.0-amd64 (debian-kernel@lists.debian.org)
+[    0.123456] systemd[1]: Detected virtualization qemu.
+[    1.234567] systemd[1]: Reached target Local File Systems.
+[    2.345678] Debian GNU/Linux 13 sysemble ttyS0
+sysemble login:
+LOG
+exit 0
+EOF
+  chmod +x "$CASE_DIR/fake-qemu"
+
+  expected=$(printf '%s\n' \
+    '-machine' 'q35' \
+    '-m' '1024' \
+    '-smp' '2' \
+    '-nographic' \
+    '-no-reboot' \
+    '-kernel' "$real_case_dir/rootfs/boot/vmlinuz-6.12.0-amd64" \
+    '-initrd' "$real_case_dir/rootfs/boot/initrd.img-6.12.0-amd64" \
+    '-append' 'console=ttyS0 root=/dev/vda rw rootfstype=ext4 systemd.unit=multi-user.target' \
+    '-drive' "file=$real_case_dir/disk.img,format=raw,if=virtio")
+
+  RC=0
+  FAKE_QEMU_ARGS="$args_file" "$BASH_BIN" "$BOOT_CHECK" \
+    --artifact "$CASE_DIR/artifact.json" \
+    --qemu "$CASE_DIR/fake-qemu" --timeout 10 --json \
+    >"$OUT_FILE" 2>"$ERR_FILE" || RC=$?
+
+  actual=$(cat "$args_file" 2>/dev/null)
+  check_eq "exit code" 0 "$RC"
+  check_eq "qemu argv" "$expected" "$actual"
+  check_eq "result" "pass" "$(json_query "$evidence" result)"
+  end_case
+}
+
+test_early_stop_after_assertions() {
+  local evidence=""
+  local duration=0
+
+  begin_case "fake qemu keeps running after good log -> early stop, exit 0"
+  make_fixture "$CASE_DIR"
+  evidence="$CASE_DIR/boot-evidence.json"
+
+  cat >"$CASE_DIR/fake-qemu" <<'EOF'
+#!/bin/sh
+cat <<'LOG'
+[    0.000000] Linux version 6.12.0-amd64 (debian-kernel@lists.debian.org)
+[    0.123456] systemd[1]: Detected virtualization qemu.
+[    1.234567] systemd[1]: Reached target Local File Systems.
+[    2.345678] Debian GNU/Linux 13 sysemble ttyS0
+sysemble login:
+LOG
+# A real booted VM never exits. Boot-check must notice all assertions and stop
+# this process instead of waiting for the timeout.
+exec sleep 30
+EOF
+  chmod +x "$CASE_DIR/fake-qemu"
+
+  SECONDS=0
+  invoke_boot_check "$BASH_BIN" "$BOOT_CHECK" \
+    --artifact "$CASE_DIR/artifact.json" \
+    --qemu "$CASE_DIR/fake-qemu" --timeout 5 --json
+  duration=$SECONDS
+
+  check_eq "exit code" 0 "$RC"
+  check_eq "result" "pass" "$(json_query "$evidence" result)"
+  check_eq "all assertions" "pass" "$(json_query "$evidence" assertion_result boot.login)"
+  check_le "wall clock duration" 4 "$duration"
+  end_case
+}
+
+test_fake_qemu_timeout() {
+  local evidence=""
+  local duration=0
+
+  begin_case "fake qemu hangs with --timeout 2 -> exit 4, partial log kept"
+  make_fixture "$CASE_DIR"
+  evidence="$CASE_DIR/boot-evidence.json"
+  write_fake_qemu_hang "$CASE_DIR/fake-qemu"
+
+  SECONDS=0
+  invoke_boot_check "$BASH_BIN" "$BOOT_CHECK" \
+    --artifact "$CASE_DIR/artifact.json" \
+    --qemu "$CASE_DIR/fake-qemu" --timeout 2 --json
+  duration=$SECONDS
+
+  check_eq "exit code" 4 "$RC"
+  check_file "boot.log" "$CASE_DIR/boot.log"
+  check_file "evidence file" "$evidence"
+  check_eq "stdout is valid JSON" 1 "$(json_valid "$OUT_FILE" && echo 1 || echo 0)"
+  check_eq "result" "timeout" "$(json_query "$evidence" result)"
+  check_eq "timeout_seconds" 2 "$(json_query "$evidence" timeout_seconds)"
+  check_ge "elapsed_seconds" 2 "$(json_query "$evidence" elapsed_seconds)"
+  check_ge "wall clock duration" 2 "$duration"
+  check_ge "partial log preserved" 1 "$(wc -c <"$CASE_DIR/boot.log" | tr -d ' ')"
+  check_eq "boot.kernel on partial log" "pass" "$(json_query "$evidence" assertion_result boot.kernel)"
+  check_eq "boot.login on partial log" "fail" "$(json_query "$evidence" assertion_result boot.login)"
+  check_contains "login detail mentions timeout" "within 2s" "$(json_query "$evidence" assertion_detail boot.login)"
+  end_case
+}
+
+test_empty_log_offline() {
+  local evidence=""
+
+  begin_case "empty log -> assertions fail (exit 1), not error"
+  make_fixture "$CASE_DIR"
+  evidence="$CASE_DIR/boot-evidence.json"
+  : >"$CASE_DIR/empty.log"
+
+  invoke_boot_check "$BASH_BIN" "$BOOT_CHECK" \
+    --artifact "$CASE_DIR/artifact.json" \
+    --log-from "$CASE_DIR/empty.log" --json
+
+  check_eq "exit code" 1 "$RC"
+  check_file "evidence file" "$evidence"
+  check_eq "result" "fail" "$(json_query "$evidence" result)"
+  check_eq "boot.kernel" "fail" "$(json_query "$evidence" assertion_result boot.kernel)"
+  check_eq "boot.systemd" "fail" "$(json_query "$evidence" assertion_result boot.systemd)"
+  check_eq "boot.login" "fail" "$(json_query "$evidence" assertion_result boot.login)"
+  check_contains "empty detail" "log is empty" "$(json_query "$evidence" assertion_detail boot.kernel)"
+  end_case
+}
+
+test_offline_ignores_qemu() {
+  begin_case "offline mode does not require QEMU"
+  make_fixture "$CASE_DIR"
+  write_good_log "$CASE_DIR/good.log"
+
+  invoke_boot_check "$BASH_BIN" "$BOOT_CHECK" \
+    --artifact "$CASE_DIR/artifact.json" \
+    --log-from "$CASE_DIR/good.log" \
+    --qemu /nonexistent --json
+
+  check_eq "exit code" 0 "$RC"
+  check_eq "result" "pass" "$(json_query "$CASE_DIR/boot-evidence.json" result)"
+  check_no_file "boot.log absent in offline mode" "$CASE_DIR/boot.log"
+  end_case
+}
+
+test_missing_raw_image() {
+  begin_case "missing raw image -> exit 2"
+  make_fixture "$CASE_DIR"
+  write_good_log "$CASE_DIR/good.log"
+  rm -f "$CASE_DIR/disk.img"
+
+  invoke_boot_check "$BASH_BIN" "$BOOT_CHECK" \
+    --artifact "$CASE_DIR/artifact.json" \
+    --log-from "$CASE_DIR/good.log" --json
+
+  check_eq "exit code" 2 "$RC"
+  check_empty "stdout" "$(cat "$OUT_FILE")"
+  check_contains "diagnostic" "images[].path (raw)" "$(cat "$ERR_FILE")"
+  check_no_file "no evidence" "$CASE_DIR/boot-evidence.json"
+  end_case
+}
+
+test_missing_kernel() {
+  begin_case "missing boot.kernel target -> exit 2"
+  make_fixture "$CASE_DIR"
+  write_good_log "$CASE_DIR/good.log"
+  rm -f "$CASE_DIR/rootfs/boot/vmlinuz-6.12.0-amd64"
+
+  invoke_boot_check "$BASH_BIN" "$BOOT_CHECK" \
+    --artifact "$CASE_DIR/artifact.json" \
+    --log-from "$CASE_DIR/good.log" --json
+
+  check_eq "exit code" 2 "$RC"
+  check_contains "diagnostic" "boot.kernel" "$(cat "$ERR_FILE")"
+  end_case
+}
+
+test_invalid_json() {
+  begin_case "malformed artifact JSON -> exit 2"
+  make_fixture "$CASE_DIR"
+  printf '{ this is not json\n' >"$CASE_DIR/artifact.json"
+
+  invoke_boot_check "$BASH_BIN" "$BOOT_CHECK" \
+    --artifact "$CASE_DIR/artifact.json" \
+    --log-from "$CASE_DIR/whatever.log" --json
+
+  check_eq "exit code" 2 "$RC"
+  check_empty "stdout" "$(cat "$OUT_FILE")"
+  check_contains "diagnostic" "not valid JSON" "$(cat "$ERR_FILE")"
+  end_case
+}
+
+test_unknown_option() {
+  begin_case "unknown option -> exit 2"
+  make_fixture "$CASE_DIR"
+
+  invoke_boot_check "$BASH_BIN" "$BOOT_CHECK" \
+    --artifact "$CASE_DIR/artifact.json" --frobnicate
+
+  check_eq "exit code" 2 "$RC"
+  check_empty "stdout" "$(cat "$OUT_FILE")"
+  check_contains "diagnostic" "unknown option" "$(cat "$ERR_FILE")"
+  end_case
+}
+
+test_systemd_reached_target_only() {
+  begin_case "systemd assertion accepts 'Reached target' alone"
+  make_fixture "$CASE_DIR"
+  cat >"$CASE_DIR/reached.log" <<'EOF'
+[    0.000000] Linux version 6.12.0-amd64 (debian-kernel@lists.debian.org)
+[    1.234567] Reached target Local File Systems.
+sysemble login:
+EOF
+
+  invoke_boot_check "$BASH_BIN" "$BOOT_CHECK" \
+    --artifact "$CASE_DIR/artifact.json" \
+    --log-from "$CASE_DIR/reached.log" --json
+
+  check_eq "exit code" 0 "$RC"
+  check_eq "result" "pass" "$(json_query "$CASE_DIR/boot-evidence.json" result)"
+  check_eq "boot.systemd" "pass" "$(json_query "$CASE_DIR/boot-evidence.json" assertion_result boot.systemd)"
+  end_case
+}
+
+# ---------------------------------------------------------------------------
+# Runner
+# ---------------------------------------------------------------------------
+
+printf 'Sysemble boot-check tests\n'
+printf '  repo: %s\n' "$REPO_ROOT"
+printf '  bash: %s\n' "$BASH_BIN"
+printf '  json: %s\n' "$JSON_TOOL"
+
+test_good_log_offline
+test_bad_log_offline
+test_missing_log_from
+test_missing_artifact_argument
+test_qemu_unavailable
+test_fake_qemu_good
+test_qemu_arguments
+test_early_stop_after_assertions
+test_fake_qemu_timeout
+test_empty_log_offline
+test_offline_ignores_qemu
+test_missing_raw_image
+test_missing_kernel
+test_invalid_json
+test_unknown_option
+test_systemd_reached_target_only
+
+printf '\n----------------------------------------------------------------\n'
+printf 'Summary: %d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
+
+if [ "$FAIL_COUNT" -ne 0 ] || [ "$PASS_COUNT" -eq 0 ]; then
+  exit 1
+fi
+exit 0

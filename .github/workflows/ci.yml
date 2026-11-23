@@ -25,3 +25,43 @@ jobs:
       - uses: actions/checkout@v4
       - name: Test
         run: cargo test --workspace
+
+  boot-smoke:
+    name: Boot smoke (Debian)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install build and boot tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            mmdebstrap debian-archive-keyring \
+            qemu-system-x86 qemu-utils e2fsprogs jq
+
+      - name: Plan minimal image
+        run: cargo run -q -p sysemble-cli -- plan examples/minimal-debian.yaml > plan.json
+
+      - name: Build disk image
+        run: sudo env PATH="$PATH" bash builders/debian/build.sh --plan plan.json --out out --execute
+
+      - name: Hand build output back to the runner user
+        run: sudo chown -R "$(id -u):$(id -g)" out
+
+      - name: Boot and assert
+        run: bash tools/boot-check.sh --artifact out/artifact.json --timeout 300 --json
+
+      - name: Upload boot evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-evidence
+          if-no-files-found: warn
+          path: |
+            plan.json
+            out/artifact.json
+            out/build.log
+            out/boot.log
+            out/boot-evidence.json

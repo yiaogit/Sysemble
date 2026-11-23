@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sysemble Debian builder - shared helpers for build.sh (P0-a).
+# Sysemble Debian builder - shared helpers for build.sh (P0-a + P0-b).
 #
 # This file is sourced by build.sh. It is written for bash 3.2 (the /bin/bash
 # shipped by macOS) and must not use bash 4 features (mapfile, nameref, ...).
@@ -8,7 +8,12 @@
 #   - JSON access (jq preferred, python3 fallback) and the record protocol
 #   - plan validation
 #   - engine preflight checks (native / docker)
+#   - artifact.json generation helpers (P0-b)
 #   - output helpers / usage text
+#
+# It is safe to source this file without running a build: it only defines
+# functions and constants. In particular the artifact helpers are pure
+# functions so builders/debian/tests/ can call them against fixtures.
 
 # ---------------------------------------------------------------------------
 # Contract constants
@@ -94,36 +99,54 @@ err() {
 # ---------------------------------------------------------------------------
 
 IFS= read -r -d '' USAGE_TEXT <<'USAGE' || true
-Sysemble Debian builder (P0-a) - build a Debian rootfs from plan.json
+Sysemble Debian builder (P0-b) - build a bootable Debian disk image from plan.json
 
 Usage:
-  builders/debian/build.sh --plan <plan.json> --out <dir> [--dry-run] [--engine docker|native]
+  builders/debian/build.sh --plan <plan.json> --out <dir> [--dry-run] [--execute] [--engine docker|native]
 
 Options:
   --plan <path>      plan.json produced by `sysemble plan --json`
   --out <dir>        output directory; created if missing
   --dry-run          validate the plan, print stages/packages/estimates, and
                      write only <out>/plan.copy.json
+  --execute          explicit alias for the default build mode: build the
+                     rootfs, disk images, and artifact.json. Mutually exclusive
+                     with --dry-run. The CI contract passes this flag.
   --engine <name>    native (default) or docker
   -h, --help         show this help and exit 0
 
+Outputs (native --execute):
+  <out>/rootfs/        mmdebstrap rootfs
+  <out>/disk.img       raw ext4 image (mkfs.ext4 -d)
+  <out>/disk.qcow2     qcow2 conversion of disk.img
+  <out>/artifact.json  sysemble/artifact/v1 manifest
+  <out>/build.log      full build output (tee)
+
 Engines:
-  native   requires Linux, euid 0, and mmdebstrap on PATH; builds <out>/rootfs
+  native   requires Linux, euid 0, and mmdebstrap, mkfs.ext4, and qemu-img on
+           PATH; builds rootfs, disk.img, disk.qcow2, and artifact.json.
   docker   runs mmdebstrap in a debian:trixie container with <out> mounted at
-           /out; requires a working Docker daemon. --dry-run does not check
-           the engine, so it works on hosts without Linux/Docker.
+           /out; requires a working Docker daemon. Docker mode still stops after
+           the rootfs: P0-b disk/artifact assembly is native-only and has not
+           been verified in docker mode, so --execute with --engine docker is
+           rejected (exit 2). --dry-run does not check the engine, so it works
+           on hosts without Linux/Docker.
 
 Exit codes:
-  0  success (dry run, or rootfs bootstrap completed)
-  1  invalid plan (malformed JSON or failed plan validation)
+  0  success (dry run, or a complete native image build)
+  1  invalid plan (malformed JSON or failed plan validation), or plan.spec is
+     missing for a real native build (artifact.json requires it)
   2  usage or I/O error (including an unsafe --out)
-  3  native engine unavailable (not Linux, not root, or no mmdebstrap)
+  3  native engine unavailable (not Linux, not root, or a required tool is
+     missing: mmdebstrap, mkfs.ext4, qemu-img)
   4  docker engine unavailable (no docker CLI or no daemon)
   5  no JSON parser available (install jq or python3)
-  6  a build step failed, or <out>/rootfs already exists
+  6  a build step failed, <out>/rootfs or an output image already exists, or
+     the rootfs has no bootable kernel/initrd
 
-P0-a scope: rootfs bootstrap only. No partitioning, bootloader, qcow2/ISO
-conversion, system configuration, networking changes, or host changes.
+P0-b scope: Debian rootfs + raw ext4 disk + qcow2 + artifact manifest.
+Partitioning, bootloaders, ISO assembly, and cross-architecture builds are out
+of scope. Docker mode is P0-a rootfs-only and P0-b unverified.
 USAGE
 
 usage() {
@@ -735,6 +758,261 @@ print_estimate() {
 }
 
 # ---------------------------------------------------------------------------
+# Artifact manifest helpers (P0-b)
+#
+# These functions are pure (arguments in, stdout/stderr out, no global state)
+# so tests can source lib.sh and call them directly without running build.sh.
+# artifact_json() deliberately fails when a required input is missing instead
+# of guessing: build.sh maps that failure to exit 6.
+# ---------------------------------------------------------------------------
+
+ARTIFACT_API_VERSION="sysemble/artifact/v1"
+ARTIFACT_BUILDER_NAME="build.sh"
+ARTIFACT_BUILDER_VERSION="0.1.0"
+ARTIFACT_BOOT_CMDLINE="console=ttyS0 root=/dev/vda rw rootfstype=ext4 systemd.unit=multi-user.target"
+
+# Escape a string for a JSON string body. Plan records are already stripped of
+# control characters by the JSON extractors, so backslash and quote escaping
+# is sufficient here.
+json_escape() {
+  sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+json_quote() {
+  local value=$1
+  printf '"%s"' "$(printf '%s' "$value" | json_escape)"
+}
+
+# Print the SHA-256 of a regular file. Supports GNU coreutils, macOS shasum,
+# and openssl so the same code works on the CI runner and on the dev host.
+sha256_file() {
+  local file=$1
+  local digest=""
+
+  if [ ! -f "$file" ]; then
+    err "cannot hash missing file: $file"
+    return 1
+  fi
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    digest=$(sha256sum <"$file" 2>/dev/null | awk '{print $1}')
+  elif command -v shasum >/dev/null 2>&1; then
+    digest=$(shasum -a 256 <"$file" 2>/dev/null | awk '{print $1}')
+  elif command -v openssl >/dev/null 2>&1; then
+    digest=$(openssl dgst -sha256 <"$file" 2>/dev/null | awk '{print $NF}')
+  else
+    err "no SHA-256 tool available: install coreutils/shasum or openssl"
+    return 1
+  fi
+
+  if [ "${#digest}" -ne 64 ]; then
+    err "unexpected SHA-256 output for $file"
+    return 1
+  fi
+  case "$digest" in
+    *[!0-9a-f]*)
+      err "unexpected SHA-256 output for $file: $digest"
+      return 1
+      ;;
+  esac
+  printf '%s\n' "$digest"
+}
+
+# Ceiling of the file size in MiB.
+file_size_mb() {
+  local file=$1
+  local bytes=""
+
+  if [ ! -f "$file" ]; then
+    err "not a regular file: $file"
+    return 1
+  fi
+  bytes=$(wc -c <"$file" | tr -d '[:space:]')
+  case "$bytes" in
+    '' | *[!0-9]*)
+      err "cannot determine size of $file"
+      return 1
+      ;;
+  esac
+  printf '%s\n' $(((bytes + 1048575) / 1048576))
+}
+
+# Ceiling of the rootfs disk usage in MiB (du -sk reports 1 KiB blocks).
+rootfs_size_mb() {
+  local rootfs=$1
+  local kb=""
+
+  if [ ! -d "$rootfs" ]; then
+    err "rootfs directory not found: $rootfs"
+    return 1
+  fi
+  kb=$(du -sk "$rootfs" 2>/dev/null | awk 'NR == 1 {print $1}')
+  case "$kb" in
+    '' | *[!0-9]*)
+      err "cannot determine rootfs size: $rootfs"
+      return 1
+      ;;
+  esac
+  printf '%s\n' $(((kb + 1023) / 1024))
+}
+
+# P0-b disk sizing: ceil(rootfs_mb * 1.6 + 512), rounded up to the next 256 MB
+# boundary, with a 2048 MB floor. Integer arithmetic only (bash 3.2).
+compute_disk_size_mb() {
+  local rootfs_mb=$1
+  local grown=0
+  local size=0
+
+  case "$rootfs_mb" in
+    '' | *[!0-9]*)
+      err "rootfs_mb must be a non-negative integer (got '$rootfs_mb')"
+      return 2
+      ;;
+  esac
+
+  # ceil(rootfs_mb * 8 / 5) + 512
+  grown=$((((rootfs_mb * 8) + 4) / 5 + 512))
+  # round up to a 256 MB boundary
+  size=$((((grown + 255) / 256) * 256))
+  if [ "$size" -lt 2048 ]; then
+    size=2048
+  fi
+  printf '%s\n' "$size"
+}
+
+# Pick the highest-versioned file matching <rootfs>/boot/<prefix>-* using
+# `sort -V`. Prints the absolute path; returns 1 when no candidate exists.
+find_boot_image() {
+  local rootfs=$1
+  local prefix=$2
+  local candidate=""
+
+  if [ ! -d "$rootfs/boot" ]; then
+    return 1
+  fi
+  candidate=$(
+    find "$rootfs/boot" -maxdepth 1 \( -type f -o -type l \) \
+      -name "$prefix-*" -print 2>/dev/null | sort -V | tail -n 1
+  )
+  if [ -z "$candidate" ]; then
+    return 1
+  fi
+  printf '%s\n' "$candidate"
+}
+
+# Emit a sysemble/artifact/v1 manifest on stdout.
+#
+# Usage:
+#   artifact_json <out_dir> <spec> <release> <pin> <arch> <created_at> \
+#                 [package ...]
+#
+# <out_dir> must contain rootfs/, disk.img, and disk.qcow2 with a kernel and an
+# initrd under rootfs/boot/. The function never writes files; build.sh writes
+# its stdout atomically to <out>/artifact.json.
+artifact_json() {
+  local out=""
+  local spec=""
+  local release=""
+  local pin=""
+  local arch=""
+  local created_at=""
+  local rootfs=""
+  local raw=""
+  local qcow=""
+  local rootfs_mb=""
+  local raw_mb=""
+  local qcow_mb=""
+  local raw_sha=""
+  local qcow_sha=""
+  local kernel=""
+  local initrd=""
+  local kernel_rel=""
+  local initrd_rel=""
+  local pin_json="null"
+  local sep=""
+
+  if [ "$#" -lt 6 ]; then
+    err "artifact_json: expected at least 6 arguments"
+    return 2
+  fi
+  out=$1
+  spec=$2
+  release=$3
+  pin=$4
+  arch=$5
+  created_at=$6
+  shift 6
+
+  rootfs="$out/rootfs"
+  raw="$out/disk.img"
+  qcow="$out/disk.qcow2"
+
+  if [ ! -d "$rootfs" ]; then
+    err "artifact: rootfs directory is missing: $rootfs"
+    return 1
+  fi
+  if [ ! -f "$raw" ]; then
+    err "artifact: raw disk image is missing: $raw"
+    return 1
+  fi
+  if [ ! -f "$qcow" ]; then
+    err "artifact: qcow2 image is missing: $qcow"
+    return 1
+  fi
+
+  kernel=$(find_boot_image "$rootfs" vmlinuz) || {
+    err "artifact: no kernel found in $rootfs/boot (expected vmlinuz-*)"
+    return 1
+  }
+  initrd=$(find_boot_image "$rootfs" initrd.img) || {
+    err "artifact: no initrd found in $rootfs/boot (expected initrd.img-*)"
+    return 1
+  }
+  kernel_rel="rootfs/boot/${kernel##*/}"
+  initrd_rel="rootfs/boot/${initrd##*/}"
+
+  rootfs_mb=$(rootfs_size_mb "$rootfs") || return 1
+  raw_mb=$(file_size_mb "$raw") || return 1
+  qcow_mb=$(file_size_mb "$qcow") || return 1
+  raw_sha=$(sha256_file "$raw") || return 1
+  qcow_sha=$(sha256_file "$qcow") || return 1
+
+  if [ -n "$pin" ]; then
+    pin_json=$(json_quote "$pin")
+  fi
+
+  printf '{\n'
+  printf '  "apiVersion": %s,\n' "$(json_quote "$ARTIFACT_API_VERSION")"
+  printf '  "createdAt": %s,\n' "$(json_quote "$created_at")"
+  printf '  "spec": %s,\n' "$(json_quote "$spec")"
+  printf '  "base": {"kind": "debian", "release": %s, "pin": %s},\n' \
+    "$(json_quote "$release")" "$pin_json"
+  printf '  "arch": %s,\n' "$(json_quote "$arch")"
+  printf '  "packages": ['
+  for pkg in "$@"; do
+    printf '%s%s' "$sep" "$(json_quote "$pkg")"
+    sep=", "
+  done
+  printf '],\n'
+  printf '  "rootfs": {"path": "rootfs", "size_mb": %s},\n' "$rootfs_mb"
+  printf '  "images": [\n'
+  printf '    {"path": "disk.img", "format": "raw", "size_mb": %s, "sha256": %s},\n' \
+    "$raw_mb" "$(json_quote "$raw_sha")"
+  printf '    {"path": "disk.qcow2", "format": "qcow2", "size_mb": %s, "sha256": %s}\n' \
+    "$qcow_mb" "$(json_quote "$qcow_sha")"
+  printf '  ],\n'
+  printf '  "boot": {\n'
+  printf '    "kernel": %s,\n' "$(json_quote "$kernel_rel")"
+  printf '    "initrd": %s,\n' "$(json_quote "$initrd_rel")"
+  printf '    "cmdline": %s\n' "$(json_quote "$ARTIFACT_BOOT_CMDLINE")"
+  printf '  },\n'
+  printf '  "builder": {"name": %s, "version": %s}\n' \
+    "$(json_quote "$ARTIFACT_BUILDER_NAME")" "$(json_quote "$ARTIFACT_BUILDER_VERSION")"
+  printf '}\n'
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # Engine preflight
 # ---------------------------------------------------------------------------
 
@@ -759,6 +1037,16 @@ native_preflight() {
 
   if ! command -v mmdebstrap >/dev/null 2>&1; then
     err "native engine requires 'mmdebstrap' on PATH; it was not found"
+    failed=1
+  fi
+
+  if ! command -v mkfs.ext4 >/dev/null 2>&1; then
+    err "native engine requires 'mkfs.ext4' on PATH (e2fsprogs); it was not found"
+    failed=1
+  fi
+
+  if ! command -v qemu-img >/dev/null 2>&1; then
+    err "native engine requires 'qemu-img' on PATH (qemu-utils); it was not found"
     failed=1
   fi
 

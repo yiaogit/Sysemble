@@ -1,0 +1,41 @@
+apiVersion: sysemble/v1
+
+meta:
+  name: minimal-debian
+  description: Minimal bootable Debian used by the P0-b boot smoke test.
+  tags: [minimal, boot, ci]
+
+target:
+  base:
+    kind: debian
+    release: trixie
+    pin: "2026-11-01"
+  arch: x86_64
+  firmware: uefi
+  output: [qcow2]
+
+system:
+  hostname: sysemble
+  locale: C.UTF-8
+  timezone: UTC
+  users:
+    - name: ops
+      groups: [sudo]
+      shell: /bin/bash
+      password: locked
+  kernel:
+    flavor: lts
+  packages:
+    include: []
+    exclude: []
+
+security:
+  disk_encryption: none
+  secure_boot: false
+  firewall: none
+  hardening: minimal
+
+verify:
+  scenarios:
+    - id: boot
+      tests: [boot, network]
