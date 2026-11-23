@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sysemble boot-check (P0-b).
+# Sysemble boot-check (P0-b + P0-c UEFI).
 #
 # Boots a built disk image with QEMU and proves that the serial console reaches
 # a kernel, systemd, and a login prompt. With --log-from it runs the same
@@ -9,18 +9,31 @@
 # Contract (frozen):
 #   tools/boot-check.sh --artifact <artifact.json> [--timeout 300] [--json]
 #                       [--log-from <file>] [--qemu <binary>]
+#                       [--firmware <OVMF_CODE.fd>]
 #
-# Artifact paths (boot.kernel, boot.initrd, images[].path) are resolved relative
-# to the directory holding artifact.json. Boot-check writes
+# Two boot modes are selected by artifact.boot.mode:
+#
+#   kernel (default)  QEMU starts the kernel directly with -kernel/-initrd and
+#                     the raw image as a virtio drive (P0-b behavior).
+#   uefi              QEMU boots OVMF from pflash, which loads GRUB from the GPT
+#                     ESP on artifact.boot.disk. The kernel, initrd, and cmdline
+#                     live inside the disk and are not passed to QEMU.
+#
+# Artifact paths (boot.kernel, boot.initrd, boot.disk, images[].path) are
+# resolved relative to the directory holding artifact.json. Boot-check writes
 # <artifact dir>/boot.log and <artifact dir>/boot-evidence.json plus a temporary
-# directory under $TMPDIR. QEMU itself opens the raw image read-write because the
-# artifact cmdline mounts the root filesystem rw, so the image must be writable
-# by the user running boot-check. The host, network, and boot configuration are
-# never modified; no sudo is used.
+# directory under $TMPDIR. In UEFI mode the OVMF VARS template is copied to a
+# temporary file inside that $TMPDIR work directory (QEMU needs a writable copy)
+# and deleted on exit; nothing is ever written to the caller's working
+# directory. QEMU opens the target disk read-write because the cmdline mounts
+# the root filesystem rw, so the disk must be writable by the user running
+# boot-check. The host, network, and boot configuration are never modified; no
+# sudo is used.
 #
 # A successful boot does not power itself off. In QEMU mode a monitor watches
-# boot.log and stops QEMU as soon as all three required assertions have matched,
-# which is what lets a healthily booted VM finish before --timeout.
+# boot.log and stops QEMU as soon as every required assertion has matched (3 in
+# kernel mode, 5 in UEFI mode), which is what lets a healthily booted VM finish
+# before --timeout.
 #
 # Requires bash 3.2+ (macOS /bin/bash). Do not use bash 4 features
 # (mapfile, associative arrays, wait -n, ...).
@@ -50,6 +63,7 @@ TIMEOUT_SECONDS=$DEFAULT_TIMEOUT
 JSON_OUTPUT=0
 LOG_FROM=""
 QEMU_OPT=""
+FIRMWARE_OPT=""
 
 ARTIFACT_ABS=""
 ARTIFACT_DIR=""
@@ -57,18 +71,25 @@ JSON_BACKEND=""
 TMP_DIR=""
 
 ARCH_VALUE=""
+BOOT_MODE="kernel"
 KERNEL_REL=""
 INITRD_REL=""
 CMDLINE_VALUE=""
 RAW_IMAGE_REL=""
+BOOT_DISK_REL=""
 
 KERNEL_ABS=""
 INITRD_ABS=""
 RAW_IMAGE_ABS=""
+BOOT_DISK_ABS=""
 
 QEMU_LABEL=""
 QEMU_BIN=""
 MACHINE=""
+
+FIRMWARE_CODE=""
+FIRMWARE_VARS=""
+VARS_TMP=""
 
 LOG_PATH=""
 LOG_EVIDENCE=""
@@ -76,12 +97,23 @@ EVIDENCE_PATH=""
 LOG_HASH=""
 ELAPSED=0
 
+FIRMWARE_RESULT="fail"
+FIRMWARE_DETAIL=""
+GRUB_RESULT="fail"
+GRUB_DETAIL=""
 KERNEL_RESULT="fail"
 KERNEL_DETAIL=""
 SYSTEMD_RESULT="fail"
 SYSTEMD_DETAIL=""
 LOGIN_RESULT="fail"
 LOGIN_DETAIL=""
+
+# Assertion records for the evidence JSON: id<0x1f>result<0x1f>detail per line.
+# The unit separator is the same framing character the artifact parser uses, so
+# assertion details can never be split by the shell or by IFS whitespace.
+US=$'\x1f'
+ASSERT_RECORDS=""
+LOG_STATE="ok"
 
 RESULT="fail"
 TIMED_OUT=0
@@ -114,11 +146,12 @@ say() {
 }
 
 IFS= read -r -d '' USAGE_TEXT <<'USAGE' || true
-Sysemble boot-check (P0-b) - prove a built image reaches a login prompt
+Sysemble boot-check (P0-b/P0-c) - prove a built image boots to a login prompt
 
 Usage:
   tools/boot-check.sh --artifact <artifact.json> [--timeout 300] [--json]
                       [--log-from <file>] [--qemu <binary>]
+                      [--firmware <OVMF_CODE.fd>]
 
 Options:
   --artifact <path>  artifact.json produced by builders/debian/build.sh
@@ -128,32 +161,46 @@ Options:
   --log-from <file>  offline mode: do not run QEMU, run the assertions against
                      this existing serial log
   --qemu <binary>    QEMU binary (default: qemu-system-<arch> from PATH)
+  --firmware <path>  OVMF code image for boot.mode=uefi. Default: the first
+                     readable path of
+                       /usr/share/OVMF/OVMF_CODE_4M.fd
+                       /usr/share/OVMF/OVMF_CODE.fd
+                       /usr/share/edk2/ovmf/OVMF_CODE.fd
+                     The matching VARS template is taken from the same
+                     directory (OVMF_VARS_4M.fd / OVMF_VARS.fd).
   -h, --help         show this help and exit 0
 
 Artifact fields used (relative to the artifact.json directory):
   apiVersion must be 'sysemble/artifact/v1'
   arch       must be 'x86_64' or 'aarch64'
-  boot.kernel / boot.initrd must exist
+  boot.mode  'kernel' (default when absent) or 'uefi'
+  boot.kernel / boot.initrd  required when boot.mode=kernel
+  boot.disk  required when boot.mode=uefi: raw GPT disk image with the ESP
+  boot.cmdline is passed to QEMU -append in kernel mode only
   images[]   must contain an entry with format 'raw' whose path exists
-  boot.cmdline is passed to QEMU -append
 
-QEMU opens the raw image read-write (the cmdline mounts the root filesystem rw)
-and boot-check writes boot.log/boot-evidence.json beside artifact.json, so the
-artifact directory and raw image must be writable by the invoking user.
+In kernel mode QEMU opens the raw image read-write (the cmdline mounts the root
+filesystem rw); in UEFI mode it opens boot.disk read-write and pflash. Boot-check
+writes boot.log/boot-evidence.json beside artifact.json, so the artifact
+directory, the raw image, and boot.disk must be writable by the invoking user.
 
 Assertions (all required):
-  boot.kernel   serial log contains 'Linux version'
-  boot.systemd  serial log contains 'systemd[1]' or 'Reached target'
-  boot.login    serial log contains 'login:'
+  boot.firmware  (uefi only) serial log contains 'EFI v' or 'UEFI'
+  boot.grub      (uefi only) serial log contains 'GRUB' or 'Booting'
+  boot.kernel    serial log contains 'Linux version'
+  boot.systemd   serial log contains 'systemd[1]' or 'Reached target'
+  boot.login     serial log contains 'login:'
 
-In QEMU mode all three must pass before --timeout; QEMU is stopped as soon as
-they do. A timeout keeps the partial boot.log and reports result 'timeout'.
+In QEMU mode every assertion must pass before --timeout; QEMU is stopped as soon
+as they do. A timeout keeps the partial boot.log and reports result 'timeout'.
+--log-from never launches QEMU or probes firmware, so UEFI assertions are
+testable offline.
 
 Exit codes:
   0  all assertions passed
   1  one or more assertions failed
   2  usage, file, JSON, or evidence I/O error
-  3  QEMU is unavailable
+  3  QEMU or OVMF firmware is unavailable
   4  timed out waiting for the assertions
 
 This script never changes the host, never uses sudo, and never needs network.
@@ -241,6 +288,29 @@ parse_args() {
         QEMU_OPT=${1#--qemu=}
         if [ -z "$QEMU_OPT" ]; then
           err "--qemu must not be empty"
+          usage >&2
+          exit "$EXIT_USAGE"
+        fi
+        shift
+        ;;
+      --firmware)
+        if [ "$#" -lt 2 ]; then
+          err "--firmware requires a value"
+          usage >&2
+          exit "$EXIT_USAGE"
+        fi
+        if [ -z "$2" ]; then
+          err "--firmware must not be empty"
+          usage >&2
+          exit "$EXIT_USAGE"
+        fi
+        FIRMWARE_OPT=$2
+        shift 2
+        ;;
+      --firmware=*)
+        FIRMWARE_OPT=${1#--firmware=}
+        if [ -z "$FIRMWARE_OPT" ]; then
+          err "--firmware must not be empty"
           usage >&2
           exit "$EXIT_USAGE"
         fi
@@ -350,6 +420,16 @@ cleanup() {
         ;;
     esac
   fi
+  # Only ever delete the OVMF VARS copy this run created inside its own
+  # $TMPDIR work directory (mktemp template, checked again here). The
+  # directory itself is removed by the TMP_DIR branch above.
+  if [ -n "$VARS_TMP" ]; then
+    case "$VARS_TMP" in
+      */sysemble-boot.*/ovmf-vars.*)
+        rm -f "$VARS_TMP" 2>/dev/null || true
+        ;;
+    esac
+  fi
   return 0
 }
 
@@ -409,6 +489,8 @@ def image_records:
   else "images\u001fmissing\u001f" end;
 scalar("apiVersion"; ["apiVersion"]),
 scalar("arch"; ["arch"]),
+scalar("boot.mode"; ["boot", "mode"]),
+scalar("boot.disk"; ["boot", "disk"]),
 scalar("boot.kernel"; ["boot", "kernel"]),
 scalar("boot.initrd"; ["boot", "initrd"]),
 scalar("boot.cmdline"; ["boot", "cmdline"]),
@@ -494,6 +576,8 @@ def main(argv):
 
     scalar("apiVersion", ["apiVersion"])
     scalar("arch", ["arch"])
+    scalar("boot.mode", ["boot", "mode"])
+    scalar("boot.disk", ["boot", "disk"])
     scalar("boot.kernel", ["boot", "kernel"])
     scalar("boot.initrd", ["boot", "initrd"])
     scalar("boot.cmdline", ["boot", "cmdline"])
@@ -588,6 +672,8 @@ parse_artifact() {
   local key="" field1="" field2="" field3="" field4="" field5=""
   local api_type="missing" api_value=""
   local arch_type="missing" arch_value=""
+  local mode_type="missing" mode_value=""
+  local disk_type="missing" disk_value=""
   local kernel_type="missing" kernel_value=""
   local initrd_type="missing" initrd_value=""
   local cmdline_type="missing" cmdline_value=""
@@ -622,6 +708,14 @@ parse_artifact() {
       arch)
         arch_type=$field1
         arch_value=$field2
+        ;;
+      boot.mode)
+        mode_type=$field1
+        mode_value=$field2
+        ;;
+      boot.disk)
+        disk_type=$field1
+        disk_value=$field2
         ;;
       boot.kernel)
         kernel_type=$field1
@@ -685,23 +779,63 @@ EOF
       ;;
   esac
 
-  if [ "$kernel_type" != "string" ] || [ -z "$kernel_value" ]; then
-    err "artifact field boot.kernel is missing, empty, or not a string"
-    exit "$EXIT_USAGE"
-  fi
-  KERNEL_REL=$kernel_value
+  # boot.mode selects the QEMU boot path. Absent means "kernel", which keeps
+  # P0-b artifacts (and their evidence) byte-compatible.
+  case "$mode_type" in
+    missing)
+      BOOT_MODE=kernel
+      ;;
+    string)
+      case "$mode_value" in
+        kernel | uefi)
+          BOOT_MODE=$mode_value
+          ;;
+        *)
+          err "artifact boot.mode must be 'kernel' or 'uefi' (got '$mode_value')"
+          exit "$EXIT_USAGE"
+          ;;
+      esac
+      ;;
+    *)
+      err "artifact field boot.mode must be a string (got '$mode_type')"
+      exit "$EXIT_USAGE"
+      ;;
+  esac
 
-  if [ "$initrd_type" != "string" ] || [ -z "$initrd_value" ]; then
-    err "artifact field boot.initrd is missing, empty, or not a string"
+  # OVMF is x86_64-only in P0-c; an aarch64 UEFI artifact would silently get
+  # the wrong QEMU arguments, so reject it instead of booting something else.
+  if [ "$BOOT_MODE" = "uefi" ] && [ "$ARCH_VALUE" != "x86_64" ]; then
+    err "artifact boot.mode=uefi is only supported for arch x86_64 (got '$ARCH_VALUE')"
     exit "$EXIT_USAGE"
   fi
-  INITRD_REL=$initrd_value
 
-  if [ "$cmdline_type" != "string" ]; then
-    err "artifact field boot.cmdline is missing or not a string"
-    exit "$EXIT_USAGE"
+  if [ "$BOOT_MODE" = "kernel" ]; then
+    if [ "$kernel_type" != "string" ] || [ -z "$kernel_value" ]; then
+      err "artifact field boot.kernel is missing, empty, or not a string"
+      exit "$EXIT_USAGE"
+    fi
+    KERNEL_REL=$kernel_value
+
+    if [ "$initrd_type" != "string" ] || [ -z "$initrd_value" ]; then
+      err "artifact field boot.initrd is missing, empty, or not a string"
+      exit "$EXIT_USAGE"
+    fi
+    INITRD_REL=$initrd_value
+
+    if [ "$cmdline_type" != "string" ]; then
+      err "artifact field boot.cmdline is missing or not a string"
+      exit "$EXIT_USAGE"
+    fi
+    CMDLINE_VALUE=$cmdline_value
+  else
+    # UEFI boots through firmware + GRUB, so the kernel/initrd/cmdline inside
+    # boot are informational and are not handed to QEMU.
+    if [ "$disk_type" != "string" ] || [ -z "$disk_value" ]; then
+      err "artifact field boot.disk is required when boot.mode=uefi"
+      exit "$EXIT_USAGE"
+    fi
+    BOOT_DISK_REL=$disk_value
   fi
-  CMDLINE_VALUE=$cmdline_value
 
   if [ "$images_kind" = "missing" ]; then
     err "artifact field images is required"
@@ -720,10 +854,15 @@ EOF
     exit "$EXIT_USAGE"
   fi
 
-  resolve_artifact_file "boot.kernel" "$KERNEL_REL"
-  KERNEL_ABS=$RESOLVED_FILE
-  resolve_artifact_file "boot.initrd" "$INITRD_REL"
-  INITRD_ABS=$RESOLVED_FILE
+  if [ "$BOOT_MODE" = "kernel" ]; then
+    resolve_artifact_file "boot.kernel" "$KERNEL_REL"
+    KERNEL_ABS=$RESOLVED_FILE
+    resolve_artifact_file "boot.initrd" "$INITRD_REL"
+    INITRD_ABS=$RESOLVED_FILE
+  else
+    resolve_artifact_file "boot.disk" "$BOOT_DISK_REL"
+    BOOT_DISK_ABS=$RESOLVED_FILE
+  fi
   resolve_artifact_file "images[].path (raw)" "$RAW_IMAGE_REL"
   RAW_IMAGE_ABS=$RESOLVED_FILE
 }
@@ -766,7 +905,16 @@ log_has() {
   grep -Fq "$1" "$LOG_PATH" 2>/dev/null
 }
 
+# The assertion set depends on the boot mode: UEFI adds firmware and GRUB
+# before the kernel/systemd/login triple. Both all_assertions_pass (the QEMU
+# early-stop monitor) and evaluate_assertions (the evidence writer) use the
+# same predicates so a boot can never be "proven" by one and reported by the
+# other.
 all_assertions_pass() {
+  if [ "$BOOT_MODE" = "uefi" ]; then
+    log_has 'EFI v' || log_has 'UEFI' || return 1
+    log_has 'GRUB' || log_has 'Booting' || return 1
+  fi
   log_has 'Linux version' || return 1
   if ! log_has 'systemd[1]' && ! log_has 'Reached target'; then
     return 1
@@ -774,77 +922,118 @@ all_assertions_pass() {
   log_has 'login:'
 }
 
-# Set KERNEL_RESULT/KERNEL_DETAIL, SYSTEMD_RESULT/SYSTEMD_DETAIL, and
-# LOGIN_RESULT/LOGIN_DETAIL from the current log. A missing or empty log is an
-# assertion failure, never an I/O error.
-evaluate_assertions() {
-  local log_state="ok"
-
+log_state_of() {
   if [ ! -f "$LOG_PATH" ]; then
-    log_state="missing"
+    printf 'missing'
   elif [ ! -s "$LOG_PATH" ]; then
-    log_state="empty"
+    printf 'empty'
+  else
+    printf 'ok'
+  fi
+}
+
+# Compose the detail for a failed assertion. $1 is the expectation phrase, e.g.
+# 'no `login:`'; the caller passes the exact wording used by P0-b.
+failure_detail() {
+  local expectation=$1
+
+  if [ "$LOG_STATE" = "missing" ]; then
+    printf 'log file is missing'
+    return 0
+  fi
+  if [ "$LOG_STATE" = "empty" ]; then
+    printf 'log is empty'
+    return 0
+  fi
+  if [ "$TIMED_OUT" -eq 1 ]; then
+    printf '%s within %ss' "$expectation" "$TIMEOUT_SECONDS"
+  else
+    printf '%s in log' "$expectation"
+  fi
+}
+
+# evaluate_assertion <result-var> <detail-var> <fail-phrase> <pattern>...
+#
+# Pass when any pattern is present. The detail lists every pattern that matched
+# so a log carrying all alternatives is visible in the evidence. A missing or
+# empty log is an assertion failure, never an I/O error.
+evaluate_assertion() {
+  local result_var=$1
+  local detail_var=$2
+  local fail_phrase=$3
+  local pattern=""
+  local matched=""
+  local result="fail"
+  local detail=""
+
+  shift 3
+  for pattern in "$@"; do
+    if log_has "$pattern"; then
+      if [ -z "$matched" ]; then
+        matched="\`$pattern\`"
+      else
+        matched="$matched and \`$pattern\`"
+      fi
+    fi
+  done
+
+  if [ -n "$matched" ]; then
+    result=pass
+    detail="matched $matched"
+  else
+    detail=$(failure_detail "$fail_phrase")
   fi
 
-  if log_has 'Linux version'; then
-    KERNEL_RESULT=pass
-    KERNEL_DETAIL="matched \`Linux version\`"
-  else
-    KERNEL_RESULT=fail
-    if [ "$log_state" = "missing" ]; then
-      KERNEL_DETAIL="log file is missing"
-    elif [ "$log_state" = "empty" ]; then
-      KERNEL_DETAIL="log is empty"
-    elif [ "$TIMED_OUT" -eq 1 ]; then
-      KERNEL_DETAIL="no \`Linux version\` within ${TIMEOUT_SECONDS}s"
-    else
-      KERNEL_DETAIL="no \`Linux version\` in log"
-    fi
+  printf -v "$result_var" '%s' "$result"
+  printf -v "$detail_var" '%s' "$detail"
+}
+
+# Append one record for the evidence JSON.
+record_assertion() {
+  ASSERT_RECORDS="${ASSERT_RECORDS}${1}${US}${2}${US}${3}
+"
+}
+
+# Set the result/detail variables for every assertion that applies to the
+# current boot mode, then snapshot them as evidence records in report order.
+# kernel mode runs 3 assertions; uefi mode runs 5.
+evaluate_assertions() {
+  LOG_STATE=$(log_state_of)
+  ASSERT_RECORDS=""
+
+  if [ "$BOOT_MODE" = "uefi" ]; then
+    evaluate_assertion FIRMWARE_RESULT FIRMWARE_DETAIL \
+      'no `EFI v` or `UEFI`' 'EFI v' 'UEFI'
+    record_assertion boot.firmware "$FIRMWARE_RESULT" "$FIRMWARE_DETAIL"
+
+    evaluate_assertion GRUB_RESULT GRUB_DETAIL \
+      'no `GRUB` or `Booting`' 'GRUB' 'Booting'
+    record_assertion boot.grub "$GRUB_RESULT" "$GRUB_DETAIL"
   fi
 
-  if log_has 'systemd[1]' || log_has 'Reached target'; then
-    SYSTEMD_RESULT=pass
-    if log_has 'systemd[1]' && log_has 'Reached target'; then
-      SYSTEMD_DETAIL="matched \`systemd[1]\` and \`Reached target\`"
-    elif log_has 'systemd[1]'; then
-      SYSTEMD_DETAIL="matched \`systemd[1]\`"
-    else
-      SYSTEMD_DETAIL="matched \`Reached target\`"
-    fi
-  else
-    SYSTEMD_RESULT=fail
-    if [ "$log_state" = "missing" ]; then
-      SYSTEMD_DETAIL="log file is missing"
-    elif [ "$log_state" = "empty" ]; then
-      SYSTEMD_DETAIL="log is empty"
-    elif [ "$TIMED_OUT" -eq 1 ]; then
-      SYSTEMD_DETAIL="no \`systemd[1]\` or \`Reached target\` within ${TIMEOUT_SECONDS}s"
-    else
-      SYSTEMD_DETAIL="no \`systemd[1]\` or \`Reached target\` in log"
-    fi
-  fi
+  evaluate_assertion KERNEL_RESULT KERNEL_DETAIL \
+    'no `Linux version`' 'Linux version'
+  record_assertion boot.kernel "$KERNEL_RESULT" "$KERNEL_DETAIL"
 
-  if log_has 'login:'; then
-    LOGIN_RESULT=pass
-    LOGIN_DETAIL="matched \`login:\`"
-  else
-    LOGIN_RESULT=fail
-    if [ "$log_state" = "missing" ]; then
-      LOGIN_DETAIL="log file is missing"
-    elif [ "$log_state" = "empty" ]; then
-      LOGIN_DETAIL="log is empty"
-    elif [ "$TIMED_OUT" -eq 1 ]; then
-      LOGIN_DETAIL="no \`login:\` within ${TIMEOUT_SECONDS}s"
-    else
-      LOGIN_DETAIL="no \`login:\` in log"
-    fi
-  fi
+  evaluate_assertion SYSTEMD_RESULT SYSTEMD_DETAIL \
+    'no `systemd[1]` or `Reached target`' 'systemd[1]' 'Reached target'
+  record_assertion boot.systemd "$SYSTEMD_RESULT" "$SYSTEMD_DETAIL"
+
+  evaluate_assertion LOGIN_RESULT LOGIN_DETAIL \
+    'no `login:`' 'login:'
+  record_assertion boot.login "$LOGIN_RESULT" "$LOGIN_DETAIL"
 }
 
 determine_result() {
   if [ "$TIMED_OUT" -eq 1 ] && [ "$SUCCEEDED" -eq 0 ]; then
     RESULT=timeout
     return 0
+  fi
+  if [ "$BOOT_MODE" = "uefi" ]; then
+    if [ "$FIRMWARE_RESULT" != "pass" ] || [ "$GRUB_RESULT" != "pass" ]; then
+      RESULT=fail
+      return 0
+    fi
   fi
   if [ "$KERNEL_RESULT" = "pass" ] &&
     [ "$SYSTEMD_RESULT" = "pass" ] &&
@@ -931,6 +1120,164 @@ select_qemu_for_run() {
   QEMU_BIN=$found
 }
 
+# ---------------------------------------------------------------------------
+# OVMF firmware (boot.mode=uefi)
+# ---------------------------------------------------------------------------
+
+# Absolute path without requiring the file to exist. Returns 1 when the parent
+# directory cannot be resolved.
+absolutize_path() {
+  local path=$1
+  local dir=""
+  local base=""
+
+  case "$path" in
+    /*)
+      printf '%s' "$path"
+      ;;
+    *)
+      dir=${path%/*}
+      base=${path##*/}
+      if [ "$dir" = "$path" ]; then
+        dir=.
+      fi
+      if ! dir=$(cd "$dir" 2>/dev/null && pwd -P); then
+        return 1
+      fi
+      printf '%s/%s' "$dir" "$base"
+      ;;
+  esac
+}
+
+# Probe order is part of the P0-c contract; --firmware always wins.
+probe_firmware() {
+  local candidate=""
+
+  for candidate in \
+    /usr/share/OVMF/OVMF_CODE_4M.fd \
+    /usr/share/OVMF/OVMF_CODE.fd \
+    /usr/share/edk2/ovmf/OVMF_CODE.fd; do
+    if [ -f "$candidate" ] && [ -r "$candidate" ]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# OVMF ships a read-only CODE image plus a writable VARS template. QEMU's
+# pflash drive must be writable, so the template is copied into boot-check's
+# own $TMPDIR work directory (removed by cleanup(), also on failure/timeout) and
+# never into the artifact directory or the caller's working directory. Missing
+# firmware is exit 3, the same class as a missing QEMU.
+resolve_firmware() {
+  local code_dir=""
+  local code_base=""
+  local vars_base=""
+  local candidate=""
+  local resolved=""
+
+  if [ -n "$FIRMWARE_OPT" ]; then
+    if ! resolved=$(absolutize_path "$FIRMWARE_OPT"); then
+      err "cannot resolve --firmware path: $FIRMWARE_OPT"
+      exit "$EXIT_QEMU"
+    fi
+    if [ ! -f "$resolved" ] || [ ! -r "$resolved" ]; then
+      err "OVMF firmware not found or not readable: $FIRMWARE_OPT"
+      err "hint: install OVMF (e.g. apt-get install ovmf) or pass --firmware <OVMF_CODE.fd>"
+      exit "$EXIT_QEMU"
+    fi
+    FIRMWARE_CODE=$resolved
+  else
+    if ! FIRMWARE_CODE=$(probe_firmware); then
+      err "no OVMF firmware found; boot.mode=uefi needs a UEFI code image"
+      err "looked for: /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE.fd"
+      err "hint: install OVMF (e.g. apt-get install ovmf) or pass --firmware <OVMF_CODE.fd>"
+      exit "$EXIT_QEMU"
+    fi
+  fi
+
+  code_dir=${FIRMWARE_CODE%/*}
+  code_base=${FIRMWARE_CODE##*/}
+  case "$code_base" in
+    *CODE_4M.fd) vars_base=${code_base%CODE_4M.fd}VARS_4M.fd ;;
+    *CODE.fd) vars_base=${code_base%CODE.fd}VARS.fd ;;
+    *CODE_4M) vars_base=${code_base%CODE_4M}VARS_4M ;;
+    *CODE) vars_base=${code_base%CODE}VARS ;;
+    *) vars_base="" ;;
+  esac
+
+  # Prefer the name derived from the code image, then the two conventional
+  # template names in the same directory.
+  for candidate in "$vars_base" OVMF_VARS_4M.fd OVMF_VARS.fd; do
+    if [ -n "$candidate" ] && [ -f "$code_dir/$candidate" ] && [ -r "$code_dir/$candidate" ]; then
+      FIRMWARE_VARS="$code_dir/$candidate"
+      break
+    fi
+  done
+
+  if [ -z "$FIRMWARE_VARS" ]; then
+    err "cannot find an OVMF VARS template next to $FIRMWARE_CODE"
+    err "expected ${vars_base:-OVMF_VARS_4M.fd} or OVMF_VARS.fd in ${code_dir:-/}"
+    exit "$EXIT_QEMU"
+  fi
+
+  case "$FIRMWARE_CODE" in
+    *,*)
+      err "firmware code path contains a comma, which cannot be expressed in QEMU -drive: $FIRMWARE_CODE"
+      exit "$EXIT_USAGE"
+      ;;
+  esac
+  case "$FIRMWARE_VARS" in
+    *,*)
+      err "firmware VARS path contains a comma, which cannot be expressed in QEMU -drive: $FIRMWARE_VARS"
+      exit "$EXIT_USAGE"
+      ;;
+  esac
+
+  if ! VARS_TMP=$(mktemp "$TMP_DIR/ovmf-vars.XXXXXX" 2>/dev/null); then
+    err "cannot create a temporary OVMF VARS file in: $TMP_DIR"
+    exit "$EXIT_USAGE"
+  fi
+  case "$VARS_TMP" in
+    *,*)
+      err "temporary directory path contains a comma, which cannot be expressed in QEMU -drive: $TMP_DIR"
+      exit "$EXIT_USAGE"
+      ;;
+  esac
+  if ! cp "$FIRMWARE_VARS" "$VARS_TMP" 2>/dev/null; then
+    err "cannot copy OVMF VARS template: $FIRMWARE_VARS"
+    rm -f "$VARS_TMP" 2>/dev/null || true
+    VARS_TMP=""
+    exit "$EXIT_USAGE"
+  fi
+
+  say "firmware: $FIRMWARE_CODE"
+  say "firmware vars: $FIRMWARE_VARS (temporary copy in $TMP_DIR)"
+}
+
+# QEMU opens the boot disk read-write (the guest mounts the root filesystem rw),
+# so a root-owned image from a sudo build cannot boot. Fail early with an
+# actionable diagnostic instead of letting QEMU emit a permission error that
+# would look like a boot assertion failure.
+require_writable_disk() {
+  local label=$1
+  local rel=$2
+  local abs=$3
+
+  case "$rel" in
+    *,*)
+      err "$label path contains a comma, which cannot be expressed in QEMU -drive: $rel"
+      exit "$EXIT_USAGE"
+      ;;
+  esac
+  if [ ! -w "$abs" ]; then
+    err "$label is not writable by this user: $abs"
+    err "hint: run boot-check as the user that owns the build output, or chown the output directory"
+    exit "$EXIT_USAGE"
+  fi
+}
+
 run_qemu() {
   local qemu_args=()
   local qemu_status=0
@@ -944,21 +1291,11 @@ run_qemu() {
     exit "$EXIT_USAGE"
   fi
 
-  case "$RAW_IMAGE_REL" in
-    *,*)
-      err "raw image path contains a comma, which cannot be expressed in QEMU -drive: $RAW_IMAGE_REL"
-      exit "$EXIT_USAGE"
-      ;;
-  esac
-
-  # QEMU opens the raw image read-write (the artifact cmdline mounts the root
-  # filesystem rw), so a root-owned 0644 image from a sudo build cannot boot.
-  # Fail early with an actionable diagnostic instead of letting QEMU emit a
-  # permission error that would look like a boot assertion failure.
-  if [ ! -w "$RAW_IMAGE_ABS" ]; then
-    err "raw image is not writable by this user: $RAW_IMAGE_ABS"
-    err "hint: run boot-check as the user that owns the build output, or chown the output directory"
-    exit "$EXIT_USAGE"
+  if [ "$BOOT_MODE" = "uefi" ]; then
+    resolve_firmware
+    require_writable_disk "boot.disk" "$BOOT_DISK_REL" "$BOOT_DISK_ABS"
+  else
+    require_writable_disk "raw image" "$RAW_IMAGE_REL" "$RAW_IMAGE_ABS"
   fi
 
   LOG_PATH="$ARTIFACT_DIR/boot.log"
@@ -971,19 +1308,34 @@ run_qemu() {
     exit "$EXIT_USAGE"
   fi
 
-  qemu_args=(
-    -machine "$MACHINE"
-    -m 1024
-    -smp 2
-    -nographic
-    -no-reboot
-    -kernel "$KERNEL_ABS"
-    -initrd "$INITRD_ABS"
-    -append "$CMDLINE_VALUE"
-    -drive "file=$RAW_IMAGE_ABS,format=raw,if=virtio"
-  )
-
-  say "launching $QEMU_LABEL (-machine $MACHINE, timeout ${TIMEOUT_SECONDS}s)"
+  if [ "$BOOT_MODE" = "uefi" ]; then
+    # Contract sequence: firmware CODE (read-only), writable VARS copy, then the
+    # partitioned disk as a virtio drive. GRUB loads the kernel from the ESP.
+    qemu_args=(
+      -machine q35
+      -m 1024
+      -smp 2
+      -nographic
+      -no-reboot
+      -drive "if=pflash,format=raw,readonly=on,file=$FIRMWARE_CODE"
+      -drive "if=pflash,format=raw,file=$VARS_TMP"
+      -drive "file=$BOOT_DISK_ABS,format=raw,if=virtio"
+    )
+    say "launching $QEMU_LABEL (uefi/OVMF, -machine q35, timeout ${TIMEOUT_SECONDS}s)"
+  else
+    qemu_args=(
+      -machine "$MACHINE"
+      -m 1024
+      -smp 2
+      -nographic
+      -no-reboot
+      -kernel "$KERNEL_ABS"
+      -initrd "$INITRD_ABS"
+      -append "$CMDLINE_VALUE"
+      -drive "file=$RAW_IMAGE_ABS,format=raw,if=virtio"
+    )
+    say "launching $QEMU_LABEL (-machine $MACHINE, timeout ${TIMEOUT_SECONDS}s)"
+  fi
   say "serial log: $LOG_PATH"
 
   SECONDS=0
@@ -1117,12 +1469,7 @@ write_evidence() {
       --argjson timeout_seconds "$TIMEOUT_SECONDS" \
       --argjson elapsed_seconds "$ELAPSED" \
       --arg result "$RESULT" \
-      --arg kernel_result "$KERNEL_RESULT" \
-      --arg kernel_detail "$KERNEL_DETAIL" \
-      --arg systemd_result "$SYSTEMD_RESULT" \
-      --arg systemd_detail "$SYSTEMD_DETAIL" \
-      --arg login_result "$LOGIN_RESULT" \
-      --arg login_detail "$LOGIN_DETAIL" \
+      --arg assertions "$ASSERT_RECORDS" \
       --arg log "$LOG_EVIDENCE" \
       --arg log_sha256 "$LOG_HASH" \
       '{
@@ -1132,11 +1479,12 @@ write_evidence() {
         timeout_seconds: $timeout_seconds,
         elapsed_seconds: $elapsed_seconds,
         result: $result,
-        assertions: [
-          {id: "boot.kernel", result: $kernel_result, detail: $kernel_detail},
-          {id: "boot.systemd", result: $systemd_result, detail: $systemd_detail},
-          {id: "boot.login", result: $login_result, detail: $login_detail}
-        ],
+        assertions: (
+          $assertions
+          | split("\n")
+          | map(select(length > 0) | split("\u001f"))
+          | map({id: .[0], result: .[1], detail: .[2]})
+        ),
         log: $log,
         log_sha256: $log_sha256
       }' >"$tmp"; then
@@ -1145,11 +1493,26 @@ write_evidence() {
     fi
   else
     if ! python3 - "$tmp" "$ARTIFACT_ABS" "$QEMU_LABEL" "$TIMEOUT_SECONDS" \
-      "$ELAPSED" "$RESULT" "$KERNEL_RESULT" "$KERNEL_DETAIL" \
-      "$SYSTEMD_RESULT" "$SYSTEMD_DETAIL" "$LOGIN_RESULT" "$LOGIN_DETAIL" \
+      "$ELAPSED" "$RESULT" "$ASSERT_RECORDS" \
       "$LOG_EVIDENCE" "$LOG_HASH" <<'PY'
 import json
 import sys
+
+
+def parse_assertions(records):
+    assertions = []
+    for line in records.split("\n"):
+        if not line:
+            continue
+        parts = line.split("\x1f")
+        assertions.append(
+            {
+                "id": parts[0],
+                "result": parts[1] if len(parts) > 1 else "fail",
+                "detail": parts[2] if len(parts) > 2 else "",
+            }
+        )
+    return assertions
 
 
 def main(argv):
@@ -1161,25 +1524,9 @@ def main(argv):
         "timeout_seconds": int(argv[4]),
         "elapsed_seconds": int(argv[5]),
         "result": argv[6],
-        "assertions": [
-            {
-                "id": "boot.kernel",
-                "result": argv[7],
-                "detail": argv[8],
-            },
-            {
-                "id": "boot.systemd",
-                "result": argv[9],
-                "detail": argv[10],
-            },
-            {
-                "id": "boot.login",
-                "result": argv[11],
-                "detail": argv[12],
-            },
-        ],
-        "log": argv[13],
-        "log_sha256": argv[14],
+        "assertions": parse_assertions(argv[7]),
+        "log": argv[8],
+        "log_sha256": argv[9],
     }
     try:
         with open(out, "w", encoding="utf-8") as fh:
@@ -1208,14 +1555,31 @@ PY
 }
 
 report_summary() {
+  local id=""
+  local result=""
+  local detail=""
+
+  if [ "$BOOT_MODE" = "uefi" ]; then
+    if [ -n "$FIRMWARE_CODE" ]; then
+      say "boot mode: uefi (OVMF $FIRMWARE_CODE + GRUB)"
+    else
+      say "boot mode: uefi (OVMF + GRUB)"
+    fi
+  else
+    say "boot mode: kernel (-kernel/-initrd)"
+  fi
   if [ -n "$LOG_FROM" ]; then
     say "mode: offline (--log-from $LOG_FROM)"
   fi
   say "artifact: $ARTIFACT_ABS"
   say "qemu: $QEMU_LABEL (timeout ${TIMEOUT_SECONDS}s)"
-  say "boot.kernel: $KERNEL_RESULT - $KERNEL_DETAIL"
-  say "boot.systemd: $SYSTEMD_RESULT - $SYSTEMD_DETAIL"
-  say "boot.login: $LOGIN_RESULT - $LOGIN_DETAIL"
+  while IFS="$US" read -r id result detail; do
+    if [ -n "$id" ]; then
+      say "$id: $result - $detail"
+    fi
+  done <<EOF
+$ASSERT_RECORDS
+EOF
   say "result: $RESULT (${ELAPSED}s)"
   say "evidence: $EVIDENCE_PATH"
 }
@@ -1242,6 +1606,10 @@ main() {
   resolve_artifact
   detect_json_backend
   parse_artifact
+
+  if [ -n "$FIRMWARE_OPT" ] && [ "$BOOT_MODE" != "uefi" ]; then
+    warn "ignoring --firmware: artifact boot.mode is '$BOOT_MODE' (only 'uefi' uses OVMF)"
+  fi
 
   if [ -n "$LOG_FROM" ]; then
     run_offline

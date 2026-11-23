@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sysemble Debian builder - shared helpers for build.sh (P0-a + P0-b).
+# Sysemble Debian builder - shared helpers for build.sh (P0-a + P0-b + P0-c).
 #
 # This file is sourced by build.sh. It is written for bash 3.2 (the /bin/bash
 # shipped by macOS) and must not use bash 4 features (mapfile, nameref, ...).
@@ -8,7 +8,8 @@
 #   - JSON access (jq preferred, python3 fallback) and the record protocol
 #   - plan validation
 #   - engine preflight checks (native / docker)
-#   - artifact.json generation helpers (P0-b)
+#   - disk sizing, GRUB config rendering, and artifact.json generation helpers
+#     (P0-b kernel mode + P0-c GPT/GRUB/UEFI extensions)
 #   - output helpers / usage text
 #
 # It is safe to source this file without running a build: it only defines
@@ -27,6 +28,30 @@ EXIT_NATIVE=3
 EXIT_DOCKER=4
 EXIT_JSON=5
 EXIT_BUILD=6
+
+# ---------------------------------------------------------------------------
+# P0-c disk layout (frozen by docs/plan/P0-c-workplan.md §2)
+#
+#   disk.img (GPT)
+#     p1  1 MiB   +512 MiB  ESP   vfat32  label ESP
+#     p2  513 MiB  rest      root  ext4    label SYMBLE
+#
+# The build is loop-free: the ext4 filesystem is written into disk.img at a
+# byte offset, the FAT32 file system is built in a separate esp.img and then
+# merged with dd. These constants are shared by build.sh and the tests.
+# ---------------------------------------------------------------------------
+
+DISK_MIN_MB=4096
+ESP_SIZE_MB=512
+# p2 starts one 1 MiB alignment gap after the end of the 512 MiB ESP.
+ROOT_START_MB=513
+ROOT_OFFSET_BYTES=$((ROOT_START_MB * 1024 * 1024))
+# mkfs.vfat size argument is in 1 KiB blocks.
+ESP_IMAGE_KB=$((ESP_SIZE_MB * 1024))
+GRUB_EFI_REL="esp/EFI/BOOT/BOOTX64.EFI"
+GRUB_CONFIG_REL="grub.cfg"
+GRUB_MENU_TITLE="Sysemble"
+GRUB_MODULES="part_gpt part_msdos fat ext2 normal linux search search_fs_uuid configfile serial terminal echo test"
 
 # docker info is given this long before it is treated as unavailable, so the
 # script never hangs on a wedged daemon.
@@ -99,7 +124,7 @@ err() {
 # ---------------------------------------------------------------------------
 
 IFS= read -r -d '' USAGE_TEXT <<'USAGE' || true
-Sysemble Debian builder (P0-b) - build a bootable Debian disk image from plan.json
+Sysemble Debian builder (P0-c) - build a bootable Debian UEFI disk image from plan.json
 
 Usage:
   builders/debian/build.sh --plan <plan.json> --out <dir> [--dry-run] [--execute] [--engine docker|native]
@@ -110,24 +135,30 @@ Options:
   --dry-run          validate the plan, print stages/packages/estimates, and
                      write only <out>/plan.copy.json
   --execute          explicit alias for the default build mode: build the
-                     rootfs, disk images, and artifact.json. Mutually exclusive
-                     with --dry-run. The CI contract passes this flag.
+                     rootfs, GPT disk images, and artifact.json. Mutually
+                     exclusive with --dry-run. The CI contract passes this flag.
   --engine <name>    native (default) or docker
   -h, --help         show this help and exit 0
 
 Outputs (native --execute):
   <out>/rootfs/        mmdebstrap rootfs
-  <out>/disk.img       raw ext4 image (mkfs.ext4 -d)
+  <out>/disk.img       raw GPT image: p1 ESP (vfat32) + p2 root (ext4)
   <out>/disk.qcow2     qcow2 conversion of disk.img
-  <out>/artifact.json  sysemble/artifact/v1 manifest
+  <out>/esp/           ESP staging tree (EFI/BOOT/BOOTX64.EFI, boot/grub/grub.cfg)
+  <out>/grub.cfg       GRUB config embedded into BOOTX64.EFI
+  <out>/artifact.json  sysemble/artifact/v1 manifest (boot.mode = "uefi")
   <out>/build.log      full build output (tee)
 
+  <out>/esp.img is a temporary FAT32 image and is removed on success.
+
 Engines:
-  native   requires Linux, euid 0, and mmdebstrap, mkfs.ext4, and qemu-img on
-           PATH; builds rootfs, disk.img, disk.qcow2, and artifact.json.
+  native   requires Linux, euid 0, and mmdebstrap, mkfs.ext4, qemu-img,
+           sgdisk, mkfs.vfat, mcopy, grub-mkstandalone, and dd on PATH;
+           builds rootfs, disk.img (GPT + ESP + GRUB EFI), disk.qcow2, and
+           artifact.json.
   docker   runs mmdebstrap in a debian:trixie container with <out> mounted at
            /out; requires a working Docker daemon. Docker mode still stops after
-           the rootfs: P0-b disk/artifact assembly is native-only and has not
+           the rootfs: P0-c disk/artifact assembly is native-only and has not
            been verified in docker mode, so --execute with --engine docker is
            rejected (exit 2). --dry-run does not check the engine, so it works
            on hosts without Linux/Docker.
@@ -138,15 +169,17 @@ Exit codes:
      missing for a real native build (artifact.json requires it)
   2  usage or I/O error (including an unsafe --out)
   3  native engine unavailable (not Linux, not root, or a required tool is
-     missing: mmdebstrap, mkfs.ext4, qemu-img)
+     missing: mmdebstrap, mkfs.ext4, qemu-img, sgdisk, mkfs.vfat, mcopy,
+     grub-mkstandalone, dd)
   4  docker engine unavailable (no docker CLI or no daemon)
   5  no JSON parser available (install jq or python3)
   6  a build step failed, <out>/rootfs or an output image already exists, or
      the rootfs has no bootable kernel/initrd
 
-P0-b scope: Debian rootfs + raw ext4 disk + qcow2 + artifact manifest.
-Partitioning, bootloaders, ISO assembly, and cross-architecture builds are out
-of scope. Docker mode is P0-a rootfs-only and P0-b unverified.
+P0-c1 scope: GPT partition table, FAT32 ESP, GRUB EFI (embedded config), and
+UEFI artifact extensions. Installers, desktops, ISO/squashfs, secure boot, and
+cross-architecture builds are out of scope. An artifact without boot.mode still
+means the P0-b direct-kernel mode.
 USAGE
 
 usage() {
@@ -769,7 +802,52 @@ print_estimate() {
 ARTIFACT_API_VERSION="sysemble/artifact/v1"
 ARTIFACT_BUILDER_NAME="build.sh"
 ARTIFACT_BUILDER_VERSION="0.1.0"
-ARTIFACT_BOOT_CMDLINE="console=ttyS0 root=/dev/vda rw rootfstype=ext4 systemd.unit=multi-user.target"
+# P0-b direct-kernel mode (kept for artifact v1 backward compatibility).
+ARTIFACT_BOOT_CMDLINE_KERNEL="console=ttyS0 root=/dev/vda rw rootfstype=ext4 systemd.unit=multi-user.target"
+# P0-c UEFI mode: the root filesystem is GPT partition 2 of the virtio disk.
+ARTIFACT_BOOT_CMDLINE_UEFI="root=/dev/vda2 rw console=ttyS0 rootfstype=ext4 systemd.unit=multi-user.target"
+# Backward-compatible alias for the current UEFI cmdline.
+ARTIFACT_BOOT_CMDLINE=$ARTIFACT_BOOT_CMDLINE_UEFI
+
+# Emit the frozen P0-c GRUB configuration on stdout. <kernel_name> and
+# <initrd_name> are basenames found under rootfs/boot (for example
+# vmlinuz-6.12.3-amd64). build.sh embeds this text into BOOTX64.EFI with
+# grub-mkstandalone and keeps a copy at <out>/grub.cfg.
+grub_cfg_text() {
+  local kernel_name=$1
+  local initrd_name=$2
+
+  case "$kernel_name" in
+    '')
+      err "grub_cfg_text: kernel name is empty"
+      return 2
+      ;;
+    */*)
+      err "grub_cfg_text: kernel name must be a basename (got '$kernel_name')"
+      return 2
+      ;;
+  esac
+  case "$initrd_name" in
+    '')
+      err "grub_cfg_text: initrd name is empty"
+      return 2
+      ;;
+    */*)
+      err "grub_cfg_text: initrd name must be a basename (got '$initrd_name')"
+      return 2
+      ;;
+  esac
+
+  printf 'set timeout=3\n'
+  printf 'serial --unit=0 --speed=115200\n'
+  printf 'terminal_input serial\n'
+  printf 'terminal_output serial\n'
+  printf 'menuentry "%s" {\n' "$GRUB_MENU_TITLE"
+  printf '  set root=(hd0,gpt2)\n'
+  printf '  linux /boot/%s %s\n' "$kernel_name" "$ARTIFACT_BOOT_CMDLINE_UEFI"
+  printf '  initrd /boot/%s\n' "$initrd_name"
+  printf '}\n'
+}
 
 # Escape a string for a JSON string body. Plan records are already stripped of
 # control characters by the JSON extractors, so backslash and quote escaping
@@ -856,11 +934,15 @@ rootfs_size_mb() {
   printf '%s\n' $(((kb + 1023) / 1024))
 }
 
-# P0-b disk sizing: ceil(rootfs_mb * 1.6 + 512), rounded up to the next 256 MB
-# boundary, with a 2048 MB floor. Integer arithmetic only (bash 3.2).
+# P0-c disk sizing (frozen):
+#   size_mb = max(4096, ceil((rootfs_mb * 1.6 + 1024) / 256) * 256)
+#
+# Integer arithmetic only (bash 3.2). The ceiling is applied once to the real
+# value: ceil((8 * rootfs_mb + 5120) / 1280) * 256, because
+#   rootfs_mb * 1.6 + 1024 = (8 * rootfs_mb + 5120) / 5
+#   / 256                  = (8 * rootfs_mb + 5120) / 1280
 compute_disk_size_mb() {
   local rootfs_mb=$1
-  local grown=0
   local size=0
 
   case "$rootfs_mb" in
@@ -870,14 +952,44 @@ compute_disk_size_mb() {
       ;;
   esac
 
-  # ceil(rootfs_mb * 8 / 5) + 512
-  grown=$((((rootfs_mb * 8) + 4) / 5 + 512))
-  # round up to a 256 MB boundary
-  size=$((((grown + 255) / 256) * 256))
-  if [ "$size" -lt 2048 ]; then
-    size=2048
+  # ceil((rootfs_mb * 8 / 5 + 1024) / 256) * 256
+  size=$((((rootfs_mb * 8) + 5120 + 1279) / 1280 * 256))
+  if [ "$size" -lt "$DISK_MIN_MB" ]; then
+    size=$DISK_MIN_MB
   fi
   printf '%s\n' "$size"
+}
+
+# Number of 4096-byte ext4 blocks for the root partition.
+#
+# P0-c writes ext4 into disk.img at ROOT_OFFSET_BYTES with -E offset= without
+# giving mke2fs an explicit size. mke2fs then sizes the filesystem to
+# "end-of-file - offset" (and prints "Warning: offset specified without an
+# explicit file system size"). That is slightly LARGER than GPT partition 2,
+# because p2 ends 33-34 sectors before the end of the disk to leave room for
+# the backup GPT, and the kernel refuses to mount such an image:
+#   "bad geometry: block count N exceeds size of device (M blocks)".
+#
+# Passing `-b 4096` plus an explicit block count keeps ext4 inside p2 and also
+# avoids overwriting the backup GPT. We reserve one extra MiB before the end of
+# the disk for safety, so one MiB is 256 blocks at 4096 bytes per block.
+compute_root_fs_blocks() {
+  local disk_mb=$1
+  local blocks=0
+
+  case "$disk_mb" in
+    '' | *[!0-9]*)
+      err "disk_mb must be a non-negative integer (got '$disk_mb')"
+      return 2
+      ;;
+  esac
+
+  blocks=$(((disk_mb - ROOT_START_MB - 1) * 256))
+  if [ "$blocks" -le 0 ]; then
+    err "disk_mb ${disk_mb} MB is too small for the P0-c layout"
+    return 2
+  fi
+  printf '%s\n' "$blocks"
 }
 
 # Pick the highest-versioned file matching <rootfs>/boot/<prefix>-* using
@@ -907,8 +1019,12 @@ find_boot_image() {
 #                 [package ...]
 #
 # <out_dir> must contain rootfs/, disk.img, and disk.qcow2 with a kernel and an
-# initrd under rootfs/boot/. The function never writes files; build.sh writes
-# its stdout atomically to <out>/artifact.json.
+# initrd under rootfs/boot/. When <out_dir> also contains the P0-c GRUB outputs
+# (grub.cfg and esp/EFI/BOOT/BOOTX64.EFI) the manifest is extended with
+# boot.mode="uefi", boot.disk, boot.grub, and the two partitions. Without those
+# outputs the historical P0-b direct-kernel shape is emitted (boot.mode absent,
+# which consumers must treat as "kernel"). The function never writes files;
+# build.sh writes its stdout atomically to <out>/artifact.json.
 artifact_json() {
   local out=""
   local spec=""
@@ -919,6 +1035,13 @@ artifact_json() {
   local rootfs=""
   local raw=""
   local qcow=""
+  local esp_efi=""
+  local grub_cfg=""
+  local uefi=0
+  local have_efi=0
+  local have_cfg=0
+  local cmdline=""
+  local root_part_mb=""
   local rootfs_mb=""
   local raw_mb=""
   local qcow_mb=""
@@ -946,6 +1069,8 @@ artifact_json() {
   rootfs="$out/rootfs"
   raw="$out/disk.img"
   qcow="$out/disk.qcow2"
+  esp_efi="$out/$GRUB_EFI_REL"
+  grub_cfg="$out/$GRUB_CONFIG_REL"
 
   if [ ! -d "$rootfs" ]; then
     err "artifact: rootfs directory is missing: $rootfs"
@@ -957,6 +1082,26 @@ artifact_json() {
   fi
   if [ ! -f "$qcow" ]; then
     err "artifact: qcow2 image is missing: $qcow"
+    return 1
+  fi
+
+  # The two P0-c outputs are written together. Seeing only one means a partial
+  # assembly, so refuse to guess a boot mode.
+  if [ -e "$esp_efi" ] || [ -L "$esp_efi" ]; then
+    have_efi=1
+  fi
+  if [ -e "$grub_cfg" ] || [ -L "$grub_cfg" ]; then
+    have_cfg=1
+  fi
+  if [ "$have_efi" -eq 1 ] && [ "$have_cfg" -eq 1 ]; then
+    if [ ! -f "$esp_efi" ] || [ ! -s "$esp_efi" ] ||
+      [ ! -f "$grub_cfg" ] || [ ! -s "$grub_cfg" ]; then
+      err "artifact: UEFI outputs are incomplete: $GRUB_EFI_REL and $GRUB_CONFIG_REL must be non-empty regular files"
+      return 1
+    fi
+    uefi=1
+  elif [ "$have_efi" -eq 1 ] || [ "$have_cfg" -eq 1 ]; then
+    err "artifact: incomplete UEFI outputs: expected both $GRUB_EFI_REL and $GRUB_CONFIG_REL"
     return 1
   fi
 
@@ -976,6 +1121,19 @@ artifact_json() {
   qcow_mb=$(file_size_mb "$qcow") || return 1
   raw_sha=$(sha256_file "$raw") || return 1
   qcow_sha=$(sha256_file "$qcow") || return 1
+
+  if [ "$uefi" -eq 1 ]; then
+    if [ "$raw_mb" -le "$ESP_SIZE_MB" ]; then
+      err "artifact: raw image is too small for a ${ESP_SIZE_MB} MB ESP (got ${raw_mb} MB)"
+      return 1
+    fi
+    cmdline=$ARTIFACT_BOOT_CMDLINE_UEFI
+    # The frozen P0-c artifact sample reports root = disk_mb - 512: the 1 MiB
+    # alignment gap between the GPT start and the ESP is not charged to a role.
+    root_part_mb=$((raw_mb - ESP_SIZE_MB))
+  else
+    cmdline=$ARTIFACT_BOOT_CMDLINE_KERNEL
+  fi
 
   if [ -n "$pin" ]; then
     pin_json=$(json_quote "$pin")
@@ -1002,10 +1160,28 @@ artifact_json() {
     "$qcow_mb" "$(json_quote "$qcow_sha")"
   printf '  ],\n'
   printf '  "boot": {\n'
+  if [ "$uefi" -eq 1 ]; then
+    printf '    "mode": "uefi",\n'
+    printf '    "disk": "disk.img",\n'
+  fi
   printf '    "kernel": %s,\n' "$(json_quote "$kernel_rel")"
   printf '    "initrd": %s,\n' "$(json_quote "$initrd_rel")"
-  printf '    "cmdline": %s\n' "$(json_quote "$ARTIFACT_BOOT_CMDLINE")"
+  if [ "$uefi" -eq 1 ]; then
+    printf '    "cmdline": %s,\n' "$(json_quote "$cmdline")"
+    printf '    "grub": {"efi": %s, "config": %s}\n' \
+      "$(json_quote "$GRUB_EFI_REL")" "$(json_quote "$GRUB_CONFIG_REL")"
+  else
+    printf '    "cmdline": %s\n' "$(json_quote "$cmdline")"
+  fi
   printf '  },\n'
+  if [ "$uefi" -eq 1 ]; then
+    printf '  "partitions": [\n'
+    printf '    {"index": 1, "role": "esp", "size_mb": %s, "fs": "vfat32"},\n' \
+      "$ESP_SIZE_MB"
+    printf '    {"index": 2, "role": "root", "size_mb": %s, "fs": "ext4"}\n' \
+      "$root_part_mb"
+    printf '  ],\n'
+  fi
   printf '  "builder": {"name": %s, "version": %s}\n' \
     "$(json_quote "$ARTIFACT_BUILDER_NAME")" "$(json_quote "$ARTIFACT_BUILDER_VERSION")"
   printf '}\n'
@@ -1047,6 +1223,33 @@ native_preflight() {
 
   if ! command -v qemu-img >/dev/null 2>&1; then
     err "native engine requires 'qemu-img' on PATH (qemu-utils); it was not found"
+    failed=1
+  fi
+
+  # P0-c1 GPT + GRUB/UEFI toolchain. Every missing tool is reported, then the
+  # caller exits 3.
+  if ! command -v sgdisk >/dev/null 2>&1; then
+    err "native engine requires 'sgdisk' on PATH (gdisk) to write the GPT partition table; it was not found"
+    failed=1
+  fi
+
+  if ! command -v mkfs.vfat >/dev/null 2>&1; then
+    err "native engine requires 'mkfs.vfat' on PATH (dosfstools) to create the FAT32 ESP; it was not found"
+    failed=1
+  fi
+
+  if ! command -v mcopy >/dev/null 2>&1; then
+    err "native engine requires 'mcopy' on PATH (mtools) to populate the ESP; it was not found"
+    failed=1
+  fi
+
+  if ! command -v grub-mkstandalone >/dev/null 2>&1; then
+    err "native engine requires 'grub-mkstandalone' on PATH (grub-efi-amd64-bin) to build BOOTX64.EFI; it was not found"
+    failed=1
+  fi
+
+  if ! command -v dd >/dev/null 2>&1; then
+    err "native engine requires 'dd' on PATH (coreutils) to merge the ESP into disk.img; it was not found"
     failed=1
   fi
 

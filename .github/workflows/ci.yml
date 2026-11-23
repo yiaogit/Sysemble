@@ -39,7 +39,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             mmdebstrap debian-archive-keyring \
-            qemu-system-x86 qemu-utils e2fsprogs jq
+            qemu-system-x86 qemu-utils e2fsprogs jq \
+            gdisk dosfstools mtools grub-efi-amd64-bin grub-common ovmf
 
       - name: Plan minimal image
         run: cargo run -q -p sysemble-cli -- plan examples/minimal-debian.yaml > plan.json

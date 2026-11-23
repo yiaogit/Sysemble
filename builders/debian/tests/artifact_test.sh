@@ -1,10 +1,18 @@
 #!/usr/bin/env bash
-# P0-b artifact manifest tests.
+# P0-c artifact manifest tests.
 #
-# Runs entirely offline: no Linux, root, mmdebstrap, mkfs.ext4, qemu-img or
-# qemu is required. It builds a fixture rootfs, sources lib.sh (which defines
-# functions only), calls the pure artifact_json()/compute_disk_size_mb()
-# helpers, and validates the result with python3.
+# Runs entirely offline: no Linux, root, mmdebstrap, mkfs.ext4, mkfs.vfat,
+# sgdisk, mcopy, grub-mkstandalone, qemu-img or qemu is required. It builds a
+# fixture rootfs plus a fake ESP/GRUB tree, sources lib.sh (which defines
+# functions only), and calls the pure artifact_json()/compute_disk_size_mb()/
+# grub_cfg_text() helpers. The result is validated with python3 (jq fallback).
+#
+# Covered:
+#   - P0-c UEFI artifact: boot.mode/disk/grub, two partitions, vda2 cmdline
+#   - P0-b kernel fallback when the GRUB outputs are absent (mode defaults)
+#   - images raw+qcow2 with sha256/size, kernel/initrd selection
+#   - missing kernel/initrd still fail (build.sh maps that to exit 6)
+#   - P0-c disk sizing formula and GRUB config rendering
 #
 # Usage: bash builders/debian/tests/artifact_test.sh
 
@@ -57,6 +65,18 @@ assert_eq() {
   fi
 }
 
+assert_contains() {
+  local pattern=$1
+  local file=$2
+  local label=$3
+
+  if grep -Fq -- "$pattern" "$file"; then
+    pass "$label"
+  else
+    fail "$label (pattern '$pattern' not found in $file)"
+  fi
+}
+
 json_backend=python3
 if ! command -v python3 >/dev/null 2>&1; then
   if command -v jq >/dev/null 2>&1; then
@@ -68,7 +88,8 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 
 # ---------------------------------------------------------------------------
-# Fixture: a rootfs with two kernel/initrd versions plus the disk images.
+# Fixture: a rootfs with two kernel/initrd versions, a 4096 MiB disk image
+# (the P0-c minimum), a fake qcow2, and the P0-c ESP/GRUB outputs.
 # ---------------------------------------------------------------------------
 
 OUT="$TMP_DIR/out"
@@ -87,7 +108,7 @@ printf 'sysemble\n' >"$ROOTFS/etc/hostname"
 printf '#!/bin/sh\n' >"$ROOTFS/usr/bin/sysemble-fixture"
 
 printf 'raw-image\n' >"$OUT/disk.img"
-truncate -s 3M "$OUT/disk.img"
+truncate -s 4096M "$OUT/disk.img"
 
 # Fake qemu-img: only the artifact test needs a qcow2 file, not a real
 # conversion. This mirrors how the CI fake toolchain produces disk.qcow2.
@@ -109,6 +130,17 @@ SH
 chmod +x "$FAKEBIN/qemu-img"
 "$FAKEBIN/qemu-img" convert -O qcow2 "$OUT/disk.img" "$OUT/disk.qcow2"
 
+KERNEL_NAME="vmlinuz-6.12.3"
+INITRD_NAME="initrd.img-6.12.3"
+
+# The real build writes <out>/grub.cfg and stages a copy under esp/. The
+# artifact helper only requires both paths to exist and the config to be
+# non-empty.
+mkdir -p "$OUT/esp/EFI/BOOT" "$OUT/esp/boot/grub"
+grub_cfg_text "$KERNEL_NAME" "$INITRD_NAME" >"$OUT/grub.cfg"
+cp "$OUT/grub.cfg" "$OUT/esp/boot/grub/grub.cfg"
+printf 'fake BOOTX64.EFI\n' >"$OUT/esp/EFI/BOOT/BOOTX64.EFI"
+
 PACKAGES=(apt ca-certificates systemd)
 JSON="$TMP_DIR/artifact.json"
 CREATED_AT="2026-11-23T12:00:00Z"
@@ -121,17 +153,51 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# JSON shape / values
+# GRUB config rendering (input to grub-mkstandalone)
+# ---------------------------------------------------------------------------
+
+assert_contains "set timeout=3" "$OUT/grub.cfg" "grub.cfg sets a boot timeout"
+assert_contains "serial --unit=0 --speed=115200" "$OUT/grub.cfg" "grub.cfg configures serial console"
+assert_contains "terminal_input serial" "$OUT/grub.cfg" "grub.cfg uses serial input"
+assert_contains "terminal_output serial" "$OUT/grub.cfg" "grub.cfg uses serial output"
+assert_contains "menuentry \"Sysemble\"" "$OUT/grub.cfg" "grub.cfg has the Sysemble menu entry"
+assert_contains "set root=(hd0,gpt2)" "$OUT/grub.cfg" "grub.cfg selects (hd0,gpt2)"
+assert_contains "linux /boot/$KERNEL_NAME root=/dev/vda2 rw console=ttyS0" "$OUT/grub.cfg" \
+  "grub.cfg linux line has the real kernel and vda2 cmdline"
+assert_contains "initrd /boot/$INITRD_NAME" "$OUT/grub.cfg" \
+  "grub.cfg initrd line has the real initrd"
+assert_contains "rootfstype=ext4 systemd.unit=multi-user.target" "$OUT/grub.cfg" \
+  "grub.cfg cmdline is the frozen P0-c cmdline"
+
+if grub_cfg_text "" "$INITRD_NAME" >/dev/null 2>&1; then
+  fail "grub_cfg_text must reject an empty kernel name"
+else
+  pass "grub_cfg_text rejects an empty kernel name"
+fi
+if grub_cfg_text "/boot/$KERNEL_NAME" "$INITRD_NAME" >/dev/null 2>&1; then
+  fail "grub_cfg_text must reject a kernel path with a slash"
+else
+  pass "grub_cfg_text rejects a kernel path instead of a basename"
+fi
+
+# ---------------------------------------------------------------------------
+# JSON shape / values (P0-c UEFI artifact)
 # ---------------------------------------------------------------------------
 
 if [ "$json_backend" = "python3" ]; then
-  if python3 - "$JSON" "$OUT" "$CREATED_AT" <<'PY'
+  if python3 - "$JSON" "$OUT" "$CREATED_AT" "$KERNEL_NAME" "$INITRD_NAME" <<'PY'
 import json
 import os
 import re
 import sys
 
-path, out, created_at = sys.argv[1], sys.argv[2], sys.argv[3]
+path, out, created_at, kernel_name, initrd_name = (
+    sys.argv[1],
+    sys.argv[2],
+    sys.argv[3],
+    sys.argv[4],
+    sys.argv[5],
+)
 with open(path, "r", encoding="utf-8") as fh:
     doc = json.load(fh)
 
@@ -144,9 +210,9 @@ check(isinstance(doc, dict), "artifact is a JSON object")
 check(
     set(doc) == {
         "apiVersion", "createdAt", "spec", "base", "arch", "packages",
-        "rootfs", "images", "boot", "builder",
+        "rootfs", "images", "boot", "partitions", "builder",
     },
-    "top-level keys match sysemble/artifact/v1",
+    "top-level keys match sysemble/artifact/v1 plus P0-c partitions",
 )
 check(doc["apiVersion"] == "sysemble/artifact/v1", "apiVersion is sysemble/artifact/v1")
 check(doc["createdAt"] == created_at, "createdAt is the supplied timestamp")
@@ -180,20 +246,37 @@ for image in images:
     check(image["size_mb"] == expected_mb, "%s size_mb matches the file size" % image["format"])
 
 boot = doc["boot"]
-check(boot["kernel"] == "rootfs/boot/vmlinuz-6.12.3", "highest kernel version wins (6.12.3)")
-check(boot["initrd"] == "rootfs/boot/initrd.img-6.12.3", "highest initrd version wins (6.12.3)")
+check(boot["mode"] == "uefi", "boot.mode is uefi")
+check(boot["disk"] == "disk.img", "boot.disk is disk.img")
+check(boot["kernel"] == "rootfs/boot/" + kernel_name, "highest kernel version wins (6.12.3)")
+check(boot["initrd"] == "rootfs/boot/" + initrd_name, "highest initrd version wins (6.12.3)")
 check(
-    boot["cmdline"] == "console=ttyS0 root=/dev/vda rw rootfstype=ext4 systemd.unit=multi-user.target",
-    "boot.cmdline is the frozen P0-b cmdline",
+    boot["cmdline"] == "root=/dev/vda2 rw console=ttyS0 rootfstype=ext4 systemd.unit=multi-user.target",
+    "boot.cmdline is the frozen P0-c UEFI cmdline",
+)
+check(boot["cmdline"].startswith("root=/dev/vda2"), "boot.cmdline starts with root=/dev/vda2")
+check(
+    boot["grub"] == {"efi": "esp/EFI/BOOT/BOOTX64.EFI", "config": "grub.cfg"},
+    "boot.grub points at the generated EFI and config",
 )
 check(os.path.isfile(os.path.join(out, boot["kernel"])), "boot.kernel exists under <out>")
 check(os.path.isfile(os.path.join(out, boot["initrd"])), "boot.initrd exists under <out>")
+check(os.path.isfile(os.path.join(out, boot["grub"]["efi"])), "boot.grub.efi exists under <out>")
+check(os.path.isfile(os.path.join(out, boot["grub"]["config"])), "boot.grub.config exists under <out>")
+
+check(
+    doc["partitions"] == [
+        {"index": 1, "role": "esp", "size_mb": 512, "fs": "vfat32"},
+        {"index": 2, "role": "root", "size_mb": 3584, "fs": "ext4"},
+    ],
+    "partitions are exactly the P0-c ESP 512 / root 3584 layout",
+)
 check(doc["builder"] == {"name": "build.sh", "version": "0.1.0"}, "builder name/version")
 PY
   then
-    pass "artifact JSON shape and values"
+    pass "artifact JSON shape and values (P0-c UEFI)"
   else
-    fail "artifact JSON shape and values"
+    fail "artifact JSON shape and values (P0-c UEFI)"
   fi
 else
   # jq fallback keeps the test runnable on hosts without python3.
@@ -208,14 +291,21 @@ else
       (.images | length == 2) and
       ([.images[].format] | sort == ["qcow2","raw"]) and
       ([.images[].sha256 | test("^[0-9a-f]{64}$")] | all) and
+      .boot.mode == "uefi" and
+      .boot.disk == "disk.img" and
       .boot.kernel == "rootfs/boot/vmlinuz-6.12.3" and
       .boot.initrd == "rootfs/boot/initrd.img-6.12.3" and
-      .boot.cmdline == "console=ttyS0 root=/dev/vda rw rootfstype=ext4 systemd.unit=multi-user.target" and
+      .boot.cmdline == "root=/dev/vda2 rw console=ttyS0 rootfstype=ext4 systemd.unit=multi-user.target" and
+      .boot.grub == {"efi":"esp/EFI/BOOT/BOOTX64.EFI","config":"grub.cfg"} and
+      .partitions == [
+        {"index":1,"role":"esp","size_mb":512,"fs":"vfat32"},
+        {"index":2,"role":"root","size_mb":3584,"fs":"ext4"}
+      ] and
       .builder == {"name":"build.sh","version":"0.1.0"}
     ' "$JSON" >/dev/null 2>&1; then
-    pass "artifact JSON shape and values (jq)"
+    pass "artifact JSON shape and values (P0-c UEFI, jq)"
   else
-    fail "artifact JSON shape and values (jq)"
+    fail "artifact JSON shape and values (P0-c UEFI, jq)"
   fi
 fi
 
@@ -243,6 +333,8 @@ if doc["spec"] != sys.argv[2]:
     sys.exit("spec round-trip mismatch")
 if doc["base"]["pin"] is not None:
     sys.exit("missing pin must be null")
+if doc["boot"]["mode"] != "uefi":
+    sys.exit("UEFI mode lost on the escaped-spec artifact")
 PY
   then
     pass "escaped spec round-trips and missing pin is null"
@@ -250,12 +342,83 @@ PY
     fail "escaped spec round-trips and missing pin is null"
   fi
 else
-  if jq -e '.base.pin == null' "$WEIRD_JSON" >/dev/null 2>&1; then
+  if jq -e '.base.pin == null and .boot.mode == "uefi"' "$WEIRD_JSON" >/dev/null 2>&1; then
     pass "missing pin is null (jq)"
   else
     fail "missing pin is null (jq)"
   fi
 fi
+
+# ---------------------------------------------------------------------------
+# P0-b backward compatibility: without GRUB outputs the helper must emit the
+# historical direct-kernel shape (boot.mode absent means kernel).
+# ---------------------------------------------------------------------------
+
+mkdir -p "$TMP_DIR/uefi-held"
+mv "$OUT/esp" "$TMP_DIR/uefi-held/esp"
+mv "$OUT/grub.cfg" "$TMP_DIR/uefi-held/grub.cfg"
+# The legacy shape has no partitions, so a small raw file is enough and keeps
+# the extra SHA-256 fast.
+truncate -s 3M "$OUT/disk.img"
+
+LEGACY_JSON="$TMP_DIR/artifact-kernel.json"
+if artifact_json "$OUT" "minimal-debian" "trixie" "2026-11-01" "x86_64" \
+  "$CREATED_AT" "${PACKAGES[@]}" >"$LEGACY_JSON" 2>"$TMP_DIR/legacy.err"; then
+  pass "artifact_json still emits the P0-b kernel shape without ESP outputs"
+else
+  fail "artifact_json failed for the P0-b kernel fallback"
+fi
+
+if [ "$json_backend" = "python3" ]; then
+  if python3 - "$LEGACY_JSON" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    doc = json.load(fh)
+if "partitions" in doc:
+    sys.exit("kernel-mode artifact must not contain partitions")
+if "mode" in doc["boot"]:
+    sys.exit("kernel-mode artifact must omit boot.mode (defaults to kernel)")
+if "disk" in doc["boot"] or "grub" in doc["boot"]:
+    sys.exit("kernel-mode artifact must not contain UEFI boot fields")
+if doc["boot"]["cmdline"] != "console=ttyS0 root=/dev/vda rw rootfstype=ext4 systemd.unit=multi-user.target":
+    sys.exit("kernel-mode cmdline changed")
+PY
+  then
+    pass "kernel fallback omits mode/disk/grub/partitions and keeps the P0-b cmdline"
+  else
+    fail "kernel fallback shape is wrong"
+  fi
+else
+  if jq -e 'has("partitions") | not' "$LEGACY_JSON" >/dev/null 2>&1 &&
+    jq -e '.boot | has("mode") | not' "$LEGACY_JSON" >/dev/null 2>&1; then
+    pass "kernel fallback omits mode and partitions (jq)"
+  else
+    fail "kernel fallback shape is wrong (jq)"
+  fi
+fi
+
+mv "$TMP_DIR/uefi-held/esp" "$OUT/esp"
+mv "$TMP_DIR/uefi-held/grub.cfg" "$OUT/grub.cfg"
+truncate -s 4096M "$OUT/disk.img"
+
+# ---------------------------------------------------------------------------
+# Incomplete UEFI outputs must fail instead of guessing a boot mode
+# ---------------------------------------------------------------------------
+
+mv "$OUT/grub.cfg" "$TMP_DIR/uefi-held/grub.cfg"
+if artifact_json "$OUT" "minimal-debian" "trixie" "2026-11-01" "x86_64" \
+  "$CREATED_AT" "${PACKAGES[@]}" >"$TMP_DIR/incomplete.json" 2>"$TMP_DIR/incomplete.err"; then
+  fail "artifact_json must fail when only one UEFI output exists"
+else
+  if grep -q 'incomplete UEFI outputs' "$TMP_DIR/incomplete.err"; then
+    pass "incomplete UEFI outputs fail with a readable error"
+  else
+    fail "incomplete UEFI error is not readable"
+  fi
+fi
+mv "$TMP_DIR/uefi-held/grub.cfg" "$OUT/grub.cfg"
 
 # ---------------------------------------------------------------------------
 # Missing kernel / initrd must fail (build.sh maps this to exit 6)
@@ -291,19 +454,45 @@ fi
 mv "$TMP_DIR/held/initrd.img-6.1.0" "$TMP_DIR/held/initrd.img-6.12.3" "$ROOTFS/boot/"
 
 # ---------------------------------------------------------------------------
-# Disk sizing formula
+# Disk sizing formula (P0-c)
 # ---------------------------------------------------------------------------
 
-assert_eq "2048" "$(compute_disk_size_mb 1)" "1 MB rootfs clamps to the 2048 MB floor"
-assert_eq "2048" "$(compute_disk_size_mb 500)" "500 MB rootfs clamps to the 2048 MB floor"
-assert_eq "2304" "$(compute_disk_size_mb 1000)" "1000 MB rootfs -> 2304 MB (1600+512 rounded to 256)"
-assert_eq "3840" "$(compute_disk_size_mb 2000)" "2000 MB rootfs -> 3840 MB"
-assert_eq "2048" "$(compute_disk_size_mb 100)" "100 MB rootfs clamps to 2048 MB"
+assert_eq "4096" "$(compute_disk_size_mb 1)" "1 MB rootfs clamps to the 4096 MB floor"
+assert_eq "4096" "$(compute_disk_size_mb 100)" "100 MB rootfs clamps to 4096 MB"
+assert_eq "4096" "$(compute_disk_size_mb 500)" "500 MB rootfs clamps to 4096 MB"
+assert_eq "4096" "$(compute_disk_size_mb 1000)" "1000 MB rootfs clamps to the 4096 MB floor"
+assert_eq "4096" "$(compute_disk_size_mb 1920)" "1920 MB rootfs -> exactly 4096 MB"
+assert_eq "4352" "$(compute_disk_size_mb 2000)" "2000 MB rootfs -> 4352 MB"
+assert_eq "5888" "$(compute_disk_size_mb 3000)" "3000 MB rootfs -> 5888 MB"
+assert_eq "7680" "$(compute_disk_size_mb 4096)" "4096 MB rootfs -> 7680 MB"
+assert_eq "9216" "$(compute_disk_size_mb 5000)" "5000 MB rootfs -> 9216 MB (rounded to 256)"
 
 if compute_disk_size_mb "not-a-number" >/dev/null 2>&1; then
   fail "compute_disk_size_mb rejects non-numeric input"
 else
   pass "compute_disk_size_mb rejects non-numeric input"
+fi
+
+# The explicit ext4 block count keeps the filesystem inside GPT p2 and leaves
+# the final 1 MiB (backup GPT) untouched.
+assert_eq "916992" "$(compute_root_fs_blocks 4096)" "4096 MB disk -> 916992 ext4 blocks (3582 MiB)"
+assert_eq "982528" "$(compute_root_fs_blocks 4352)" "4352 MB disk -> 982528 ext4 blocks"
+if compute_root_fs_blocks "not-a-number" >/dev/null 2>&1; then
+  fail "compute_root_fs_blocks rejects non-numeric input"
+else
+  pass "compute_root_fs_blocks rejects non-numeric input"
+fi
+if compute_root_fs_blocks 513 >/dev/null 2>&1; then
+  fail "compute_root_fs_blocks rejects a disk smaller than the P0-c layout"
+else
+  pass "compute_root_fs_blocks rejects a disk smaller than the P0-c layout"
+fi
+ROOT_BYTES=$((916992 * 4096))
+PART2_MIN_BYTES=$(((4096 - 513) * 1024 * 1024 - 1024 * 1024))
+if [ "$ROOT_BYTES" -le "$PART2_MIN_BYTES" ]; then
+  pass "the explicit root filesystem fits inside GPT partition 2 with a 1 MiB margin"
+else
+  fail "the explicit root filesystem does not fit inside GPT partition 2"
 fi
 
 ROOTFS_MB=$(rootfs_size_mb "$ROOTFS")

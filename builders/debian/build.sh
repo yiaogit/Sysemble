@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# Sysemble Debian builder (P0-a + P0-b native build path).
+# Sysemble Debian builder (P0-a + P0-b native build path + P0-c1 GPT/GRUB/UEFI).
 #
 # Reads a plan.json produced by `sysemble plan --json` and bootstraps a Debian
 # rootfs with mmdebstrap, either natively (Linux/root) or inside a
 # debian:trixie Docker container. In native mode without --dry-run (or with
-# --execute) it then creates a raw ext4 disk with mkfs.ext4 -d, converts it to
-# qcow2 with qemu-img, and writes artifact.json.
+# --execute) it then:
+#   - creates a GPT disk image (p1 ESP vfat32, p2 root ext4) loop-free,
+#   - writes a FAT32 ESP in esp.img, installs GRUB EFI with an embedded
+#     grub.cfg, copies the ESP tree with mcopy, and merges it with dd,
+#   - converts disk.img to qcow2 with qemu-img, and writes artifact.json.
 #
 # Contract (frozen):
 #   build.sh --plan <plan.json> --out <dir> [--dry-run] [--execute] [--engine docker|native]
@@ -252,12 +255,13 @@ copy_plan() {
 }
 
 # ---------------------------------------------------------------------------
-# Build log and failure cleanup (P0-b)
+# Build log and failure cleanup (P0-b, extended by P0-c)
 #
 # Every build-stage message and every external command's stdout/stderr is
-# appended to <out>/build.log via tee. The EXIT trap removes only half-written
-# images (disk.img/disk.qcow2/artifact.json tmp) and keeps rootfs/ + build.log
-# for post-mortem, as required by the P0-b workplan.
+# appended to <out>/build.log via tee. The EXIT trap removes only derived
+# intermediates (esp.img, a half-written qcow2, the artifact temp file) and
+# keeps rootfs/, disk.img, esp/, grub.cfg, and build.log for post-mortem, as
+# required by the P0-c workplan §2 and the task's failure-cleanup rule.
 # ---------------------------------------------------------------------------
 
 prepare_build_log() {
@@ -292,8 +296,10 @@ build_exit_trap() {
   local rc=$1
 
   if [ "$rc" -ne 0 ] && [ "$OUTPUTS_OWNED" -eq 1 ]; then
-    rm -f "$OUT_ABS/disk.img" "$OUT_ABS/disk.qcow2" \
-      "$OUT_ABS/.artifact.json.tmp" 2>/dev/null || true
+    # P0-c: disk.img is deliberately kept for diagnosis (it may hold a valid
+    # GPT/ext4 even when a later GRUB/mcopy/dd/qemu-img step failed).
+    rm -f "$OUT_ABS/esp.img" "$OUT_ABS/disk.qcow2" \
+      "$OUT_ABS/.artifact.json.tmp" "$OUT_ABS/.grub.cfg.tmp" 2>/dev/null || true
   fi
   cleanup_tmp
 }
@@ -445,8 +451,8 @@ finish_rootfs_only() {
   local rootfs=$1
 
   info "[build] stage 5/6: configure - not implemented in P0-a (skipped)"
-  info "[build] stage 6/6: assemble image - not implemented for docker in P0-b (skipped)"
-  warn "docker engine stops after the rootfs; P0-b disk/artifact assembly is native-only and unverified for docker"
+  info "[build] stage 6/6: assemble GPT/GRUB/UEFI image - not supported by the docker engine (skipped)"
+  warn "docker engine stops after the rootfs; P0-c GPT/GRUB/UEFI disk assembly is native-only and unverified for docker"
   info "rootfs ready: $rootfs"
 }
 
@@ -454,13 +460,23 @@ build_native() {
   local rootfs="$OUT_ABS/rootfs"
   local raw="$OUT_ABS/disk.img"
   local qcow="$OUT_ABS/disk.qcow2"
+  local esp_dir="$OUT_ABS/esp"
+  local esp_img="$OUT_ABS/esp.img"
+  local grub_cfg="$OUT_ABS/grub.cfg"
+  local grub_staged="$esp_dir/boot/grub/grub.cfg"
+  local grub_efi="$esp_dir/EFI/BOOT/BOOTX64.EFI"
   local pkg_csv=""
   local hostname=""
   local hook=""
   local kernel=""
   local initrd=""
+  local kernel_name=""
+  local initrd_name=""
   local rootfs_mb=0
   local disk_mb=0
+  local root_part_mb=0
+  local root_fs_blocks=0
+  local esp_bytes=0
 
   # P0-a rule: never overwrite an existing rootfs. The disk outputs are also
   # refused so a stale image can never be paired with a fresh rootfs.
@@ -486,8 +502,23 @@ build_native() {
   hostname=$(plan_hostname)
   hook=$(make_customize_hook "$hostname")
 
-  # From here on, any partial disk.img/disk.qcow2 belongs to this build and is
-  # safe for the EXIT trap to remove.
+  # esp/, esp.img, and grub.cfg are derived P0-c intermediates. They can only
+  # survive a previous interrupted/failed attempt here, because rootfs/ and the
+  # disk images above are refused when they already exist. Removing them keeps
+  # a retry from mixing a stale ESP with a fresh disk.img.
+  if [ -e "$esp_dir" ] || [ -L "$esp_dir" ] ||
+    [ -e "$esp_img" ] || [ -L "$esp_img" ] ||
+    [ -e "$grub_cfg" ] || [ -L "$grub_cfg" ]; then
+    blog "[build] removing stale P0-c staging outputs from a previous attempt"
+    if ! rm -rf "$esp_dir" "$esp_img" "$grub_cfg"; then
+      blog_err "cannot remove stale staging outputs under $OUT_ABS"
+      return 6
+    fi
+  fi
+  rm -f "$OUT_ABS/.grub.cfg.tmp" "$OUT_ABS/.artifact.json.tmp" 2>/dev/null || true
+
+  # From here on, derived outputs belong to this build and the EXIT trap may
+  # remove the ESP image, a partial qcow2, and temp manifests.
   OUTPUTS_OWNED=1
 
   blog "[build] stage 1/6: validate - plan is valid"
@@ -515,7 +546,9 @@ build_native() {
     blog_err "no initrd found: expected $rootfs/boot/initrd.img-* after mmdebstrap"
     return 6
   }
-  blog "[build] boot: kernel=${kernel##*/}, initrd=${initrd##*/}"
+  kernel_name=${kernel##*/}
+  initrd_name=${initrd##*/}
+  blog "[build] boot: kernel=$kernel_name, initrd=$initrd_name"
 
   rootfs_mb=$(rootfs_size_mb "$rootfs") || {
     blog_err "cannot measure rootfs size: $rootfs"
@@ -531,18 +564,106 @@ build_native() {
     blog_err "cannot compute disk size from rootfs size ${rootfs_mb} MB"
     return 6
   }
+  root_part_mb=$((disk_mb - ESP_SIZE_MB))
+  root_fs_blocks=$(compute_root_fs_blocks "$disk_mb") || {
+    blog_err "cannot compute the root filesystem size for a ${disk_mb} MB disk"
+    return 6
+  }
 
-  blog "[build] stage 5/6: create ext4 disk image - rootfs ${rootfs_mb} MB, disk ${disk_mb} MB"
+  blog "[build] stage 5/6: assemble GPT disk image - rootfs ${rootfs_mb} MB, disk ${disk_mb} MB"
+  blog "[build] partitions: p1 esp ${ESP_SIZE_MB} MB (vfat32, start 1 MiB), p2 root ${root_part_mb} MB (ext4, start ${ROOT_START_MB} MiB)"
+  blog "[build] root fs: ${root_fs_blocks} x 4 KiB blocks (explicit size keeps ext4 inside p2/GPT)"
+
   if ! run_logged truncate -s "${disk_mb}M" "$raw"; then
     blog_err "truncate failed: $raw"
     return 6
   fi
-  if ! run_logged mkfs.ext4 -d "$rootfs" -L SYMBLE -F "$raw"; then
-    blog_err "mkfs.ext4 failed; the partial raw image is removed"
+  if ! run_logged sgdisk -Z "$raw"; then
+    blog_err "sgdisk -Z failed; disk.img and build.log are kept for diagnosis"
     return 6
   fi
+  if ! run_logged sgdisk -n 1:2048:+512M -t 1:ef00 -n 2:0:0 -t 2:8300 "$raw"; then
+    blog_err "sgdisk partition creation failed; disk.img and build.log are kept for diagnosis"
+    return 6
+  fi
+  # Loop-free ext4: write the filesystem at the byte offset of partition 2.
+  # The explicit block count is required: without it mke2fs sizes the FS to
+  # end-of-file, which is larger than GPT p2 (the last 33 sectors hold the
+  # backup GPT) and the kernel would refuse to mount it ("bad geometry").
+  if ! run_logged mkfs.ext4 -F -b 4096 -E "offset=$ROOT_OFFSET_BYTES" \
+    -d "$rootfs" -L SYMBLE "$raw" "$root_fs_blocks"; then
+    blog_err "mkfs.ext4 failed; disk.img and build.log are kept for diagnosis"
+    return 6
+  fi
+
+  blog "[build] esp: FAT32 image, GRUB EFI (embedded grub.cfg), mcopy"
+  if ! run_logged mkfs.vfat -F 32 -C -n ESP "$esp_img" "$ESP_IMAGE_KB"; then
+    blog_err "mkfs.vfat failed; disk.img and build.log are kept for diagnosis"
+    return 6
+  fi
+  if ! mkdir -p "$esp_dir/boot/grub" "$esp_dir/EFI/BOOT"; then
+    blog_err "cannot create the ESP staging tree: $esp_dir"
+    return 6
+  fi
+  if ! grub_cfg_text "$kernel_name" "$initrd_name" \
+    >"$OUT_ABS/.grub.cfg.tmp" 2>"$TMP_DIR/grub.err"; then
+    if [ -s "$TMP_DIR/grub.err" ]; then
+      cat "$TMP_DIR/grub.err" | tee -a "$BUILD_LOG" >&2
+    fi
+    rm -f "$OUT_ABS/.grub.cfg.tmp" 2>/dev/null || true
+    blog_err "cannot render grub.cfg for kernel=$kernel_name initrd=$initrd_name"
+    return 6
+  fi
+  if ! mv -f "$OUT_ABS/.grub.cfg.tmp" "$grub_cfg"; then
+    blog_err "cannot write grub.cfg: $grub_cfg"
+    return 6
+  fi
+  if ! cp "$grub_cfg" "$grub_staged"; then
+    blog_err "cannot stage grub.cfg under $esp_dir"
+    return 6
+  fi
+  if ! run_logged grub-mkstandalone -O x86_64-efi -o "$grub_efi" \
+    --modules="$GRUB_MODULES" \
+    "boot/grub/grub.cfg=$grub_staged"; then
+    blog_err "grub-mkstandalone failed; disk.img, esp/ and build.log are kept for diagnosis"
+    return 6
+  fi
+  if [ ! -s "$grub_efi" ]; then
+    blog_err "grub-mkstandalone reported success but $grub_efi is missing or empty"
+    return 6
+  fi
+  if ! run_logged mcopy -i "$esp_img" -s "$esp_dir/EFI" "::/"; then
+    blog_err "mcopy failed to populate the ESP; disk.img and build.log are kept for diagnosis"
+    return 6
+  fi
+  if [ ! -f "$esp_img" ]; then
+    blog_err "mkfs.vfat reported success but $esp_img is missing"
+    return 6
+  fi
+  esp_bytes=$(wc -c <"$esp_img" | tr -d '[:space:]') || esp_bytes=""
+  case "$esp_bytes" in
+    '' | *[!0-9]*)
+      blog_err "cannot determine the size of the ESP image: $esp_img"
+      return 6
+      ;;
+  esac
+  if [ "$esp_bytes" -ne "$((ESP_SIZE_MB * 1024 * 1024))" ]; then
+    blog_err "esp.img is ${esp_bytes} bytes, not the ${ESP_SIZE_MB} MiB ESP partition; refusing to dd over partition 2"
+    return 6
+  fi
+  # Merge the FAT32 ESP at its GPT partition offset (1 MiB). The GPT itself
+  # lives in the first MiB, so it is not overwritten; conv=notrunc keeps dd
+  # from truncating the ext4 partition that lives after the ESP.
+  if ! run_logged dd if="$esp_img" of="$raw" bs=1M seek=1 conv=notrunc; then
+    blog_err "dd failed to merge the ESP into disk.img; disk.img and build.log are kept for diagnosis"
+    return 6
+  fi
+  if ! rm -f "$esp_img"; then
+    blog "[build] warning: could not remove the intermediate ESP image: $esp_img"
+  fi
+
   if ! run_logged qemu-img convert -O qcow2 "$raw" "$qcow"; then
-    blog_err "qemu-img convert failed; the raw and qcow2 images are removed"
+    blog_err "qemu-img convert failed; the partial qcow2 is removed, disk.img and build.log are kept"
     return 6
   fi
 
@@ -566,10 +687,11 @@ build_native() {
   OUTPUTS_OWNED=0
 
   blog ""
-  blog "[build] complete"
+  blog "[build] complete (mode: uefi)"
   blog "  rootfs:   $rootfs"
-  blog "  raw:      $raw (${disk_mb} MB)"
+  blog "  raw:      $raw (${disk_mb} MB: GPT, p1 esp ${ESP_SIZE_MB} MB, p2 root ${root_part_mb} MB)"
   blog "  qcow2:    $qcow"
+  blog "  grub:     $grub_efi (config: $grub_cfg)"
   blog "  artifact: $OUT_ABS/artifact.json"
   blog "  log:      $BUILD_LOG"
   return 0
@@ -672,7 +794,7 @@ main() {
     build_native || exit 6
   else
     if [ "$EXECUTE" -eq 1 ]; then
-      err "P0-b --execute is native-only: docker mode does not assemble disk images or artifact.json (P0-b unverified)"
+      err "P0-c --execute is native-only: docker mode does not assemble GPT/GRUB/UEFI disk images or artifact.json (unverified)"
       exit 2
     fi
     docker_preflight || exit 4

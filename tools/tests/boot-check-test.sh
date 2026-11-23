@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Sysemble boot-check tests (P0-b).
+# Sysemble boot-check tests (P0-b kernel mode + P0-c UEFI mode).
 #
 # Exercises tools/boot-check.sh without QEMU:
 #   - offline assertion mode (--log-from) on canned good/bad/empty logs
+#   - kernel mode: 3 assertions, -kernel/-initrd argv (P0-b regression)
+#   - UEFI mode: 5 assertions, OVMF pflash argv, VARS copy/cleanup, exit 3
 #   - artifact validation and usage errors
 #   - QEMU availability, fake-QEMU success, fake-QEMU timeout
 #
@@ -275,6 +277,198 @@ echo '[    0.000000] Linux version 6.12.0-amd64 (debian-kernel@lists.debian.org)
 exec sleep 10
 EOF
   chmod +x "$1"
+}
+
+# UEFI artifact fixture: GPT disk with an ESP, GRUB metadata, and the boot.mode
+# contract from docs/plan/P0-c-workplan.md section 4.
+make_uefi_fixture() {
+  local dir=$1
+
+  make_fixture "$dir"
+  mkdir -p "$dir/fw"
+  printf 'OVMF-CODE-FIXTURE\n' >"$dir/fw/OVMF_CODE_4M.fd"
+  printf 'OVMF-VARS-FIXTURE\n' >"$dir/fw/OVMF_VARS_4M.fd"
+
+  cat >"$dir/artifact.json" <<'EOF'
+{
+  "apiVersion": "sysemble/artifact/v1",
+  "createdAt": "2026-11-23T12:00:00Z",
+  "spec": "minimal-debian",
+  "base": {"kind": "debian", "release": "trixie", "pin": "2026-11-01"},
+  "arch": "x86_64",
+  "packages": ["linux-image-amd64", "grub-efi-amd64-bin"],
+  "rootfs": {"path": "rootfs", "size_mb": 1},
+  "images": [
+    {"path": "disk.img", "format": "raw", "size_mb": 1, "sha256": "00"},
+    {"path": "disk.qcow2", "format": "qcow2", "size_mb": 1, "sha256": "00"}
+  ],
+  "boot": {
+    "mode": "uefi",
+    "disk": "disk.img",
+    "kernel": "rootfs/boot/vmlinuz-6.12.0-amd64",
+    "initrd": "rootfs/boot/initrd.img-6.12.0-amd64",
+    "cmdline": "root=/dev/vda2 rw console=ttyS0 rootfstype=ext4 systemd.unit=multi-user.target",
+    "grub": {"efi": "esp/EFI/BOOT/BOOTX64.EFI", "config": "grub.cfg"}
+  },
+  "partitions": [
+    {"index": 1, "role": "esp", "size_mb": 512, "fs": "vfat32"},
+    {"index": 2, "role": "root", "size_mb": 3584, "fs": "ext4"}
+  ],
+  "builder": {"name": "build.sh", "version": "0.1.0"}
+}
+EOF
+}
+
+write_uefi_good_log() {
+  cat >"$1" <<'EOF'
+[    0.000000] efi: EFI v2.70 by EDK II
+GRUB loading..
+Booting `Sysemble'
+[    0.000000] Linux version 6.12.0-amd64 (debian-kernel@lists.debian.org)
+[    0.123456] systemd[1]: Detected virtualization qemu.
+[    1.234567] systemd[1]: Reached target Local File Systems.
+[    2.345678] Debian GNU/Linux 13 sysemble ttyS0
+sysemble login:
+EOF
+}
+
+# Same UEFI boot but nothing identifying a bootloader: firmware passed, GRUB
+# never produced output.
+write_uefi_no_grub_log() {
+  cat >"$1" <<'EOF'
+[    0.000000] efi: EFI v2.70 by EDK II
+[    0.000000] Linux version 6.12.0-amd64 (debian-kernel@lists.debian.org)
+[    0.123456] systemd[1]: Detected virtualization qemu.
+[    1.234567] systemd[1]: Reached target Local File Systems.
+[    2.345678] Debian GNU/Linux 13 sysemble ttyS0
+sysemble login:
+EOF
+}
+
+# Fake UEFI qemu: records argv, copies the writable pflash VARS file aside (so
+# the test can prove the VARS template reached QEMU), emits a healthy UEFI log,
+# then either exits (like a powered-off VM) or keeps running (to prove the
+# early-stop monitor).
+write_fake_qemu_uefi() {
+  local path=$1
+  local mode=${2:-exit}
+
+  cat >"$path" <<'SCRIPT'
+#!/bin/sh
+printf '%s\n' "$@" >"$FAKE_QEMU_ARGS"
+for arg in "$@"; do
+  case "$arg" in
+    if=pflash*readonly=on*) ;;
+    if=pflash*file=*)
+      cp "${arg##*file=}" "$FAKE_QEMU_VARS_COPY" 2>/dev/null || exit 9
+      ;;
+  esac
+done
+cat <<'LOG'
+[    0.000000] efi: EFI v2.70 by EDK II
+GRUB loading..
+Booting `Sysemble'
+[    0.000000] Linux version 6.12.0-amd64 (debian-kernel@lists.debian.org)
+[    0.123456] systemd[1]: Detected virtualization qemu.
+[    1.234567] systemd[1]: Reached target Local File Systems.
+[    2.345678] Debian GNU/Linux 13 sysemble ttyS0
+sysemble login:
+LOG
+SCRIPT
+  if [ "$mode" = "hang" ]; then
+    # A real booted VM never exits; boot-check must stop it after 5 matches.
+    printf 'exec sleep 30\n' >>"$path"
+  else
+    printf 'exit 0\n' >>"$path"
+  fi
+  chmod +x "$path"
+}
+
+# Print the QEMU argv with the random VARS temp name canonicalized, so the full
+# pflash/drive sequence can be compared exactly.
+normalize_uefi_args() {
+  local args_file=$1
+  local line=""
+  local output=""
+
+  while IFS= read -r line; do
+    case "$line" in
+      if=pflash,format=raw,file=*) line="if=pflash,format=raw,file=<VARS>" ;;
+    esac
+    output="$output$line
+"
+  done <"$args_file"
+  printf '%s' "$output"
+}
+
+# Print the writable pflash VARS path recorded in the QEMU argv.
+find_uefi_vars_arg() {
+  local args_file=$1
+  local line=""
+
+  while IFS= read -r line; do
+    case "$line" in
+      if=pflash,format=raw,file=*)
+        printf '%s' "${line#*file=}"
+        return 0
+        ;;
+    esac
+  done <"$args_file"
+  return 1
+}
+
+# JSON-backed artifact variants (used to exercise validation errors without
+# duplicating the fixture): set or delete a dotted field.
+set_artifact_field() {
+  local in=$1
+  local out=$2
+  local path=$3
+  local value=$4
+
+  if [ "$JSON_TOOL" = "jq" ]; then
+    jq --arg p "$path" --arg v "$value" \
+      'setpath(($p | split(".")); $v)' "$in" >"$out" 2>/dev/null
+  else
+    python3 - "$in" "$out" "$path" "$value" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    data = json.load(fh)
+node = data
+keys = sys.argv[3].split(".")
+for key in keys[:-1]:
+    node = node[key]
+node[keys[-1]] = sys.argv[4]
+with open(sys.argv[2], "w", encoding="utf-8") as fh:
+    json.dump(data, fh, indent=2)
+PY
+  fi
+}
+
+delete_artifact_field() {
+  local in=$1
+  local out=$2
+  local path=$3
+
+  if [ "$JSON_TOOL" = "jq" ]; then
+    jq --arg p "$path" 'delpaths([$p | split(".")])' "$in" >"$out" 2>/dev/null
+  else
+    python3 - "$in" "$out" "$path" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    data = json.load(fh)
+node = data
+keys = sys.argv[3].split(".")
+for key in keys[:-1]:
+    node = node[key]
+del node[keys[-1]]
+with open(sys.argv[2], "w", encoding="utf-8") as fh:
+    json.dump(data, fh, indent=2)
+PY
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -751,6 +945,344 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# UEFI mode (P0-c)
+# ---------------------------------------------------------------------------
+
+test_uefi_good_log_offline() {
+  local evidence=""
+  local stderr_text=""
+  local hash=""
+
+  begin_case "UEFI canned good log -> exit 0, five passes"
+  make_uefi_fixture "$CASE_DIR"
+  evidence="$CASE_DIR/boot-evidence.json"
+  write_uefi_good_log "$CASE_DIR/good-uefi.log"
+
+  invoke_boot_check "$BASH_BIN" "$BOOT_CHECK" \
+    --artifact "$CASE_DIR/artifact.json" \
+    --log-from "$CASE_DIR/good-uefi.log" --json
+
+  check_eq "exit code" 0 "$RC"
+  check_file "evidence file" "$evidence"
+  check_no_file "boot.log absent in offline mode" "$CASE_DIR/boot.log"
+  check_eq "stdout is valid JSON" 1 "$(json_valid "$OUT_FILE" && echo 1 || echo 0)"
+  check_eq "evidence API version" "sysemble/boot-evidence/v1" "$(json_query "$evidence" apiVersion)"
+  check_eq "result" "pass" "$(json_query "$evidence" result)"
+  check_eq "assertion count" 5 "$(json_query "$evidence" assertion_count)"
+  check_eq "boot.firmware" "pass" "$(json_query "$evidence" assertion_result boot.firmware)"
+  check_eq "boot.grub" "pass" "$(json_query "$evidence" assertion_result boot.grub)"
+  check_eq "boot.kernel" "pass" "$(json_query "$evidence" assertion_result boot.kernel)"
+  check_eq "boot.systemd" "pass" "$(json_query "$evidence" assertion_result boot.systemd)"
+  check_eq "boot.login" "pass" "$(json_query "$evidence" assertion_result boot.login)"
+  check_contains "firmware detail" 'matched `EFI v`' "$(json_query "$evidence" assertion_detail boot.firmware)"
+  hash=$(json_query "$evidence" log_sha256)
+  check_eq "log sha256 matches file" "$(file_sha256 "$CASE_DIR/good-uefi.log")" "$hash"
+  stderr_text=$(cat "$ERR_FILE")
+  check_contains "human summary on stderr" "boot.firmware: pass" "$stderr_text"
+  check_contains "boot mode summary" "boot mode: uefi" "$stderr_text"
+  end_case
+}
+
+test_uefi_missing_grub_offline() {
+  local evidence=""
+
+  begin_case "UEFI log without GRUB -> boot.grub fail, exit 1"
+  make_uefi_fixture "$CASE_DIR"
+  evidence="$CASE_DIR/boot-evidence.json"
+  write_uefi_no_grub_log "$CASE_DIR/no-grub.log"
+
+  invoke_boot_check "$BASH_BIN" "$BOOT_CHECK" \
+    --artifact "$CASE_DIR/artifact.json" \
+    --log-from "$CASE_DIR/no-grub.log" --json
+
+  check_eq "exit code" 1 "$RC"
+  check_eq "result" "fail" "$(json_query "$evidence" result)"
+  check_eq "assertion count" 5 "$(json_query "$evidence" assertion_count)"
+  check_eq "boot.firmware" "pass" "$(json_query "$evidence" assertion_result boot.firmware)"
+  check_eq "boot.grub" "fail" "$(json_query "$evidence" assertion_result boot.grub)"
+  check_contains "grub detail" 'no `GRUB` or `Booting`' "$(json_query "$evidence" assertion_detail boot.grub)"
+  check_eq "boot.kernel still evaluated" "pass" "$(json_query "$evidence" assertion_result boot.kernel)"
+  check_eq "boot.login still evaluated" "pass" "$(json_query "$evidence" assertion_result boot.login)"
+  end_case
+}
+
+test_uefi_firmware_missing() {
+  local args_file=""
+
+  begin_case "UEFI --firmware /nonexistent -> exit 3, QEMU never launched"
+  make_uefi_fixture "$CASE_DIR"
+  args_file="$CASE_DIR/qemu-args.txt"
+  write_fake_qemu_uefi "$CASE_DIR/fake-qemu"
+
+  # An explicit --firmware takes precedence over the auto-probe, so this is
+  # independent of whether the host has /usr/share/OVMF installed.
+  RC=0
+  FAKE_QEMU_ARGS="$args_file" FAKE_QEMU_VARS_COPY="$CASE_DIR/vars-copy.bin" \
+    "$BASH_BIN" "$BOOT_CHECK" \
+    --artifact "$CASE_DIR/artifact.json" \
+    --qemu "$CASE_DIR/fake-qemu" --firmware /nonexistent --timeout 10 --json \
+    >"$OUT_FILE" 2>"$ERR_FILE" || RC=$?
+
+  check_eq "exit code" 3 "$RC"
+  check_empty "stdout" "$(cat "$OUT_FILE")"
+  check_contains "diagnostic" "OVMF firmware not found or not readable" "$(cat "$ERR_FILE")"
+  check_contains "actionable hint" "pass --firmware" "$(cat "$ERR_FILE")"
+  check_no_file "no boot.log" "$CASE_DIR/boot.log"
+  check_no_file "no evidence" "$CASE_DIR/boot-evidence.json"
+  check_no_file "QEMU was not launched" "$args_file"
+  end_case
+}
+
+test_uefi_qemu_arguments() {
+  local evidence=""
+  local args_file=""
+  local vars_copy=""
+  local expected=""
+  local actual=""
+  local real_case_dir=""
+  local vars_path=""
+  local duration=0
+
+  begin_case "UEFI argv: q35 + two pflash drives + virtio disk, early stop"
+  make_uefi_fixture "$CASE_DIR"
+  evidence="$CASE_DIR/boot-evidence.json"
+  args_file="$CASE_DIR/qemu-args.txt"
+  vars_copy="$CASE_DIR/vars-copy.bin"
+  real_case_dir=$(cd "$CASE_DIR" && pwd -P)
+  write_fake_qemu_uefi "$CASE_DIR/fake-qemu" hang
+
+  expected=$(printf '%s\n' \
+    '-machine' 'q35' \
+    '-m' '1024' \
+    '-smp' '2' \
+    '-nographic' \
+    '-no-reboot' \
+    '-drive' "if=pflash,format=raw,readonly=on,file=$real_case_dir/fw/OVMF_CODE_4M.fd" \
+    '-drive' 'if=pflash,format=raw,file=<VARS>' \
+    '-drive' "file=$real_case_dir/disk.img,format=raw,if=virtio")
+
+  SECONDS=0
+  RC=0
+  FAKE_QEMU_ARGS="$args_file" FAKE_QEMU_VARS_COPY="$vars_copy" \
+    "$BASH_BIN" "$BOOT_CHECK" \
+    --artifact "$CASE_DIR/artifact.json" \
+    --qemu "$CASE_DIR/fake-qemu" --firmware "$real_case_dir/fw/OVMF_CODE_4M.fd" \
+    --timeout 10 --json >"$OUT_FILE" 2>"$ERR_FILE" || RC=$?
+  duration=$SECONDS
+
+  actual=$(normalize_uefi_args "$args_file")
+  check_eq "exit code" 0 "$RC"
+  check_eq "qemu argv" "$expected" "$actual"
+  # Well below the 10s timeout (the fake qemu would sleep 30s): proves the
+  # UEFI assertion set triggers the same early-stop monitor as kernel mode.
+  check_le "early stop duration" 6 "$duration"
+  check_eq "result" "pass" "$(json_query "$evidence" result)"
+  check_eq "assertion count" 5 "$(json_query "$evidence" assertion_count)"
+  check_eq "boot.firmware" "pass" "$(json_query "$evidence" assertion_result boot.firmware)"
+  check_eq "boot.grub" "pass" "$(json_query "$evidence" assertion_result boot.grub)"
+  check_eq "evidence log" "boot.log" "$(json_query "$evidence" log)"
+  check_eq "no -kernel flag" 0 "$(grep -c '^-kernel$' "$args_file" || true)"
+  check_eq "no -initrd flag" 0 "$(grep -c '^-initrd$' "$args_file" || true)"
+  check_eq "no -append flag" 0 "$(grep -c '^-append$' "$args_file" || true)"
+  check_eq "VARS template copied for QEMU" "OVMF-VARS-FIXTURE" "$(cat "$vars_copy" 2>/dev/null)"
+  vars_path=$(find_uefi_vars_arg "$args_file")
+  check_contains "VARS copy in boot-check temp dir" "/sysemble-boot." "$vars_path"
+  check_contains "VARS copy under TMPDIR" "${TMPDIR:-/tmp}" "$vars_path"
+  check_no_file "VARS copy removed on exit" "$vars_path"
+  check_eq "no VARS temp in artifact dir" 0 "$(ls -A "$real_case_dir" | grep -c '^\.sysemble-ovmf-vars\.' || true)"
+  end_case
+}
+
+test_uefi_vars_name_fallback() {
+  local args_file=""
+  local vars_copy=""
+  local vars_path=""
+  local real_case_dir=""
+
+  begin_case "UEFI VARS fallback: OVMF_CODE.fd uses OVMF_VARS.fd"
+  make_uefi_fixture "$CASE_DIR"
+  rm -f "$CASE_DIR/fw/OVMF_CODE_4M.fd" "$CASE_DIR/fw/OVMF_VARS_4M.fd"
+  printf 'OVMF-CODE-PLAIN\n' >"$CASE_DIR/fw/OVMF_CODE.fd"
+  printf 'OVMF-VARS-PLAIN\n' >"$CASE_DIR/fw/OVMF_VARS.fd"
+  args_file="$CASE_DIR/qemu-args.txt"
+  vars_copy="$CASE_DIR/vars-copy.bin"
+  real_case_dir=$(cd "$CASE_DIR" && pwd -P)
+  write_fake_qemu_uefi "$CASE_DIR/fake-qemu"
+
+  RC=0
+  FAKE_QEMU_ARGS="$args_file" FAKE_QEMU_VARS_COPY="$vars_copy" \
+    "$BASH_BIN" "$BOOT_CHECK" \
+    --artifact "$CASE_DIR/artifact.json" \
+    --qemu "$CASE_DIR/fake-qemu" --firmware "$real_case_dir/fw/OVMF_CODE.fd" \
+    --timeout 10 --json >"$OUT_FILE" 2>"$ERR_FILE" || RC=$?
+
+  check_eq "exit code" 0 "$RC"
+  check_contains "plain CODE used" "readonly=on,file=$real_case_dir/fw/OVMF_CODE.fd" "$(cat "$args_file" 2>/dev/null)"
+  check_eq "plain VARS copied for QEMU" "OVMF-VARS-PLAIN" "$(cat "$vars_copy" 2>/dev/null)"
+  vars_path=$(find_uefi_vars_arg "$args_file")
+  check_no_file "VARS copy removed on exit" "$vars_path"
+  end_case
+}
+
+test_uefi_missing_disk() {
+  begin_case "UEFI artifact without boot.disk -> exit 2"
+  make_uefi_fixture "$CASE_DIR"
+  write_uefi_good_log "$CASE_DIR/good-uefi.log"
+  delete_artifact_field "$CASE_DIR/artifact.json" "$CASE_DIR/no-disk.json" "boot.disk"
+
+  invoke_boot_check "$BASH_BIN" "$BOOT_CHECK" \
+    --artifact "$CASE_DIR/no-disk.json" \
+    --log-from "$CASE_DIR/good-uefi.log" --json
+
+  check_eq "exit code" 2 "$RC"
+  check_empty "stdout" "$(cat "$OUT_FILE")"
+  check_contains "diagnostic" "boot.disk is required when boot.mode=uefi" "$(cat "$ERR_FILE")"
+  check_no_file "no evidence" "$CASE_DIR/boot-evidence.json"
+  end_case
+}
+
+test_unknown_boot_mode() {
+  begin_case "unknown boot.mode -> exit 2"
+  make_uefi_fixture "$CASE_DIR"
+  write_uefi_good_log "$CASE_DIR/good-uefi.log"
+  set_artifact_field "$CASE_DIR/artifact.json" "$CASE_DIR/bios.json" "boot.mode" "bios"
+
+  invoke_boot_check "$BASH_BIN" "$BOOT_CHECK" \
+    --artifact "$CASE_DIR/bios.json" \
+    --log-from "$CASE_DIR/good-uefi.log" --json
+
+  check_eq "exit code" 2 "$RC"
+  check_empty "stdout" "$(cat "$OUT_FILE")"
+  check_contains "diagnostic" "must be 'kernel' or 'uefi'" "$(cat "$ERR_FILE")"
+  check_no_file "no evidence" "$CASE_DIR/boot-evidence.json"
+  end_case
+}
+
+test_kernel_mode_assertions_unchanged() {
+  local evidence=""
+
+  begin_case "kernel mode stays at 3 assertions and ignores --firmware"
+  make_fixture "$CASE_DIR"
+  evidence="$CASE_DIR/boot-evidence.json"
+  write_good_log "$CASE_DIR/good.log"
+
+  invoke_boot_check "$BASH_BIN" "$BOOT_CHECK" \
+    --artifact "$CASE_DIR/artifact.json" \
+    --log-from "$CASE_DIR/good.log" --firmware /nonexistent --json
+
+  check_eq "exit code" 0 "$RC"
+  check_eq "result" "pass" "$(json_query "$evidence" result)"
+  check_eq "assertion count" 3 "$(json_query "$evidence" assertion_count)"
+  check_empty "no boot.firmware assertion" "$(json_query "$evidence" assertion_result boot.firmware)"
+  check_empty "no boot.grub assertion" "$(json_query "$evidence" assertion_result boot.grub)"
+  check_contains "firmware warning" "ignoring --firmware" "$(cat "$ERR_FILE")"
+  end_case
+}
+
+test_uefi_timeout() {
+  local evidence=""
+  local duration=0
+  local args_file=""
+  local vars_path=""
+
+  begin_case "UEFI fake qemu emits firmware then hangs -> exit 4, partial log"
+  make_uefi_fixture "$CASE_DIR"
+  evidence="$CASE_DIR/boot-evidence.json"
+  args_file="$CASE_DIR/qemu-args.txt"
+
+  cat >"$CASE_DIR/fake-qemu" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$@" >"$FAKE_QEMU_ARGS"
+echo '[    0.000000] efi: EFI v2.70 by EDK II'
+exec sleep 10
+EOF
+  chmod +x "$CASE_DIR/fake-qemu"
+
+  SECONDS=0
+  RC=0
+  FAKE_QEMU_ARGS="$args_file" "$BASH_BIN" "$BOOT_CHECK" \
+    --artifact "$CASE_DIR/artifact.json" \
+    --qemu "$CASE_DIR/fake-qemu" \
+    --firmware "$CASE_DIR/fw/OVMF_CODE_4M.fd" --timeout 2 --json \
+    >"$OUT_FILE" 2>"$ERR_FILE" || RC=$?
+  duration=$SECONDS
+
+  check_eq "exit code" 4 "$RC"
+  check_eq "result" "timeout" "$(json_query "$evidence" result)"
+  check_eq "assertion count" 5 "$(json_query "$evidence" assertion_count)"
+  check_eq "boot.firmware on partial log" "pass" "$(json_query "$evidence" assertion_result boot.firmware)"
+  check_eq "boot.grub on partial log" "fail" "$(json_query "$evidence" assertion_result boot.grub)"
+  check_contains "grub detail mentions timeout" "within 2s" "$(json_query "$evidence" assertion_detail boot.grub)"
+  check_ge "wall clock duration" 2 "$duration"
+  vars_path=$(find_uefi_vars_arg "$args_file")
+  check_no_file "VARS copy removed after timeout" "$vars_path"
+  end_case
+}
+
+test_uefi_failure_cleanup() {
+  local evidence=""
+  local args_file=""
+  local vars_copy=""
+  local vars_path=""
+  local real_case_dir=""
+
+  begin_case "UEFI assertion failure -> exit 1, VARS temp still cleaned"
+  make_uefi_fixture "$CASE_DIR"
+  evidence="$CASE_DIR/boot-evidence.json"
+  args_file="$CASE_DIR/qemu-args.txt"
+  vars_copy="$CASE_DIR/vars-copy.bin"
+  real_case_dir=$(cd "$CASE_DIR" && pwd -P)
+
+  # Firmware + kernel + systemd, but no GRUB output and no login prompt: the
+  # boot is not proven, so boot-check must exit 1 after cleaning up.
+  cat >"$CASE_DIR/fake-qemu" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$@" >"$FAKE_QEMU_ARGS"
+for arg in "$@"; do
+  case "$arg" in
+    if=pflash*readonly=on*) ;;
+    if=pflash*file=*)
+      cp "${arg##*file=}" "$FAKE_QEMU_VARS_COPY" 2>/dev/null || exit 9
+      ;;
+  esac
+done
+echo '[    0.000000] efi: EFI v2.70 by EDK II'
+echo '[    0.000000] Linux version 6.12.0-amd64 (debian-kernel@lists.debian.org)'
+echo '[    1.234567] systemd[1]: Reached target Local File Systems.'
+exit 0
+EOF
+  chmod +x "$CASE_DIR/fake-qemu"
+
+  RC=0
+  FAKE_QEMU_ARGS="$args_file" FAKE_QEMU_VARS_COPY="$vars_copy" \
+    "$BASH_BIN" "$BOOT_CHECK" \
+    --artifact "$CASE_DIR/artifact.json" \
+    --qemu "$CASE_DIR/fake-qemu" --firmware "$real_case_dir/fw/OVMF_CODE_4M.fd" \
+    --timeout 10 --json >"$OUT_FILE" 2>"$ERR_FILE" || RC=$?
+
+  check_eq "exit code" 1 "$RC"
+  check_eq "result" "fail" "$(json_query "$evidence" result)"
+  check_eq "boot.grub" "fail" "$(json_query "$evidence" assertion_result boot.grub)"
+  check_eq "boot.login" "fail" "$(json_query "$evidence" assertion_result boot.login)"
+  vars_path=$(find_uefi_vars_arg "$args_file")
+  check_no_file "VARS copy removed after assertion failure" "$vars_path"
+  check_eq "no VARS temp in artifact dir" 0 "$(ls -A "$real_case_dir" | grep -c '^\.sysemble-ovmf-vars\.' || true)"
+  end_case
+}
+
+# Runs last: every offline/QEMU path above has had a chance to leak. boot-check
+# must keep its OVMF VARS copy under $TMPDIR, never in the caller's working
+# directory (the repo root when this suite runs from there).
+test_repo_root_has_no_leftovers() {
+  local leftovers=""
+
+  begin_case "repo root has no .sysemble-* temporary leftovers"
+  leftovers=$(ls -A "$REPO_ROOT" 2>/dev/null | grep '^\.sysemble-' || true)
+  check_empty "repo root .sysemble-* files" "$leftovers"
+  end_case
+}
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -775,6 +1307,18 @@ test_missing_kernel
 test_invalid_json
 test_unknown_option
 test_systemd_reached_target_only
+
+test_uefi_good_log_offline
+test_uefi_missing_grub_offline
+test_uefi_firmware_missing
+test_uefi_qemu_arguments
+test_uefi_vars_name_fallback
+test_uefi_missing_disk
+test_unknown_boot_mode
+test_kernel_mode_assertions_unchanged
+test_uefi_timeout
+test_uefi_failure_cleanup
+test_repo_root_has_no_leftovers
 
 printf '\n----------------------------------------------------------------\n'
 printf 'Summary: %d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
