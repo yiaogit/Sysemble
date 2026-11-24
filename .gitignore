@@ -28,3 +28,6 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# Engine image build output (P1-e2)
+/engine/image/build/

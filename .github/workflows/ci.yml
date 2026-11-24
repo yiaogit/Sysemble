@@ -214,6 +214,56 @@ jobs:
       - name: Test the desktop crate
         run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
 
+      - name: Clippy the desktop crate
+        run: cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets -- -D warnings
+
+  engine-check:
+    name: Engine image (build + boot)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build the engine image
+        run: |
+          bash engine/image/build-image.sh \
+            --ref sysemble-engine:0.1.0 \
+            --out engine/image/build
+
+      - name: Verify the engine image manifest
+        run: bash engine/image/tests/image_test.sh --docker
+
+      - name: Plan the minimal image
+        run: |
+          mkdir -p engine/image/build/smoke
+          cargo run -q -p sysemble-cli -- plan examples/minimal-debian.yaml \
+            > engine/image/build/smoke/plan.json
+
+      - name: Build and boot inside the engine container
+        run: |
+          bash engine/image/tests/container_smoke.sh \
+            --image sysemble-engine:0.1.0 \
+            --repo "$PWD" \
+            --out engine/image/build/smoke
+
+      - name: Upload engine evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: engine-evidence
+          if-no-files-found: warn
+          path: |
+            engine/image/build/sysemble-engine.json
+            engine/image/build/build-image.log
+            engine/image/build/smoke/container-build.log
+            engine/image/build/smoke/container-boot-check.log
+            engine/image/build/smoke/artifact.json
+            engine/image/build/smoke/boot-evidence.json
+            engine/image/build/smoke/disk.qcow2
+            engine/image/build/smoke/build.log
+            engine/image/build/smoke/boot.log
+
   tui-install-smoke:
     name: TUI install smoke
     runs-on: ubuntu-latest

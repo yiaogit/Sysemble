@@ -1,17 +1,24 @@
-//! Build execution for the Sysemble desktop shell (P1-b).
+//! Build execution for the Sysemble desktop shell (P1-b/P1-e2).
 //!
 //! A [`BuildManager`] owns every build started by this process. A build is a
-//! `bash <repo>/builders/debian/build.sh ...` child process whose combined
-//! stdout/stderr is redirected to `<out>/build.log`. A supervisor thread blocks
-//! in [`std::process::Child::wait`] and publishes the terminal state, while
-//! cancellation signals the builder's process group. The supervisor therefore
-//! never holds the registry lock while waiting, and cancellation never blocks
-//! on a running build.
+//! child process whose combined stdout/stderr is redirected to `<out>/build.log`.
+//! A supervisor thread blocks in [`std::process::Child::wait`] and publishes the
+//! terminal state, while cancellation signals the builder's process group. The
+//! supervisor therefore never holds the registry lock while waiting, and
+//! cancellation never blocks on a running build.
+//!
+//! P1-e2 adds the container backend: `--execute` runs the same
+//! `builders/debian/build.sh` inside the engine image with
+//! `<runtime> run --rm --init --privileged --platform linux/amd64 ...`, while
+//! `--dry-run` keeps running the builder directly on the host. The frozen
+//! parameter order lives in `docs/plan/P1-e2-workplan.md` §2.3 and in
+//! [`container_invocation`].
 //!
 //! The command layer lives in `lib.rs`; this module is plain Rust so the
 //! lifecycle can be tested without a WebView.
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -24,6 +31,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use sysemble_core::{load_spec, resolve_plan};
 
+use crate::engine::{self, EngineInfo, EngineProbe};
 use crate::{repo_root, resolve_path};
 
 /// Log lines returned by [`BuildManager::get_build_log`] when the caller does
@@ -32,6 +40,17 @@ pub const DEFAULT_LOG_TAIL_LINES: u32 = 200;
 
 /// Registry shared by the command layer and the supervisor threads.
 type Registry = Arc<Mutex<HashMap<String, BuildRecord>>>;
+
+/// Resolves the engine for a build. Production probes the host every time, so
+/// a daemon that starts after the window opened is picked up on the next build.
+type EngineResolver = Arc<dyn Fn() -> EngineProbe + Send + Sync>;
+
+/// Target platform of the engine image (frozen by the P1-e2 workplan).
+const CONTAINER_PLATFORM: &str = "linux/amd64";
+
+/// Container entry point (v2): runs inside the image, builds on the container's
+/// case-sensitive filesystem, and exports only the top-level artifacts.
+const CONTAINER_ENTRY_SCRIPT: &str = "engine/runtime/container-entry.sh";
 
 static NEXT_BUILD_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -105,6 +124,32 @@ impl BuildMode {
     }
 }
 
+/// Which launch path an execute build takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutionBackend {
+    /// P1-b host builder: `bash <builder> --plan … --out … --execute`.
+    Host,
+    /// Engine image: `<runtime> run … bash <builder> …`.
+    Container,
+}
+
+/// Pick the launch path from the probed engine.
+///
+/// A `local` engine already means "root and the builder tools are on this
+/// host", so it keeps the P1-b host path and never needs a runtime executable.
+/// Only `container` runs inside docker/podman. `None` means no probe was taken
+/// (dry run or the `SYMBLE_BUILDER` hook) and also uses the host path.
+fn execution_backend(probe: Option<&EngineProbe>) -> Result<ExecutionBackend, String> {
+    match probe {
+        None => Ok(ExecutionBackend::Host),
+        Some(probe) => match probe.info.kind.as_str() {
+            "local" => Ok(ExecutionBackend::Host),
+            "container" => Ok(ExecutionBackend::Container),
+            other => Err(format!("engine kind `{other}` cannot run execute builds")),
+        },
+    }
+}
+
 /// One entry in the build registry.
 struct BuildRecord {
     state: BuildState,
@@ -114,9 +159,29 @@ struct BuildRecord {
     log_path: PathBuf,
     /// Builder process id, kept for cancellation.
     pid: u32,
+    /// Container this build runs in, when the engine is a container runtime.
+    container: Option<ContainerHandle>,
     /// The child is claimed by the supervisor thread for `wait()`. It is put
     /// back once the process has been reaped so the record keeps its handle.
     child: Option<Child>,
+}
+
+/// Identifies the container a build started so cancellation can kill it.
+///
+/// Killing the `docker run` client does not necessarily stop the container it
+/// created, so the daemon-side container is killed by name as well.
+#[derive(Debug, Clone)]
+struct ContainerHandle {
+    runtime: PathBuf,
+    name: String,
+}
+
+/// Everything needed to launch a containerized builder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContainerInvocation {
+    program: PathBuf,
+    args: Vec<OsString>,
+    name: String,
 }
 
 /// Owns the builds started by this desktop process.
@@ -129,20 +194,52 @@ struct BuildRecord {
 pub struct BuildManager {
     registry: Registry,
     cancel_gate: Arc<Mutex<()>>,
+    /// Resolved on every execute build; dry runs never consult it.
+    engine: EngineResolver,
+    /// Repository mounted at `/work` for container builds. Production uses
+    /// [`repo_root`]; tests inject a temporary repository.
+    repo: PathBuf,
 }
 
 impl Default for BuildManager {
     fn default() -> Self {
-        Self {
-            registry: Arc::new(Mutex::new(HashMap::new())),
-            cancel_gate: Arc::new(Mutex::new(())),
-        }
+        Self::with_engine_resolver(Arc::new(engine::probe_engine))
     }
 }
 
 impl BuildManager {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Build a manager around an explicit engine resolver.
+    ///
+    /// Production uses [`engine::probe_engine`]; tests inject a fixed probe so
+    /// the execute gate and the container argv can be asserted without a
+    /// docker daemon.
+    fn with_engine_resolver(resolver: EngineResolver) -> Self {
+        Self::with_repo(resolver, repo_root())
+    }
+
+    fn with_repo(resolver: EngineResolver, repo: PathBuf) -> Self {
+        Self {
+            registry: Arc::new(Mutex::new(HashMap::new())),
+            cancel_gate: Arc::new(Mutex::new(())),
+            engine: resolver,
+            repo,
+        }
+    }
+
+    /// Test/harness constructor: always resolve to the given probe.
+    #[cfg(test)]
+    fn with_engine_probe(probe: EngineProbe) -> Self {
+        Self::with_engine_resolver(Arc::new(move || probe.clone()))
+    }
+
+    /// Test/harness constructor: fixed probe plus an injected repository root.
+    #[cfg(test)]
+    fn with_engine_probe_and_repo(probe: EngineProbe, repo: PathBuf) -> Self {
+        Self::with_repo(Arc::new(move || probe.clone()), repo)
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, HashMap<String, BuildRecord>>, String> {
@@ -173,6 +270,40 @@ impl BuildManager {
 
         let builder = builder_path()?;
 
+        // `SYMBLE_BUILDER` is the P1-b test/builder-replacement hook: when it
+        // is set, both modes run that script directly on the host and the
+        // engine gate is skipped, so the cancellation tests keep working
+        // without a container runtime.
+        let builder_override = std::env::var_os("SYMBLE_BUILDER").is_some();
+
+        // Gate execute builds on a usable engine before writing any output.
+        let engine_probe = if mode == BuildMode::Execute && !builder_override {
+            let probe = (self.engine)();
+            if !probe.info.available {
+                return Err(unavailable_engine_error(&probe.info));
+            }
+            Some(probe)
+        } else {
+            None
+        };
+
+        // A `local` engine keeps the P1-b host path; only a container engine
+        // launches a runtime, so `runtime_path` is only required there.
+        let backend = execution_backend(engine_probe.as_ref())?;
+
+        // Container builds need the v2 entry script inside the mounted
+        // repository; validate it before writing output or spawning anything.
+        let container_repo = match backend {
+            ExecutionBackend::Container => {
+                let repo = fs::canonicalize(&self.repo).map_err(|error| {
+                    format!("cannot resolve the repository root for a container build: {error}")
+                })?;
+                container_entry_script(&repo)?;
+                Some(repo)
+            }
+            ExecutionBackend::Host => None,
+        };
+
         fs::create_dir_all(out_dir)
             .map_err(|error| format!("cannot create output directory `{out_dir}`: {error}"))?;
         let out_abs = fs::canonicalize(out_dir)
@@ -195,27 +326,59 @@ impl BuildManager {
             )
         })?;
 
-        let mut command = Command::new("bash");
+        // The id is generated before the launch so container builds can use it
+        // in `--name sysemble-build-<id>`.
+        let id = next_build_id();
+
+        let (mut command, container) = match (engine_probe.as_ref(), container_repo.as_deref()) {
+            (Some(probe), Some(repo)) => {
+                let runtime = probe.runtime_path.clone().ok_or_else(|| {
+                    "the container engine did not report a runtime executable".to_string()
+                })?;
+                let image = probe
+                    .info
+                    .image
+                    .as_deref()
+                    .unwrap_or(engine::DEFAULT_ENGINE_IMAGE);
+                let invocation = container_invocation(&runtime, image, &id, repo, &out_abs)?;
+                let mut command = Command::new(&invocation.program);
+                command.args(&invocation.args);
+                let handle = ContainerHandle {
+                    runtime: invocation.program.clone(),
+                    name: invocation.name.clone(),
+                };
+                (command, Some(handle))
+            }
+            _ => {
+                let mut command = Command::new("bash");
+                command
+                    .arg(&builder)
+                    .arg("--plan")
+                    .arg(&plan_path)
+                    .arg("--out")
+                    .arg(&out_abs)
+                    .arg(mode.flag());
+                (command, None)
+            }
+        };
+
         command
-            .arg(&builder)
-            .arg("--plan")
-            .arg(&plan_path)
-            .arg("--out")
-            .arg(&out_abs)
-            .arg(mode.flag())
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(stderr_log));
         configure_process_group(&mut command);
 
-        let child = command.spawn().map_err(|error| {
-            format!(
+        let child = command.spawn().map_err(|error| match &container {
+            Some(handle) => format!(
+                "cannot start the container runtime `{}`: {error}",
+                handle.runtime.display()
+            ),
+            None => format!(
                 "cannot start builder `{}` with bash: {error}",
                 builder.display()
-            )
+            ),
         })?;
         let pid = child.id();
-        let id = next_build_id();
         let started_at = now_iso8601();
 
         let record = BuildRecord {
@@ -225,6 +388,7 @@ impl BuildManager {
             finished_at: None,
             log_path: log_path.clone(),
             pid,
+            container,
             child: Some(child),
         };
 
@@ -302,7 +466,7 @@ impl BuildManager {
             .lock()
             .map_err(|_| "the build cancellation lock is poisoned".to_string())?;
 
-        let pid = {
+        let (pid, container) = {
             let registry = self.lock()?;
             let record = registry.get(id).ok_or_else(|| unknown_build(id))?;
             if record.state != BuildState::Running {
@@ -311,11 +475,20 @@ impl BuildManager {
                     record.state.as_str()
                 ));
             }
-            record.pid
+            (record.pid, record.container.clone())
         };
 
-        terminate_process_group(pid)
-            .map_err(|error| format!("cannot cancel build `{id}`: {error}"))?;
+        let group_result = terminate_process_group(pid);
+
+        // Killing the `docker run` client does not reliably stop the container
+        // it created, so ask the runtime to kill it by name as well. This is
+        // best effort: a runtime that vanished or a container that already
+        // exited must not fail the cancellation.
+        if let Some(container) = container {
+            kill_container(&container);
+        }
+
+        group_result.map_err(|error| format!("cannot cancel build `{id}`: {error}"))?;
 
         let mut registry = self.lock()?;
         if let Some(record) = registry.get_mut(id) {
@@ -390,9 +563,10 @@ fn next_build_id() -> String {
     format!("build-{}-{sequence}", std::process::id())
 }
 
-/// Resolve the builder script. `SYMBLE_BUILDER` wins so tests (and future
-/// engines) can substitute a fake builder; otherwise the script lives at the
-/// repository root next to the desktop app.
+/// Resolve the builder script. `SYMBLE_BUILDER` wins so tests can substitute a
+/// fake builder; setting it also bypasses the P1-e2 engine gate (both modes run
+/// the host script), which keeps the P1-b cancellation test engine-free.
+/// Otherwise the script lives at the repository root next to the desktop app.
 fn builder_path() -> Result<PathBuf, String> {
     if let Some(raw) = std::env::var_os("SYMBLE_BUILDER") {
         let path = PathBuf::from(raw);
@@ -421,6 +595,112 @@ fn builder_path() -> Result<PathBuf, String> {
         "cannot find the Debian builder at `{}`; set SYMBLE_BUILDER to override it",
         from_repo.display()
     ))
+}
+
+/// Readable error for an execute build when no engine can run it.
+fn unavailable_engine_error(info: &EngineInfo) -> String {
+    format!(
+        "cannot start an execute build: {} (engine kind: {}); use --dry-run to validate the plan on this host",
+        info.reason, info.kind
+    )
+}
+
+/// Resolve the v2 container entry script inside `repo` and require it to exist.
+///
+/// The argv passes the script as the repository-relative path
+/// [`CONTAINER_ENTRY_SCRIPT`], so the script must live inside the repository
+/// that gets mounted at `/work`.
+fn container_entry_script(repo: &Path) -> Result<PathBuf, String> {
+    let script = repo.join(CONTAINER_ENTRY_SCRIPT);
+    if script.is_file() {
+        Ok(script)
+    } else {
+        Err(format!(
+            "cannot find the engine entry script `{CONTAINER_ENTRY_SCRIPT}` in the repository `{}`; container builds mount the repository read-only at /work",
+            repo.display()
+        ))
+    }
+}
+
+/// Build the frozen v2 container argv (P1-e2 workplan §2.3).
+///
+/// `repo` and `out` must be canonical absolute host paths. The repository is
+/// mounted read-only at `/work`; the host output directory is mounted at
+/// `/export`. The container builds on its own case-sensitive filesystem under
+/// `/out` (macOS APFS would otherwise turn case-only path pairs into ELOOP) and
+/// exports only top-level artifacts to `/export`.
+fn container_invocation(
+    runtime: &Path,
+    image: &str,
+    build_id: &str,
+    repo: &Path,
+    out: &Path,
+) -> Result<ContainerInvocation, String> {
+    let name = format!("sysemble-build-{build_id}");
+
+    let mut args: Vec<OsString> = [
+        "run",
+        "--rm",
+        "--init",
+        "--privileged",
+        "--platform",
+        CONTAINER_PLATFORM,
+        "--name",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect();
+    args.push(OsString::from(&name));
+
+    let mut repo_mount = repo.as_os_str().to_os_string();
+    repo_mount.push(":/work:ro");
+    args.push(OsString::from("-v"));
+    args.push(repo_mount);
+
+    let mut export_mount = out.as_os_str().to_os_string();
+    export_mount.push(":/export");
+    args.push(OsString::from("-v"));
+    args.push(export_mount);
+
+    args.push(OsString::from("-w"));
+    args.push(OsString::from("/work"));
+    args.push(OsString::from(image));
+    args.push(OsString::from("bash"));
+    args.push(OsString::from(CONTAINER_ENTRY_SCRIPT));
+    args.push(OsString::from("--plan"));
+    args.push(OsString::from("/export/plan.json"));
+    args.push(OsString::from("--out"));
+    args.push(OsString::from("/out"));
+    args.push(OsString::from("--export"));
+    args.push(OsString::from("/export"));
+    args.push(OsString::from("--mode"));
+    args.push(OsString::from("execute"));
+
+    Ok(ContainerInvocation {
+        program: runtime.to_path_buf(),
+        args,
+        name,
+    })
+}
+
+/// Ask the container runtime to kill `container`, without blocking the caller.
+fn kill_container(container: &ContainerHandle) {
+    let mut command = Command::new(&container.runtime);
+    command
+        .arg("kill")
+        .arg(&container.name)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let Ok(mut child) = command.spawn() else {
+        return;
+    };
+    // Reap on a helper thread: cancellation must never wait on the runtime.
+    let _ = thread::Builder::new()
+        .name("sysemble-container-kill".to_string())
+        .spawn(move || {
+            let _ = child.wait();
+        });
 }
 
 #[cfg(unix)]
@@ -613,6 +893,462 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    fn engine_probe(kind: &str, available: bool, reason: &str) -> EngineProbe {
+        EngineProbe {
+            info: EngineInfo {
+                kind: kind.to_string(),
+                available,
+                platform: std::env::consts::OS.to_string(),
+                reason: reason.to_string(),
+                runtime: None,
+                image: None,
+                image_present: None,
+            },
+            runtime_path: None,
+        }
+    }
+
+    fn container_probe(runtime: &Path) -> EngineProbe {
+        EngineProbe {
+            info: EngineInfo {
+                kind: "container".to_string(),
+                available: true,
+                platform: std::env::consts::OS.to_string(),
+                reason: format!(
+                    "container engine: docker 9.9.9 · image {}",
+                    engine::DEFAULT_ENGINE_IMAGE
+                ),
+                runtime: Some("docker".to_string()),
+                image: Some(engine::DEFAULT_ENGINE_IMAGE.to_string()),
+                image_present: Some(true),
+            },
+            runtime_path: Some(runtime.to_path_buf()),
+        }
+    }
+
+    /// Create a minimal repository shape with the v2 container entry script.
+    fn fake_repo(tag: &str) -> (TempDir, PathBuf) {
+        let repo = TempDir::new(tag);
+        fs::create_dir_all(repo.path.join("engine/runtime"))
+            .expect("fake repository should be creatable");
+        fs::write(
+            repo.path.join(CONTAINER_ENTRY_SCRIPT),
+            "#!/usr/bin/env bash\nexit 0\n",
+        )
+        .expect("fake entry script should be writable");
+        let repo_abs = fs::canonicalize(&repo.path).expect("fake repository should resolve");
+        (repo, repo_abs)
+    }
+
+    #[cfg(unix)]
+    fn write_runtime(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::write(path, body).expect("fake runtime should be writable");
+        let mut permissions = fs::metadata(path)
+            .expect("fake runtime metadata should be readable")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("fake runtime should be executable");
+    }
+
+    #[test]
+    fn container_argv_uses_the_v2_entry_script_and_mounts() {
+        let (_repo, repo_abs) = fake_repo("container-argv-v2");
+        let out_dir = TempDir::new("container-argv-v2-out");
+        let out_abs = fs::canonicalize(&out_dir.path).expect("output directory should resolve");
+
+        let invocation = container_invocation(
+            Path::new("docker"),
+            engine::DEFAULT_ENGINE_IMAGE,
+            "build-1",
+            &repo_abs,
+            &out_abs,
+        )
+        .expect("container invocation should assemble");
+
+        let args: Vec<String> = invocation
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "run".to_string(),
+                "--rm".to_string(),
+                "--init".to_string(),
+                "--privileged".to_string(),
+                "--platform".to_string(),
+                "linux/amd64".to_string(),
+                "--name".to_string(),
+                "sysemble-build-build-1".to_string(),
+                "-v".to_string(),
+                format!("{}:/work:ro", repo_abs.display()),
+                "-v".to_string(),
+                format!("{}:/export", out_abs.display()),
+                "-w".to_string(),
+                "/work".to_string(),
+                engine::DEFAULT_ENGINE_IMAGE.to_string(),
+                "bash".to_string(),
+                "engine/runtime/container-entry.sh".to_string(),
+                "--plan".to_string(),
+                "/export/plan.json".to_string(),
+                "--out".to_string(),
+                "/out".to_string(),
+                "--export".to_string(),
+                "/export".to_string(),
+                "--mode".to_string(),
+                "execute".to_string(),
+            ]
+        );
+        assert_eq!(invocation.program, PathBuf::from("docker"));
+        assert_eq!(invocation.name, "sysemble-build-build-1");
+    }
+
+    #[test]
+    fn container_argv_exports_an_in_repo_output_at_export() {
+        let (_repo, repo_abs) = fake_repo("container-argv-in-repo");
+        let out = repo_abs.join("out");
+        fs::create_dir_all(&out).expect("output directory should be creatable");
+
+        let invocation = container_invocation(
+            Path::new("podman"),
+            engine::DEFAULT_ENGINE_IMAGE,
+            "build-2",
+            &repo_abs,
+            &out,
+        )
+        .expect("container invocation should assemble");
+
+        let args: Vec<String> = invocation
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.contains(&format!("{}:/work:ro", repo_abs.display())),
+            "repository must be mounted read-only: {args:?}"
+        );
+        assert!(
+            args.contains(&format!("{}:/export", out.display())),
+            "v2 always exports the host out directory separately: {args:?}"
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == &format!("{}:/work", repo_abs.display())),
+            "the mutable /work mount is gone in v2: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|arg| arg.starts_with("/work/")),
+            "v2 container paths must not derive from the repository: {args:?}"
+        );
+
+        let plan_index = args
+            .iter()
+            .position(|arg| arg == "--plan")
+            .expect("--plan should be present");
+        assert_eq!(args[plan_index + 1], "/export/plan.json");
+        let out_index = args
+            .iter()
+            .position(|arg| arg == "--out")
+            .expect("--out should be present");
+        assert_eq!(args[out_index + 1], "/out");
+    }
+
+    #[test]
+    fn execute_without_the_container_entry_script_is_a_readable_error() {
+        let repo = TempDir::new("execute-entry-missing");
+        let out = TempDir::new("execute-entry-missing-out");
+        let manager = BuildManager::with_engine_probe_and_repo(
+            container_probe(Path::new("docker")),
+            repo.path.clone(),
+        );
+
+        let error = manager
+            .start_build(
+                &as_str(&example("minimal-debian.yaml")),
+                &as_str(&out.path),
+                "execute",
+            )
+            .expect_err("execute must validate the v2 container entry script");
+
+        assert!(
+            error.contains("cannot find the engine entry script"),
+            "error should be readable: {error}"
+        );
+        assert!(
+            error.contains(CONTAINER_ENTRY_SCRIPT),
+            "error should name the missing script: {error}"
+        );
+        assert!(
+            !out.path.join("build.log").exists(),
+            "the entry script must be validated before output is written"
+        );
+    }
+
+    #[test]
+    fn execute_without_an_engine_returns_a_readable_error() {
+        let manager = BuildManager::with_engine_probe(engine_probe(
+            "container",
+            false,
+            "container engine: docker 29.1.2 · image sysemble-engine:0.1.0 not found; build it with engine/image/build-image.sh",
+        ));
+        let temp = TempDir::new("execute-no-engine");
+
+        let error = manager
+            .start_build(
+                &as_str(&example("minimal-debian.yaml")),
+                &as_str(&temp.path),
+                "execute",
+            )
+            .expect_err("execute must be gated on a usable engine");
+
+        assert!(
+            error.contains("engine/image/build-image.sh"),
+            "error should carry the probe reason: {error}"
+        );
+        assert!(
+            error.contains("dry-run"),
+            "error should point at the still-available dry run: {error}"
+        );
+        assert!(
+            !temp.path.join("build.log").exists(),
+            "a gated build must not create a log"
+        );
+    }
+
+    #[test]
+    fn local_engine_keeps_the_host_backend_without_a_runtime_path() {
+        let local = engine_probe(
+            "local",
+            true,
+            "local Linux builder: root and all required tools are available",
+        );
+        assert!(
+            local.runtime_path.is_none(),
+            "a local engine has no container runtime to invoke"
+        );
+        assert_eq!(
+            execution_backend(Some(&local)),
+            Ok(ExecutionBackend::Host),
+            "kind local must keep the P1-b host path"
+        );
+
+        // No probe at all (dry run or the SYMBLE_BUILDER hook) is also host.
+        assert_eq!(execution_backend(None), Ok(ExecutionBackend::Host));
+    }
+
+    #[test]
+    fn only_a_container_engine_uses_the_container_backend() {
+        let container = container_probe(Path::new("docker"));
+        assert_eq!(
+            execution_backend(Some(&container)),
+            Ok(ExecutionBackend::Container)
+        );
+
+        let none = engine_probe("none", false, "no usable build engine");
+        let error =
+            execution_backend(Some(&none)).expect_err("kind `none` must not reach a launch path");
+        assert!(
+            error.contains("none"),
+            "error should name the engine kind: {error}"
+        );
+    }
+
+    #[test]
+    fn dry_run_still_runs_when_the_engine_is_unavailable() {
+        let manager = BuildManager::with_engine_probe(engine_probe(
+            "none",
+            false,
+            "no usable build engine on macos",
+        ));
+        let temp = TempDir::new("dry-run-no-engine");
+
+        let started = manager
+            .start_build(
+                &as_str(&example("minimal-debian.yaml")),
+                &as_str(&temp.path),
+                "dry-run",
+            )
+            .expect("dry-run must not depend on the engine probe");
+
+        let status = wait_for_terminal(&manager, &started.id, Duration::from_secs(30));
+        assert_eq!(status.state, BuildState::Exited, "status: {status:?}");
+        assert_eq!(status.exit_code, Some(0));
+
+        let log = manager
+            .get_build_log(&started.id, None)
+            .expect("build log should be readable");
+        assert!(log.contains("Dry run complete"), "log:\n{log}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_builds_through_the_container_runtime() {
+        let temp = TempDir::new("execute-container");
+        let invocation_log = temp.path.join("run-argv.txt");
+        let runtime = temp.path.join("docker");
+        let body = format!(
+            r#"#!/usr/bin/env bash
+if [ "$1" = "run" ]; then
+  printf '%s\n' "$@" > '{}'
+fi
+exit 0
+"#,
+            invocation_log.display()
+        );
+        write_runtime(&runtime, &body);
+
+        let manager = BuildManager::with_engine_probe(container_probe(&runtime));
+        let out = temp.path.join("out");
+
+        let started = manager
+            .start_build(
+                &as_str(&example("minimal-debian.yaml")),
+                &as_str(&out),
+                "execute",
+            )
+            .expect("container build should start");
+        let status = wait_for_terminal(&manager, &started.id, Duration::from_secs(30));
+
+        assert_eq!(status.state, BuildState::Exited, "status: {status:?}");
+        assert_eq!(status.exit_code, Some(0));
+
+        let recorded =
+            fs::read_to_string(&invocation_log).expect("the runtime argv should be recorded");
+        let args: Vec<&str> = recorded.lines().collect();
+        assert_eq!(args.first().copied(), Some("run"));
+        assert!(args.contains(&"--privileged"), "argv: {args:?}");
+        assert!(args.contains(&"--platform"), "argv: {args:?}");
+        assert!(args.contains(&"linux/amd64"), "argv: {args:?}");
+        assert!(
+            args.contains(&"engine/runtime/container-entry.sh"),
+            "the v2 entry script must run inside the container: {args:?}"
+        );
+        assert!(
+            args.iter().any(|arg| arg.ends_with(":/work:ro")),
+            "the repository must be mounted read-only: {args:?}"
+        );
+        assert!(
+            args.iter().any(|arg| arg.ends_with(":/export")),
+            "the host out directory must be exported: {args:?}"
+        );
+        assert_eq!(args.last().copied(), Some("execute"));
+        let mode_index = args
+            .iter()
+            .position(|arg| *arg == "--mode")
+            .expect("--mode should be present");
+        assert_eq!(args[mode_index + 1], "execute");
+
+        let name_index = args
+            .iter()
+            .position(|arg| *arg == "--name")
+            .expect("--name should be present");
+        let name = args[name_index + 1];
+        assert!(
+            name.starts_with("sysemble-build-"),
+            "unexpected container name: {name}"
+        );
+
+        // Only the -v mount sources may be host paths; plan/out stay inside.
+        let plan_index = args
+            .iter()
+            .position(|arg| *arg == "--plan")
+            .expect("--plan should be present");
+        assert_eq!(args[plan_index + 1], "/export/plan.json");
+        let out_index = args
+            .iter()
+            .position(|arg| *arg == "--out")
+            .expect("--out should be present");
+        assert_eq!(args[out_index + 1], "/out");
+        let export_index = args
+            .iter()
+            .position(|arg| *arg == "--export")
+            .expect("--export should be present");
+        assert_eq!(args[export_index + 1], "/export");
+        assert!(Path::new(&started.plan_path).is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancel_kills_the_named_container() {
+        let temp = TempDir::new("cancel-container");
+        let run_log = temp.path.join("run-argv.txt");
+        let kill_log = temp.path.join("kill-argv.txt");
+        let runtime = temp.path.join("docker");
+        let body = format!(
+            r#"#!/usr/bin/env bash
+if [ "$1" = "run" ]; then
+  printf '%s\n' "$@" > '{}'
+  sleep 30
+fi
+if [ "$1" = "kill" ]; then
+  printf '%s\n' "$@" > '{}'
+fi
+exit 0
+"#,
+            run_log.display(),
+            kill_log.display()
+        );
+        write_runtime(&runtime, &body);
+
+        let manager = BuildManager::with_engine_probe(container_probe(&runtime));
+        let out = temp.path.join("out");
+        let started = manager
+            .start_build(
+                &as_str(&example("minimal-debian.yaml")),
+                &as_str(&out),
+                "execute",
+            )
+            .expect("container build should start");
+
+        // Wait until the fake runtime has recorded the run argv.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !run_log.is_file() {
+            assert!(
+                Instant::now() < deadline,
+                "the fake runtime never recorded its run argv"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        manager
+            .cancel_build(&started.id)
+            .expect("a running container build should be cancellable");
+        let status = wait_for_terminal(&manager, &started.id, Duration::from_secs(10));
+        assert_eq!(status.state, BuildState::Cancelled, "status: {status:?}");
+
+        // `<runtime> kill <name>` is best effort and asynchronous.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !kill_log.is_file() {
+            assert!(
+                Instant::now() < deadline,
+                "cancellation did not run `<runtime> kill <name>`"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let run_args: Vec<String> = fs::read_to_string(&run_log)
+            .expect("run argv should be readable")
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let name_index = run_args
+            .iter()
+            .position(|arg| arg == "--name")
+            .expect("run argv should carry --name");
+        let name = run_args[name_index + 1].clone();
+
+        let kill_args: Vec<String> = fs::read_to_string(&kill_log)
+            .expect("kill argv should be readable")
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(kill_args, vec!["kill".to_string(), name]);
     }
 
     #[test]

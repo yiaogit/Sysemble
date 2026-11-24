@@ -47,6 +47,8 @@
   let pollGeneration = 0;
   let engineAvailable = false;
   let engineReason = "";
+  let engineSummary = "";
+  let engineLabel = "";
 
   function setStatus(message, kind = "idle") {
     els.status.textContent = message;
@@ -57,7 +59,7 @@
   function buildTitle() {
     if (!invoke) return "Real builds need the Tauri IPC bridge";
     if (engineAvailable) {
-      return "Run the builder with --execute using the local Linux engine";
+      return `Run the builder with --execute using the ${engineLabel || "detected"} engine`;
     }
     return engineReason || "Checking engine availability…";
   }
@@ -101,6 +103,7 @@
 
   function applyEngine(info) {
     const kind = info && typeof info.kind === "string" ? info.kind : "none";
+    const runtime = info && typeof info.runtime === "string" ? info.runtime : "";
     const reason =
       info && typeof info.reason === "string" && info.reason.trim().length > 0
         ? info.reason
@@ -108,11 +111,22 @@
     engineAvailable = Boolean(info && info.available === true);
 
     if (engineAvailable) {
+      // P1-e2: a container engine names the runtime it was probed through,
+      // e.g. `Engine: container · docker`.
+      engineSummary = kind === "container" && runtime ? `container · ${runtime}` : kind;
+      engineLabel =
+        kind === "container"
+          ? `${runtime || "container"} container`
+          : kind === "local"
+            ? "local Linux"
+            : kind;
       engineReason = "";
-      els.engine.textContent = `Engine: ${kind}`;
+      els.engine.textContent = `Engine: ${engineSummary}`;
       els.engine.className = "engine ok";
-      els.engine.title = `Real builds use the ${kind} engine on this host`;
+      els.engine.title = reason;
     } else {
+      engineSummary = "";
+      engineLabel = "";
       engineReason = reason;
       els.engine.textContent = `Engine unavailable — ${reason}`;
       els.engine.className = "engine error";
@@ -123,6 +137,8 @@
 
   function showEngineError(error) {
     engineAvailable = false;
+    engineSummary = "";
+    engineLabel = "";
     engineReason = `engine probe failed: ${formatError(error)}`;
     els.engine.textContent = `Engine unavailable — ${engineReason}`;
     els.engine.className = "engine error";

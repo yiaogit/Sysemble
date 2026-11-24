@@ -4,7 +4,7 @@
 
 Sysemble is a local-first desktop application for composing a complete Linux system — base, desktop, applications, a Windows VM layer, and development environments — from a declarative spec, then building and verifying it on your own machine.
 
-> **Status: P1-e1 (v0.0.1).** The engine builds, boots, installs, and runs a live ISO in CI. The Tauri shell validates/plans, runs and tails builds, renders a six-layer view, and now reports whether real builds are possible (macOS/Windows wait for the engine VM). See [docs/roadmap.md](docs/roadmap.md).
+> **Status: P1-e2a/b (v0.0.1).** The engine builds, boots, installs, and runs a live ISO in CI. The Tauri shell validates/plans, runs and tails builds, renders a six-layer view, and reports whether real builds are possible. The engine now ships as a versioned Debian OCI image (`engine/image`) that the shell runs through Docker Desktop or podman on macOS/Windows and through the local builder on Linux; native Virtualization.framework / WSL2 engine helpers are P1-e3. See [docs/roadmap.md](docs/roadmap.md).
 
 ---
 
@@ -24,7 +24,7 @@ The design borrows the useful parts of hosted builders — spec-as-truth, state 
 
 - **Conversation → spec.** An assistant interviews you in structured questions and writes a reviewable `buildspec.yaml`. It never free-hands shell commands.
 - **Visual assembly.** A layer canvas shows base → kernel → desktop → apps → Windows VM → dev environment, with size and time estimates per layer.
-- **Local build.** Builds run inside a disposable Linux sandbox (podman), never on your host.
+- **Local build.** Builds run inside the disposable, versioned Linux engine image (docker/podman), never directly on your host.
 - **Boot verification.** Every artifact is booted in QEMU and checked against assertions before it is called usable.
 - **Windows apps that feel native.** Pick per-application integration: Wine, RDP RemoteApp, full desktop VM, or GPU passthrough + Looking Glass.
 - **Team artifacts.** Share a signed spec plus SBOM and build evidence; reproduce the same image on every device.
@@ -45,23 +45,25 @@ The design borrows the useful parts of hosted builders — spec-as-truth, state 
 └───────────────────────────┬─────────────────────────────────┘
                             │
 ┌───────────────────────────▼─────────────────────────────────┐
-│ Build sandbox (podman, rootless)                            │
+│ Engine image (engine/image, docker/podman)                  │
 │  rootfs → configure → image (ISO / qcow2 / raw / UKI)       │
 │  → QEMU boot → assertions → evidence → export               │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-The engine always runs on Linux. On Windows it lives in WSL2; on macOS it lives in an Apple Virtualization.framework VM. The UI stays native.
+The engine always runs on Linux. On macOS it currently runs in the Linux VM
+provided by Docker Desktop or podman; on Windows in Docker Desktop/WSL2. A
+native Virtualization.framework helper is planned for P1-e3. The UI stays native.
 
 ## Cross-platform hosts
 
 | Host | Engine | Native target | x86_64 target |
 |---|---|---|---|
-| Windows x86_64 | WSL2 | x86_64 | native |
-| Windows arm64 | WSL2 (arm64) | arm64 | qemu-user (slow) |
-| macOS arm64 | Virtualization.framework | arm64 | Rosetta for Linux / qemu (experimental) |
-| Linux x86_64 | KVM | x86_64 | native |
-| Linux arm64 | KVM | arm64 | qemu-user (slow) |
+| Windows x86_64 | Docker Desktop / WSL2 container | x86_64 | native |
+| Windows arm64 | Docker Desktop / WSL2 container | arm64 | qemu (amd64 engine, slow) |
+| macOS arm64 | Docker Desktop / podman (amd64 engine image) | arm64 | Rosetta for Linux / qemu |
+| Linux x86_64 | native (root) or docker/podman | x86_64 | native |
+| Linux arm64 | native (root) or docker/podman | arm64 | qemu-user (slow) |
 
 Host support means the app runs everywhere; build targets are always Linux.
 
@@ -108,11 +110,15 @@ Specs live in Git, artifacts in any OCI registry. `sysemble verify` checks signa
 ## Repository layout
 
 ```
-docs/          design, ADRs, roadmap
+docs/          design, ADRs, roadmap, plans, acceptance reports
 spec/          JSON Schemas for buildspec and module
 examples/      runnable example specs
-crates/        Rust workspace (core, cli) — skeleton
-tools/         schema validation helper
+crates/        Rust workspace (plan resolver, CLI)
+builders/      Debian rootfs/disk/ISO builder and installer assets
+engine/        engine image (Dockerfile, manifest) and container entry point
+apps/desktop/  Tauri 2 shell (separate cargo workspace)
+tools/         boot/install checks, schema validation
+tests/         black-box acceptance suite
 ```
 
 ## Roadmap
@@ -120,7 +126,7 @@ tools/         schema validation helper
 | Phase | Scope |
 |---|---|
 | P0 | CLI + Debian base + 10 modules + qcow2 + QEMU boot + 3 assertions |
-| P1 | Tauri UI: canvas, diff, console, preview; ISO + installer |
+| P1 | Tauri UI: canvas, diff, console, preview; ISO + installer; container engine |
 | P2 | Windows app modes, dev profiles, local MCP server |
 | P3 | Arch/Nix backends, team bundles, signing, multi-device provisioning |
 
@@ -134,4 +140,4 @@ MIT. See [LICENSE](LICENSE).
 
 ---
 
-**中文简介**：Sysemble 是一个本地优先的 Linux 系统组装台：对话生成 spec、可视化分层拼装、本地沙箱构建、QEMU 启动验证，支持 Windows 应用层与团队可复现产物。跨 Windows/macOS/Linux 三端，技术栈 Rust + Tauri。当前处于设计阶段。
+**中文简介**：Sysemble 是一个本地优先的 Linux 系统组装台：对话生成 spec、可视化分层拼装、本地引擎镜像构建、QEMU 启动验证，支持 Windows 应用层与团队可复现产物。跨 Windows/macOS/Linux 三端，技术栈 Rust + Tauri。当前处于 P1：macOS/Windows 通过 Docker Desktop/podman 运行版本化 Debian 引擎镜像（原生 VZ/WSL2 helper 在 P1-e3）。
