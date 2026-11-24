@@ -9,6 +9,7 @@
 
   const els = {
     path: document.getElementById("spec-path"),
+    outDir: document.getElementById("out-dir"),
     status: document.getElementById("status"),
     bridgeWarning: document.getElementById("bridge-warning"),
     source: document.getElementById("spec-source"),
@@ -20,10 +21,23 @@
     load: document.getElementById("load-btn"),
     validate: document.getElementById("validate-btn"),
     planButton: document.getElementById("plan-btn"),
+    dryRun: document.getElementById("dry-run-btn"),
+    build: document.getElementById("build-btn"),
+    cancel: document.getElementById("cancel-btn"),
+    buildBadge: document.getElementById("build-badge"),
+    buildExit: document.getElementById("build-exit"),
+    buildMeta: document.getElementById("build-meta"),
+    buildLog: document.getElementById("build-log"),
   };
 
-  const buttons = [els.load, els.validate, els.planButton];
+  const BUILD_LOG_TAIL_LINES = 400;
+  const BUILD_POLL_INTERVAL_MS = 1000;
+
   let busy = false;
+  let buildRunning = false;
+  let activeBuild = null;
+  let pollTimer = null;
+  let pollGeneration = 0;
 
   function setStatus(message, kind = "idle") {
     els.status.textContent = message;
@@ -31,12 +45,26 @@
     els.status.className = `status ${kind}`;
   }
 
+  function refreshControls() {
+    const locked = !invoke || busy || buildRunning;
+    for (const button of [els.load, els.validate, els.planButton]) {
+      button.disabled = locked;
+    }
+    els.dryRun.disabled = locked;
+    els.build.disabled = locked;
+    els.path.disabled = locked;
+    els.outDir.disabled = locked;
+    els.cancel.disabled = !invoke || busy || !buildRunning;
+  }
+
   function setBusy(value) {
     busy = value;
-    for (const button of buttons) {
-      button.disabled = !invoke || busy;
-    }
-    els.path.disabled = !invoke || busy;
+    refreshControls();
+  }
+
+  function setBuildRunning(value) {
+    buildRunning = value;
+    refreshControls();
   }
 
   function formatError(error) {
@@ -194,6 +222,206 @@
     );
   }
 
+  /* ---------------------------------------------------------------- build UI */
+
+  function setBuildBadge(state, exitCode) {
+    const labels = {
+      idle: "idle",
+      starting: "starting",
+      running: "running",
+      exited: "exited",
+      failed: "failed",
+      cancelled: "cancelled",
+      error: "error",
+    };
+    const label = labels[state] || state;
+    if (els.buildBadge.textContent !== label) {
+      els.buildBadge.textContent = label;
+    }
+    els.buildBadge.className = `build-badge ${state}`;
+    const exitText =
+      state === "idle" || state === "starting" || state === "running"
+        ? ""
+        : exitCode === null || exitCode === undefined
+          ? "exit —"
+          : `exit ${exitCode}`;
+    if (els.buildExit.textContent !== exitText) {
+      els.buildExit.textContent = exitText;
+      els.buildExit.title = exitText;
+    }
+  }
+
+  function renderBuildLog(text) {
+    const content = text && text.length > 0 ? text : "(no output yet)";
+    if (els.buildLog.textContent === content) return;
+    els.buildLog.textContent = content;
+    // The log panel follows the builder output until the user starts another
+    // build or scrolls away.
+    els.buildLog.scrollTop = els.buildLog.scrollHeight;
+  }
+
+  function lastMeaningfulLine(text) {
+    const lines = String(text || "")
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+    return lines.length > 0 ? lines[lines.length - 1] : "";
+  }
+
+  function setBuildMeta(status) {
+    const parts = [];
+    if (activeBuild) parts.push(`id ${activeBuild.id}`);
+    if (status && status.started_at) parts.push(`started ${status.started_at}`);
+    if (status && status.finished_at) parts.push(`finished ${status.finished_at}`);
+    setMeta(els.buildMeta, parts.length > 0 ? parts.join(" · ") : "no build yet");
+  }
+
+  function announceBuildResult(status, log) {
+    const exit =
+      status.exit_code === null || status.exit_code === undefined
+        ? "no exit code"
+        : `exit ${status.exit_code}`;
+
+    if (status.state === "exited" && status.exit_code === 0) {
+      setStatus(`Build exited 0 · ${activeBuild ? activeBuild.log_path : ""}`, "ok");
+      return;
+    }
+    if (status.state === "cancelled") {
+      setStatus("Build cancelled", "warn");
+      return;
+    }
+    if (status.state === "failed") {
+      const tail = lastMeaningfulLine(log) || "(build log is empty)";
+      setStatus(`Build failed · ${exit} · ${tail}`, "error");
+      return;
+    }
+    setStatus(`Build ${status.state} · ${exit}`, status.state === "exited" ? "ok" : "warn");
+  }
+
+  function stopPolling() {
+    // Invalidates an in-flight poll so a slow response from a cancelled or
+    // replaced build cannot overwrite the current badge.
+    pollGeneration += 1;
+    if (pollTimer !== null) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+  }
+
+  async function pollBuild() {
+    if (!invoke || !activeBuild) return;
+    const build = activeBuild;
+    const generation = pollGeneration;
+
+    try {
+      const status = await invoke("get_build", { id: build.id });
+      const log = await invoke("get_build_log", {
+        id: build.id,
+        tail_lines: BUILD_LOG_TAIL_LINES,
+      });
+
+      if (
+        generation !== pollGeneration ||
+        !activeBuild ||
+        activeBuild.id !== build.id
+      ) {
+        return;
+      }
+
+      renderBuildLog(log);
+      setBuildMeta(status);
+
+      if (status.state === "running") {
+        setBuildBadge("running", null);
+        return;
+      }
+
+      stopPolling();
+      setBuildRunning(false);
+      setBuildBadge(status.state, status.exit_code);
+      announceBuildResult(status, log);
+    } catch (error) {
+      if (generation !== pollGeneration) return;
+      // A lost backend must stop the timer and stay visible, not spin forever.
+      stopPolling();
+      setBuildRunning(false);
+      setBuildBadge("error", null);
+      setMeta(els.buildMeta, "status unavailable");
+      els.buildLog.textContent += `\n[sysemble] polling failed: ${formatError(error)}`;
+      els.buildLog.scrollTop = els.buildLog.scrollHeight;
+      setStatus(`Build status failed: ${formatError(error)}`, "error");
+    }
+  }
+
+  async function startBuild(mode) {
+    if (!invoke) return;
+
+    const specPath = els.path.value.trim();
+    const outDir = els.outDir.value.trim();
+    if (!specPath) {
+      setStatus("Enter a spec path first.", "error");
+      els.path.focus();
+      return;
+    }
+    if (!outDir) {
+      setStatus("Enter an output directory first.", "error");
+      els.outDir.focus();
+      return;
+    }
+
+    stopPolling();
+    activeBuild = null;
+    setBuildRunning(true);
+    setBuildBadge("starting", null);
+    setMeta(els.buildMeta, "starting…");
+    els.buildLog.textContent = `Starting ${mode} build…`;
+    setStatus(`${mode === "execute" ? "Build" : "Dry run"} starting…`, "busy");
+
+    try {
+      const started = await invoke("start_build", {
+        spec_path: specPath,
+        out_dir: outDir,
+        mode,
+      });
+      activeBuild = started;
+      setBuildBadge("running", null);
+      setBuildMeta(null);
+      setStatus(`Build running · ${mode} · ${outDir}`, "busy");
+
+      await pollBuild();
+      if (buildRunning) {
+        pollTimer = setInterval(pollBuild, BUILD_POLL_INTERVAL_MS);
+      }
+    } catch (error) {
+      const message = formatError(error);
+      setBuildRunning(false);
+      setBuildBadge("error", null);
+      setMeta(els.buildMeta, "start failed");
+      els.buildLog.textContent = `Could not start the build.\n\n${message}`;
+      els.buildLog.scrollTop = 0;
+      setStatus(`Build failed to start: ${message}`, "error");
+    }
+  }
+
+  async function cancelBuild() {
+    if (!invoke || !activeBuild || !buildRunning) return;
+
+    els.cancel.disabled = true;
+    setStatus("Cancelling build…", "busy");
+    try {
+      await invoke("cancel_build", { id: activeBuild.id });
+      setBuildBadge("cancelled", null);
+      setStatus("Build cancelled", "warn");
+      stopPolling();
+      await pollBuild();
+    } catch (error) {
+      setStatus(`Cancel failed: ${formatError(error)}`, "error");
+      refreshControls();
+    }
+  }
+
+  /* ----------------------------------------------------------------- actions */
+
   async function action(run) {
     if (!invoke) return;
 
@@ -236,6 +464,9 @@
   els.load.addEventListener("click", () => action(loadSpec));
   els.validate.addEventListener("click", () => action(validateSpec));
   els.planButton.addEventListener("click", () => action(planSpec));
+  els.dryRun.addEventListener("click", () => startBuild("dry-run"));
+  els.build.addEventListener("click", () => startBuild("execute"));
+  els.cancel.addEventListener("click", cancelBuild);
 
   els.path.addEventListener("keydown", (event) => {
     if (event.key === "Enter") {
@@ -243,6 +474,8 @@
       action(validateSpec);
     }
   });
+
+  window.addEventListener("beforeunload", stopPolling);
 
   if (!invoke) {
     els.bridgeWarning.hidden = false;
@@ -252,4 +485,7 @@
     setBusy(false);
     setStatus("Ready", "idle");
   }
+
+  setBuildBadge("idle", null);
+  setBuildMeta(null);
 })();

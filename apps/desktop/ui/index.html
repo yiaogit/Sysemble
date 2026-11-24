@@ -13,7 +13,7 @@
           <span class="logo" aria-hidden="true"></span>
           <div class="brand-text">
             <h1>Sysemble</h1>
-            <p>Desktop shell &middot; spec &rarr; plan</p>
+            <p>Desktop shell &middot; spec &rarr; plan &rarr; build</p>
           </div>
         </div>
         <div id="status" class="status" role="status" aria-live="polite">Ready</div>
@@ -37,12 +37,51 @@
           <button id="plan-btn" class="button primary" type="button">Plan</button>
         </div>
       </div>
+
+      <div class="toolbar-row build-row">
+        <label class="path-field out-field" for="out-dir">
+          <span class="path-label">out</span>
+          <input
+            id="out-dir"
+            type="text"
+            value="out"
+            spellcheck="false"
+            autocomplete="off"
+            autocapitalize="off"
+          />
+        </label>
+        <div class="actions">
+          <button
+            id="dry-run-btn"
+            class="button"
+            type="button"
+            title="Run the builder with --dry-run (safe on any host)"
+          >
+            Dry run
+          </button>
+          <button
+            id="build-btn"
+            class="button primary"
+            type="button"
+            title="Run the builder with --execute (requires Linux and root; expected to fail on macOS)"
+          >
+            Build
+          </button>
+          <button id="cancel-btn" class="button danger" type="button" disabled>
+            Cancel
+          </button>
+        </div>
+        <div class="build-state" aria-live="polite">
+          <span id="build-badge" class="build-badge idle">idle</span>
+          <span id="build-exit" class="build-exit"></span>
+        </div>
+      </div>
     </header>
 
     <div id="bridge-warning" class="banner" hidden>
       <strong>Browser preview.</strong> <code>window.__TAURI__</code> is missing, so
-      <strong>Load</strong>, <strong>Validate</strong>, and <strong>Plan</strong> are
-      disabled. Launch the desktop window with
+      <strong>Load</strong>, <strong>Validate</strong>, <strong>Plan</strong>, and the
+      build controls are disabled. Launch the desktop window with
       <code>cargo run --manifest-path apps/desktop/src-tauri/Cargo.toml</code> from the
       repository root, or with <code>cargo tauri dev</code>.
     </div>
@@ -73,6 +112,14 @@
           <p class="empty">Run <strong>Plan</strong> to resolve packages and estimates.</p>
         </div>
       </aside>
+
+      <section class="pane build-pane" aria-labelledby="build-heading">
+        <div class="pane-head">
+          <h2 id="build-heading">Build log</h2>
+          <span id="build-meta" class="meta">no build yet</span>
+        </div>
+        <pre id="build-log" class="build-log">Start a dry run to see the builder output here.</pre>
+      </section>
     </main>
 
     <script src="app.js"></script>

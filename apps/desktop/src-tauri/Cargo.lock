@@ -3237,6 +3237,7 @@ dependencies = [
 name = "sysemble-desktop"
 version = "0.0.1"
 dependencies = [
+ "libc",
  "serde",
  "serde_json",
  "sysemble-core",

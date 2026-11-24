@@ -1,4 +1,4 @@
-//! Tauri command layer for the Sysemble desktop shell (P1-a).
+//! Tauri command layer for the Sysemble desktop shell (P1-a/P1-b).
 //!
 //! The IPC surface is deliberately tiny. Every command is a thin wrapper
 //! around a plain function so the interesting behaviour can be unit-tested
@@ -7,6 +7,19 @@
 use std::path::{Path, PathBuf};
 
 use sysemble_core::{load_spec, resolve_plan, validate_spec, Diagnostic, Plan};
+
+pub mod build;
+
+use build::{BuildManager, BuildStarted, BuildStatus};
+
+/// Repository root as compiled into the desktop binary.
+///
+/// Debug builds historically start inside `apps/desktop/src-tauri`, so both the
+/// example specs and `builders/debian/build.sh` are resolved relative to this
+/// directory.
+pub(crate) fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..")
+}
 
 /// Resolve a path supplied by the UI.
 ///
@@ -23,8 +36,7 @@ fn resolve_path(raw: &str) -> PathBuf {
 
     #[cfg(debug_assertions)]
     {
-        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
-        let from_repo = repo_root.join(&candidate);
+        let from_repo = repo_root().join(&candidate);
         if from_repo.exists() {
             return from_repo;
         }
@@ -73,11 +85,82 @@ fn plan(path: String) -> Result<Plan, String> {
     plan_spec_path(&path)
 }
 
+// P1-b build control. The IPC entry points are thin `#[tauri::command]`
+// wrappers around these plain functions; keeping the two names apart avoids
+// the E0255 duplicate-definition error from a previous attempt.
+
+fn start_build_command(
+    manager: &BuildManager,
+    spec_path: String,
+    out_dir: String,
+    mode: String,
+) -> Result<BuildStarted, String> {
+    manager.start_build(&spec_path, &out_dir, &mode)
+}
+
+fn get_build_command(manager: &BuildManager, id: String) -> Result<BuildStatus, String> {
+    manager.get_build(&id)
+}
+
+fn get_build_log_command(
+    manager: &BuildManager,
+    id: String,
+    tail_lines: Option<u32>,
+) -> Result<String, String> {
+    manager.get_build_log(&id, tail_lines)
+}
+
+fn cancel_build_command(manager: &BuildManager, id: String) -> Result<(), String> {
+    manager.cancel_build(&id)
+}
+
+/// IPC: start a dry-run or execute builder for a spec.
+#[tauri::command(rename_all = "snake_case")]
+fn start_build(
+    manager: tauri::State<'_, BuildManager>,
+    spec_path: String,
+    out_dir: String,
+    mode: String,
+) -> Result<BuildStarted, String> {
+    start_build_command(&manager, spec_path, out_dir, mode)
+}
+
+/// IPC: snapshot a build's state and exit code.
+#[tauri::command(rename_all = "snake_case")]
+fn get_build(manager: tauri::State<'_, BuildManager>, id: String) -> Result<BuildStatus, String> {
+    get_build_command(&manager, id)
+}
+
+/// IPC: tail of `<out>/build.log`.
+#[tauri::command(rename_all = "snake_case")]
+fn get_build_log(
+    manager: tauri::State<'_, BuildManager>,
+    id: String,
+    tail_lines: Option<u32>,
+) -> Result<String, String> {
+    get_build_log_command(&manager, id, tail_lines)
+}
+
+/// IPC: kill a running builder and mark it cancelled.
+#[tauri::command(rename_all = "snake_case")]
+fn cancel_build(manager: tauri::State<'_, BuildManager>, id: String) -> Result<(), String> {
+    cancel_build_command(&manager, id)
+}
+
 /// Start the desktop application.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![read_spec, validate, plan])
+        .manage(BuildManager::new())
+        .invoke_handler(tauri::generate_handler![
+            read_spec,
+            validate,
+            plan,
+            start_build,
+            get_build,
+            get_build_log,
+            cancel_build
+        ])
         .run(tauri::generate_context!())
         .expect("failed to run the Sysemble desktop window");
 }

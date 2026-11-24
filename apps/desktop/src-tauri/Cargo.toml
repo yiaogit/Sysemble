@@ -23,6 +23,8 @@ tauri = { version = "2", features = [] }
 sysemble-core = { path = "../../../crates/sysemble-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Used only on Unix to signal the builder's process group when cancelling.
+libc = "0.2"
 
 [profile.dev]
 # Keeping debug symbols out of the WebView stack keeps the first cold build

@@ -211,6 +211,66 @@ body {
   gap: 8px;
 }
 
+.out-field {
+  flex: 1;
+}
+
+.build-row .out-field {
+  max-width: 460px;
+}
+
+.build-state {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.build-badge {
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #0b1424;
+  color: var(--muted);
+  font: 700 10.5px/1 var(--mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.build-badge.starting,
+.build-badge.running {
+  border-color: rgba(45, 212, 191, 0.4);
+  background: rgba(45, 212, 191, 0.08);
+  color: var(--accent);
+}
+
+.build-badge.exited {
+  border-color: rgba(52, 211, 153, 0.4);
+  background: rgba(52, 211, 153, 0.07);
+  color: var(--ok);
+}
+
+.build-badge.failed,
+.build-badge.error {
+  border-color: rgba(248, 113, 113, 0.42);
+  background: rgba(248, 113, 113, 0.07);
+  color: var(--error);
+}
+
+.build-badge.cancelled {
+  border-color: rgba(251, 191, 36, 0.38);
+  background: rgba(251, 191, 36, 0.07);
+  color: var(--warn);
+}
+
+.build-exit {
+  color: var(--faint);
+  font: 11px/1.4 var(--mono);
+  white-space: nowrap;
+}
+
 .button {
   height: 40px;
   padding: 0 16px;
@@ -244,6 +304,17 @@ body {
 
 .button.primary:hover:not(:disabled) {
   background: linear-gradient(135deg, #2dd4bf, #38bdf8);
+}
+
+.button.danger {
+  border-color: rgba(248, 113, 113, 0.35);
+  background: rgba(248, 113, 113, 0.08);
+  color: #fecaca;
+}
+
+.button.danger:hover:not(:disabled) {
+  border-color: rgba(248, 113, 113, 0.62);
+  background: rgba(248, 113, 113, 0.15);
 }
 
 .button:disabled {
@@ -282,9 +353,25 @@ body {
   display: grid;
   flex: 1;
   grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr) minmax(160px, 30vh);
   gap: 14px;
   min-height: 0;
   padding: 14px 20px 20px;
+}
+
+.spec-pane {
+  grid-column: 1;
+  grid-row: 1;
+}
+
+.detail-pane {
+  grid-column: 2;
+  grid-row: 1;
+}
+
+.build-pane {
+  grid-column: 1 / -1;
+  grid-row: 2;
 }
 
 .pane {
@@ -339,6 +426,19 @@ body {
   overflow: auto;
   color: #cbd5e1;
   font: 12.5px/1.7 var(--mono);
+  tab-size: 2;
+  white-space: pre;
+}
+
+.build-log {
+  flex: 1;
+  min-height: 0;
+  margin: 0;
+  padding: 12px 16px;
+  overflow: auto;
+  background: rgba(3, 7, 15, 0.55);
+  color: #cbd5e1;
+  font: 12px/1.65 var(--mono);
   tab-size: 2;
   white-space: pre;
 }
