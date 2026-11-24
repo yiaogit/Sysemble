@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Sysemble engine image build + manifest (P1-e2a).
 #
-# Contract (frozen): docs/plan/P1-e2-workplan.md sections 2.1 and 5.
+# Contract (frozen): docs/plan/P1-e2-workplan.md section 2.1.
 #
 #   build-image.sh [--ref <ref>] [--out <dir>] [--platform linux/amd64]
 #                  [--no-cache] [--verify <dir>] [--help]

@@ -261,7 +261,6 @@ jobs:
             engine/image/build/smoke/artifact.json
             engine/image/build/smoke/boot-evidence.json
             engine/image/build/smoke/disk.qcow2
-            engine/image/build/smoke/build.log
             engine/image/build/smoke/boot.log
 
   tui-install-smoke:

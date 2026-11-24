@@ -34,8 +34,10 @@ Tauri desktop (macOS / Windows / Linux)
   engine_info() ──► probe 顺序: local(Linux root+tools) → container(docker|podman) → none
   start_build(execute) ──► docker run --rm --init --privileged --platform linux/amd64
                              --name sysemble-build-<id>
-                             -v <repo>:/work  [-v <out>:/out when outside repo]
-                             -w /work  <image>  bash builders/debian/build.sh ...
+                             -v <repo>:/work:ro  -v <out>:/export
+                             -w /work  <image>
+                             bash engine/runtime/container-entry.sh \
+                               --plan /export/plan.json --out /out --export /export --mode execute
                                    │
                                    ▼
                         sysemble-engine:0.1.0 (Debian trixie)
@@ -43,10 +45,11 @@ Tauri desktop (macOS / Windows / Linux)
                         ovmf · xorriso · squashfs-tools · rsync · gdisk · jq
                                    │
                                    ▼
-                        <out>/artifact.json + qcow2/iso + build.log
+                        container /out (case-sensitive) → export top-level files
+                        <out>/artifact.json + disk.img + qcow2/iso (+ live build.log)
 ```
 
-宿主与容器只通过挂载共享：仓库 → `/work`，仓库外的 out → `/out`。日志仍由桌面进程把子进程 stdout/stderr 写到宿主 `<out>/build.log`。
+宿主与容器只通过挂载共享：仓库只读挂到 `/work`，宿主 out 挂到 `/export`；rootfs 在容器内 `/out` 构建（大小写敏感）。日志仍由桌面进程把子进程 stdout/stderr 写到宿主 `<out>/build.log`。
 
 ## 2. 冻结接口
 
@@ -138,10 +141,10 @@ Tauri desktop (macOS / Windows / Linux)
 
 | 切片 | 内容 | 写入边界 | 状态 |
 |---|---|---|---|
-| **E2a** 引擎镜像 | Dockerfile、build-image.sh、静态/在线测试、容器内 build+boot smoke、README、CI job 片段 | `engine/image/**` | 派工中 |
-| **E2b** 桌面容器后端 | `engine_info` 探测扩展、容器命令装配、execute 接管、取消、UI 文案、单测 | `apps/desktop/**` | 派工中 |
+| **E2a** 引擎镜像 | Dockerfile、build-image.sh、静态/在线测试、容器内 build+boot smoke、README、CI job 片段 | `engine/image/**` | 已交付（本机 K1–K5，CI `engine-check` 绿） |
+| **E2b** 桌面容器后端 | `engine_info` 探测扩展、容器命令装配、execute 接管、取消、UI 文案、单测 | `apps/desktop/**` | 已交付（39 桌面测试 + 本机 E2E 通过） |
 | **E2c** 原生 VM（顺延） | VZ/WSL2 helper、镜像分发、virtiofs、vsock | `engine/vm/**`（后续） | 不做 |
-| **E2d** 独立验收 | 下载 CI artifact、重算 sha256、核对日志与镜像清单 | `docs/acceptance/**` | 待 CI |
+| **E2d** 独立验收 | 下载 CI artifact、重算 sha256、核对日志与镜像清单 | `docs/acceptance/**` | 验收中（run `45434475490`） |
 | 集成 | CI job、A10 允许目录、README/roadmap、提交/推送 | 主线程 | 进行中 |
 
 ## 4. 验收矩阵
@@ -181,8 +184,9 @@ Tauri desktop (macOS / Windows / Linux)
 5. **可复现性**：固定 base digest + `SOURCE_DATE_EPOCH` + 记录 dpkg 版本，但 apt 仓库漂移使镜像不是 bit-for-bit 可复现；签名/SBOM 标准格式在 P3，不在本切片宣称。
 6. **大小写不敏感宿主**：macOS APFS 默认大小写不敏感，rootfs 直接写宿主挂载目录会让 dpkg 的 `PAM.7.gz`/`pam.7.gz` 变成 ELOOP。v2 已改为容器内构建 + 顶层产物导出；CI（ext4）与 Windows（NTFS + Docker Desktop VM）同样走该路径，避免平台分叉。
 7. **非 ASCII 路径**：本机仓库路径含中文，容器内映射到 `/work`/`/export` 规避；导出目录里的文件名本身是 ASCII。CI 路径为 ASCII，两边都要测。
-7. **macOS CI 嵌套虚拟化**：不尝试在 macOS runner 启动 VZ；E2c 的真实验证只在真机。
-8. **镜像体积**：含 qemu/grub/ovmf，预计 1–1.5 GB；不做分发 registry，本地构建。
+8. **启动验证会改写 raw 盘**：boot-check 以读写方式启动 raw `disk.img`，boot 后它的 sha256 与 `artifact.json` 记录不再一致（qcow2 未被启动，保持一致）。验收/报告必须区分这一点，不能用 boot 后的 raw 反推产物损坏。
+9. **macOS CI 嵌套虚拟化**：不尝试在 macOS runner 启动 VZ；E2c 的真实验证只在真机。
+10. **镜像体积**：含 qemu/grub/ovmf，约 516 MB 磁盘占用；不做分发 registry，本地构建。
 
 ## 7. 非目标
 

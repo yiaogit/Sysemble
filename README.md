@@ -66,6 +66,9 @@ native Virtualization.framework helper is planned for P1-e3. The UI stays native
 | Linux arm64 | native (root) or docker/podman | arm64 | qemu-user (slow) |
 
 Host support means the app runs everywhere; build targets are always Linux.
+The container engine is verified on macOS arm64 (local E2E) and Linux CI; the
+Windows path and native Virtualization.framework/WSL2 helpers (P1-e3) are
+implemented/planned but not yet verified on real hardware.
 
 ## Base spectrum
 

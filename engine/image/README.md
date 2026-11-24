@@ -7,8 +7,8 @@ image that carries the **same** `builders/debian/build.sh` and
 implementation of the builder.
 
 Frozen contract: [`docs/plan/P1-e2-workplan.md`](../../docs/plan/P1-e2-workplan.md)
-sections 2.1 and 5. This directory only adds the image, its build/verify
-scripts, the tests, and the CI job fragment.
+sections 2.1 (image/manifest) and 2.3 (container command). This directory only
+adds the image, its build/verify scripts, the tests, and the CI job fragment.
 
 ## Contents
 
@@ -112,8 +112,8 @@ docker run --rm --init --privileged --platform linux/amd64 \
   exported artifact by phase 2.
 - **`linux/amd64` on Apple Silicon.** The image is amd64-only. Docker Desktop
   runs it through Rosetta, so a full build + TCG boot takes minutes (measured
-  191 s for the minimal plan on the M-series dev host; budget 15–40 minutes on
-  slower hosts). CI (`ubuntu-latest`) is native amd64. Rosetta
+  191 s on an idle M-series host and 504 s while other cargo jobs ran; budget
+  15–40 minutes on slower hosts). CI (`ubuntu-latest`) is native amd64. Rosetta
   keeps file descriptors 3–9 open in every process, so the image uses bash as
   `/bin/sh`: mmdebstrap hands apt a `cat >&<fd>` hook whose fd then exceeds 9,
   and dash cannot parse multi-digit redirections. The guest rootfs still uses
@@ -147,8 +147,9 @@ the container), so the CI job does not need nested virtualization.
 
 [`ci-snippet.yml`](ci-snippet.yml) is the `engine-check` job fragment for the
 main `.github/workflows/ci.yml` (ubuntu-latest, 45 min): build, verify, plan,
-container build + boot-check, upload evidence. It is a fragment on purpose —
-this slice does not edit the real workflow.
+container build + boot-check, upload evidence. The job is merged into the real
+workflow as [`engine-check`](../../.github/workflows/ci.yml); this file is kept
+as the frozen contract fragment.
 
 ## Known limits
 
