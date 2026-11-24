@@ -14,13 +14,19 @@
     bridgeWarning: document.getElementById("bridge-warning"),
     source: document.getElementById("spec-source"),
     specMeta: document.getElementById("spec-meta"),
+    layers: document.getElementById("layers"),
+    layersMeta: document.getElementById("layers-meta"),
+    rawSpec: document.getElementById("raw-spec"),
     diagnostics: document.getElementById("diagnostics"),
     diagnosticsMeta: document.getElementById("diagnostics-meta"),
     plan: document.getElementById("plan"),
     planMeta: document.getElementById("plan-meta"),
+    diff: document.getElementById("diff"),
+    diffMeta: document.getElementById("diff-meta"),
     load: document.getElementById("load-btn"),
     validate: document.getElementById("validate-btn"),
     planButton: document.getElementById("plan-btn"),
+    inspectButton: document.getElementById("inspect-btn"),
     dryRun: document.getElementById("dry-run-btn"),
     build: document.getElementById("build-btn"),
     cancel: document.getElementById("cancel-btn"),
@@ -47,7 +53,7 @@
 
   function refreshControls() {
     const locked = !invoke || busy || buildRunning;
-    for (const button of [els.load, els.validate, els.planButton]) {
+    for (const button of [els.load, els.validate, els.planButton, els.inspectButton]) {
       button.disabled = locked;
     }
     els.dryRun.disabled = locked;
@@ -97,6 +103,7 @@
 
   function renderSource(text, path) {
     els.source.textContent = text;
+    els.rawSpec.hidden = false;
     const lines = text.split("\n").length;
     const bytes = new TextEncoder().encode(text).length;
     setMeta(els.specMeta, `${lines} lines · ${bytes} B · ${path}`);
@@ -218,6 +225,133 @@
     );
     setStatus(
       `Planned ${plan.spec || ""} · ${packages.length} packages, ${estimates.image_mb ?? "?"} MB, ${estimates.build_minutes ?? "?"} min`,
+      "ok",
+    );
+  }
+
+  /* --------------------------------------------------------------- inspect UI */
+
+  function renderLayers(layers, path) {
+    const container = els.layers;
+    container.replaceChildren();
+
+    if (!Array.isArray(layers) || layers.length === 0) {
+      container.append(el("p", "empty", "No layers were returned for this spec."));
+      setMeta(els.layersMeta, `declared view · 0 layers · ${path}`);
+      return;
+    }
+
+    layers.forEach((layer, index) => {
+      const card = el("article", "layer-card");
+      if (layer.id) card.dataset.layer = layer.id;
+
+      const head = el("div", "layer-head");
+      head.append(
+        el("span", "layer-index", String(index + 1).padStart(2, "0")),
+        el("h3", null, layer.title || layer.id || "Layer"),
+      );
+      if (typeof layer.estimated_mb === "number") {
+        head.append(el("span", "layer-est", `${layer.estimated_mb} MB`));
+      }
+
+      const list = el("ul", "layer-items");
+      const items = Array.isArray(layer.items) ? layer.items : [];
+      if (items.length === 0) {
+        list.append(el("li", "layer-empty", "no items"));
+      }
+      for (const item of items) {
+        const text = String(item);
+        list.append(el("li", /^\+\d+ more$/.test(text) ? "layer-more" : null, text));
+      }
+
+      card.append(head, list);
+      container.append(card);
+    });
+
+    setMeta(els.layersMeta, `declared view · ${layers.length} layers · ${path}`);
+  }
+
+  function renderPlanSummary(summary) {
+    const card = el("div", "plan-card");
+    const modules = Array.isArray(summary.modules) ? summary.modules : [];
+
+    const grid = el("div", "stat-grid");
+    grid.append(
+      stat(summary.packages ?? 0, "packages"),
+      stat(`${summary.image_mb ?? "?"} MB`, "image"),
+      stat(`${summary.build_minutes ?? "?"} min`, "build"),
+      stat(modules.length, "modules"),
+    );
+    card.append(grid);
+
+    card.append(el("h3", null, "Resolved modules"));
+    const moduleList = el("div", "chips");
+    if (modules.length === 0) {
+      moduleList.append(el("span", "empty-inline", "none"));
+    }
+    for (const id of modules) {
+      moduleList.append(el("span", "chip", id));
+    }
+    card.append(moduleList);
+
+    els.plan.replaceChildren(card);
+    setMeta(
+      els.planMeta,
+      `${summary.packages ?? 0} packages · ${summary.image_mb ?? "?"} MB · ${summary.build_minutes ?? "?"} min`,
+    );
+  }
+
+  function renderDiff(diff) {
+    const container = els.diff;
+    container.replaceChildren();
+    const items = Array.isArray(diff) ? diff : [];
+    const resolved = items.filter((item) => item.kind === "resolved").length;
+    const warnings = items.filter((item) => item.kind === "warning").length;
+
+    if (items.length === 0) {
+      container.append(el("p", "empty", "No resolved mappings or warnings."));
+    }
+    for (const item of items) {
+      const kind = item.kind === "warning" ? "warning" : "resolved";
+      const row = el("div", `diff-item ${kind}`);
+      row.append(
+        el("span", `diff-kind ${kind}`, kind),
+        el("span", "diff-text", item.text || ""),
+      );
+      container.append(row);
+    }
+
+    setMeta(els.diffMeta, `${resolved} resolved · ${warnings} warning(s)`);
+  }
+
+  function renderInspectError(error, path) {
+    const message = formatError(error);
+
+    const notice = el("div", "inspect-error");
+    notice.append(el("strong", null, "Inspect failed"), el("p", null, message));
+    els.layers.replaceChildren(notice);
+    setMeta(els.layersMeta, `declared view · failed · ${path}`);
+
+    els.plan.replaceChildren(
+      el("p", "empty", "No plan summary: the spec could not be resolved."),
+    );
+    setMeta(els.planMeta, "inspect failed");
+
+    els.diff.replaceChildren(el("p", "empty", message));
+    setMeta(els.diffMeta, "inspect failed");
+
+    setStatus(`Inspect failed: ${message}`, "error");
+  }
+
+  function renderInspect(result, path) {
+    const layers = Array.isArray(result.layers) ? result.layers : [];
+    const summary = result.plan || {};
+    renderLayers(layers, path);
+    renderPlanSummary(summary);
+    renderDiff(result.diff);
+
+    setStatus(
+      `Inspected ${path} · ${layers.length} layers · ${summary.packages ?? 0} packages · ${summary.image_mb ?? "?"} MB`,
       "ok",
     );
   }
@@ -446,7 +580,7 @@
     setStatus(`Loading ${path}…`, "busy");
     const text = await invoke("read_spec", { path });
     renderSource(text, path);
-    setStatus(`Loaded ${path}`, "ok");
+    await inspectSpec(path);
   }
 
   async function validateSpec(path) {
@@ -461,9 +595,20 @@
     renderPlan(plan);
   }
 
+  async function inspectSpec(path) {
+    setStatus(`Inspecting ${path}…`, "busy");
+    try {
+      const result = await invoke("inspect", { path });
+      renderInspect(result || {}, path);
+    } catch (error) {
+      renderInspectError(error, path);
+    }
+  }
+
   els.load.addEventListener("click", () => action(loadSpec));
   els.validate.addEventListener("click", () => action(validateSpec));
   els.planButton.addEventListener("click", () => action(planSpec));
+  els.inspectButton.addEventListener("click", () => action(inspectSpec));
   els.dryRun.addEventListener("click", () => startBuild("dry-run"));
   els.build.addEventListener("click", () => startBuild("execute"));
   els.cancel.addEventListener("click", cancelBuild);
@@ -488,4 +633,10 @@
 
   setBuildBadge("idle", null);
   setBuildMeta(null);
+
+  if (invoke) {
+    // The layer canvas is the primary view, so derive it for the default spec
+    // immediately instead of showing an empty left pane.
+    action(inspectSpec);
+  }
 })();
