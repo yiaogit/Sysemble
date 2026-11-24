@@ -150,7 +150,7 @@ sysemble-vm run --image-dir <dir> --repo <dir> --out <dir> --plan <plan.json>
 ## 5. CI
 
 - `vm-image`（`ubuntu-24.04-arm`，45 min）：构建 arm64 VM 镜像 → `image_test.sh --docker` → 上传清单/kernel/initrd（不上传 6 GiB 盘）。
-- `vm-helper`（`macos-14`，30 min）：`engine/vm/macos/build.sh` → `probe --json` → shell 测试；**不启动 VM**（嵌套虚拟化不可用）。
+- `vm-helper`（`macos-15`，30 min）：`engine/vm/macos/build.sh` → `probe --json` → shell 测试；**不启动 VM**（嵌套虚拟化不可用）。
 - 现有 9 个 job 不动。
 
 ## 6. 风险

@@ -268,7 +268,7 @@ non-zero only on failures. CI runs the default mode.
 ## CI
 
 [`ci-snippet.yml`](ci-snippet.yml) is the `vm-helper` job fragment for the main
-workflow (`macos-14`, 30 min): build + ad-hoc sign, `probe --json`, static
+workflow (`macos-15`, 30 min): build + ad-hoc sign, `probe --json`, static
 tests. The fragment is merged into the real workflow by the P1-e3 integration
 slice; this copy is the frozen reference.
 
@@ -280,7 +280,7 @@ signature, and probe still prove V3.
 ## Known limits
 
 - **No VM in CI.** Real boot is verified on a developer Mac (and the independent
-  acceptance Mac), not on `macos-14` runners. Do not turn the CI job into a boot
+  acceptance Mac), not on `macos-15` runners. Do not turn the CI job into a boot
   gate.
 - **arm64 guest only.** The E3a image is an arm64 Debian rootfs and the helper's
   device set has no UEFI/GRUB path. This prototype does not produce x86_64
