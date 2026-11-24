@@ -16,7 +16,12 @@
             <p>Desktop shell &middot; spec &rarr; plan &rarr; build</p>
           </div>
         </div>
-        <div id="status" class="status" role="status" aria-live="polite">Ready</div>
+        <div class="brand-status">
+          <div id="engine" class="engine pending" role="status" aria-live="polite">
+            Engine: checking&hellip;
+          </div>
+          <div id="status" class="status" role="status" aria-live="polite">Ready</div>
+        </div>
       </div>
 
       <div class="toolbar-row path-row">
@@ -71,7 +76,8 @@
             id="build-btn"
             class="button primary"
             type="button"
-            title="Run the builder with --execute (requires Linux and root; expected to fail on macOS)"
+            title="Checking engine availability…"
+            disabled
           >
             Build
           </button>

@@ -10,6 +10,7 @@
   const els = {
     path: document.getElementById("spec-path"),
     outDir: document.getElementById("out-dir"),
+    engine: document.getElementById("engine"),
     status: document.getElementById("status"),
     bridgeWarning: document.getElementById("bridge-warning"),
     source: document.getElementById("spec-source"),
@@ -44,6 +45,8 @@
   let activeBuild = null;
   let pollTimer = null;
   let pollGeneration = 0;
+  let engineAvailable = false;
+  let engineReason = "";
 
   function setStatus(message, kind = "idle") {
     els.status.textContent = message;
@@ -51,13 +54,24 @@
     els.status.className = `status ${kind}`;
   }
 
+  function buildTitle() {
+    if (!invoke) return "Real builds need the Tauri IPC bridge";
+    if (engineAvailable) {
+      return "Run the builder with --execute using the local Linux engine";
+    }
+    return engineReason || "Checking engine availability…";
+  }
+
   function refreshControls() {
     const locked = !invoke || busy || buildRunning;
     for (const button of [els.load, els.validate, els.planButton, els.inspectButton]) {
       button.disabled = locked;
     }
+    // Dry run stays available regardless of the engine probe; only an
+    // in-flight action or a missing IPC bridge locks it.
     els.dryRun.disabled = locked;
-    els.build.disabled = locked;
+    els.build.disabled = locked || !engineAvailable;
+    els.build.title = buildTitle();
     els.path.disabled = locked;
     els.outDir.disabled = locked;
     els.cancel.disabled = !invoke || busy || !buildRunning;
@@ -80,6 +94,51 @@
       return JSON.stringify(error);
     } catch {
       return String(error);
+    }
+  }
+
+  /* ------------------------------------------------------------ engine probe */
+
+  function applyEngine(info) {
+    const kind = info && typeof info.kind === "string" ? info.kind : "none";
+    const reason =
+      info && typeof info.reason === "string" && info.reason.trim().length > 0
+        ? info.reason
+        : "no usable build engine on this host";
+    engineAvailable = Boolean(info && info.available === true);
+
+    if (engineAvailable) {
+      engineReason = "";
+      els.engine.textContent = `Engine: ${kind}`;
+      els.engine.className = "engine ok";
+      els.engine.title = `Real builds use the ${kind} engine on this host`;
+    } else {
+      engineReason = reason;
+      els.engine.textContent = `Engine unavailable — ${reason}`;
+      els.engine.className = "engine error";
+      els.engine.title = reason;
+    }
+    refreshControls();
+  }
+
+  function showEngineError(error) {
+    engineAvailable = false;
+    engineReason = `engine probe failed: ${formatError(error)}`;
+    els.engine.textContent = `Engine unavailable — ${engineReason}`;
+    els.engine.className = "engine error";
+    els.engine.title = engineReason;
+    refreshControls();
+  }
+
+  async function probeEngine() {
+    els.engine.textContent = "Engine: checking…";
+    els.engine.className = "engine pending";
+    els.engine.title = "Checking whether this host can run real builds";
+    try {
+      const info = await invoke("engine_info");
+      applyEngine(info);
+    } catch (error) {
+      showEngineError(error);
     }
   }
 
@@ -502,6 +561,10 @@
       els.outDir.focus();
       return;
     }
+    if (mode === "execute" && !engineAvailable) {
+      setStatus(`Build unavailable — ${engineReason || "engine not ready"}`, "error");
+      return;
+    }
 
     stopPolling();
     activeBuild = null;
@@ -624,11 +687,17 @@
 
   if (!invoke) {
     els.bridgeWarning.hidden = false;
+    engineAvailable = false;
+    engineReason = "Tauri IPC unavailable (browser preview)";
+    els.engine.textContent = `Engine unavailable — ${engineReason}`;
+    els.engine.className = "engine error";
+    els.engine.title = engineReason;
     setBusy(false);
     setStatus("Browser preview — Tauri IPC unavailable", "warn");
   } else {
     setBusy(false);
     setStatus("Ready", "idle");
+    probeEngine();
   }
 
   setBuildBadge("idle", null);

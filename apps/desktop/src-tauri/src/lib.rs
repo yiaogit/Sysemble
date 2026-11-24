@@ -1,4 +1,4 @@
-//! Tauri command layer for the Sysemble desktop shell (P1-a/P1-b/P1-c).
+//! Tauri command layer for the Sysemble desktop shell (P1-a/P1-b/P1-c/P1-e1).
 //!
 //! The IPC surface is deliberately tiny. Every command is a thin wrapper
 //! around a plain function so the interesting behaviour can be unit-tested
@@ -9,9 +9,11 @@ use std::path::{Path, PathBuf};
 use sysemble_core::{load_spec, resolve_plan, validate_spec, Diagnostic, Plan};
 
 pub mod build;
+pub mod engine;
 pub mod inspect;
 
 use build::{BuildManager, BuildStarted, BuildStatus};
+use engine::EngineInfo;
 use inspect::Inspect;
 
 /// Repository root as compiled into the desktop binary.
@@ -99,6 +101,15 @@ fn inspect(path: String) -> Result<Inspect, String> {
     inspect_command(path)
 }
 
+/// IPC: whether this host can run real builds (P1-e1).
+///
+/// The plain probe lives in [`engine::engine_info`]; the local name is the
+/// command Tauri exposes to the UI.
+#[tauri::command]
+fn engine_info() -> Result<EngineInfo, String> {
+    engine::engine_info()
+}
+
 // P1-b build control. The IPC entry points are thin `#[tauri::command]`
 // wrappers around these plain functions; keeping the two names apart avoids
 // the E0255 duplicate-definition error from a previous attempt.
@@ -171,6 +182,7 @@ pub fn run() {
             validate,
             plan,
             inspect,
+            engine_info,
             start_build,
             get_build,
             get_build_log,

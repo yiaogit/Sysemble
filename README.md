@@ -4,7 +4,7 @@
 
 Sysemble is a local-first desktop application for composing a complete Linux system — base, desktop, applications, a Windows VM layer, and development environments — from a declarative spec, then building and verifying it on your own machine.
 
-> **Status: P1-c (v0.0.1).** The engine builds, boots, installs, and runs a live ISO in CI. The Tauri shell validates/plans a spec, runs and tails builds, and renders a six-layer declared view with resolved/warning diffs. Next: React migration and conversation. See [docs/roadmap.md](docs/roadmap.md).
+> **Status: P1-e1 (v0.0.1).** The engine builds, boots, installs, and runs a live ISO in CI. The Tauri shell validates/plans, runs and tails builds, renders a six-layer view, and now reports whether real builds are possible (macOS/Windows wait for the engine VM). See [docs/roadmap.md](docs/roadmap.md).
 
 ---
 

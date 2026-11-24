@@ -165,6 +165,49 @@ body {
   background: rgba(45, 212, 191, 0.07);
 }
 
+.brand-status {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+}
+
+.brand-status .status {
+  max-width: 42%;
+}
+
+.engine {
+  max-width: 58%;
+  padding: 6px 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #0b1424;
+  color: var(--muted);
+  font: 600 11.5px/1.35 var(--mono);
+  text-align: left;
+  white-space: normal;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+
+.engine.ok {
+  color: var(--ok);
+  border-color: rgba(52, 211, 153, 0.4);
+  background: rgba(52, 211, 153, 0.07);
+}
+
+.engine.error {
+  color: var(--error);
+  border-color: rgba(248, 113, 113, 0.42);
+  background: rgba(248, 113, 113, 0.07);
+}
+
+.engine.pending {
+  color: var(--faint);
+}
+
 .path-field {
   display: flex;
   flex: 1;
