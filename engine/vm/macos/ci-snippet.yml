@@ -1,0 +1,26 @@
+# P1-e3b vm-helper job fragment.
+#
+# Paste under `jobs:` in .github/workflows/ci.yml (the P1-e3 integration slice
+# merges it). Frozen by docs/plan/P1-e3-workplan.md section 5: macos-14,
+# 30 minutes, build -> probe -> static tests.
+#
+# IMPORTANT: GitHub-hosted macOS runners are themselves
+# Virtualization.framework guests. Apple does not support nested
+# virtualization, so this job NEVER calls `sysemble-vm run`; `probe --json`
+# is expected to report supported=false there. Real boot is verified on a
+# developer Mac (and the independent acceptance Mac), never in this job.
+  vm-helper:
+    name: macOS VM helper (build + probe)
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and ad-hoc sign the helper
+        run: bash engine/vm/macos/build.sh
+
+      - name: Probe Virtualization.framework
+        run: ./engine/vm/macos/.build/release/sysemble-vm probe --json
+
+      - name: Static helper tests (never boots a VM)
+        run: bash engine/vm/macos/tests/vm_test.sh

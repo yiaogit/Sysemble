@@ -1,0 +1,29 @@
+# Sysemble VM guest agent (P1-e3a).
+#
+# Installed to /etc/systemd/system/sysemble-vm-agent.service by
+# engine/vm/image/in-container-build.sh. Type=simple: the agent mounts the
+# virtiofs shares, writes the ready marker, runs the single job, and exits.
+# Restart=no: a failed mount means the host configured the VM wrongly; the host
+# stops the VM on its own timeout, so restarting would only hide the error.
+#
+# Wording note: Documentation points at the repository, not at a documentation
+# server, because the prototype is not distributed yet.
+
+[Unit]
+Description=Sysemble VM guest agent (virtiofs mounts + file job protocol)
+Documentation=https://github.com/yiaogit/Sysemble
+After=systemd-modules-load.service
+Wants=systemd-modules-load.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/sysemble-vm-agent
+# Keep the agent's own lines visible on the virtio console: the host captures
+# the serial log and uses it to debug mounts and timeouts.
+StandardOutput=journal+console
+StandardError=journal+console
+Restart=no
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

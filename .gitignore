@@ -31,3 +31,4 @@ Thumbs.db
 
 # Engine image build output (P1-e2)
 /engine/image/build/
+/engine/vm/image/build/

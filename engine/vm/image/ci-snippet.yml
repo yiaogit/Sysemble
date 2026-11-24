@@ -1,0 +1,52 @@
+# P1-e3a VM image job fragment.
+#
+# Paste under `jobs:` in .github/workflows/ci.yml (the main thread merges it).
+# Frozen by docs/plan/P1-e3-workplan.md section 5: arm64 runner, 45 minutes,
+# build -> verify/test -> upload the manifest, kernel and initrd. The 6 GiB
+# disk image is never uploaded.
+#
+# This job proves V1/V2 (image builds on native arm64 Linux, manifest hashes
+# verify). It cannot prove V4-V7: GitHub's macOS runners are themselves
+# Virtualization.framework guests, so nested VMs are unavailable; the real boot
+# and the guest build are verified on Apple Silicon only.
+#
+# The build uses `--engine auto`: docker when the arm64 runner's daemon is
+# usable (same debian:trixie environment as macOS), otherwise the native
+# path with sudo. Set --engine docker/native explicitly if the runner image
+# changes.
+  vm-image:
+    name: VM image (arm64 build + manifest)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show runner
+        run: |
+          uname -m
+          docker info --format '{{.ServerVersion}}' || true
+
+      - name: Build the VM image
+        run: |
+          bash engine/vm/image/build-image.sh \
+            --out engine/vm/image/build
+
+      - name: Verify and test the VM image
+        shell: bash
+        run: |
+          set -o pipefail
+          bash engine/vm/image/tests/image_test.sh --docker \
+            2>&1 | tee engine/vm/image/build/image_test.log
+
+      - name: Upload VM image evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-image-evidence
+          if-no-files-found: warn
+          path: |
+            engine/vm/image/build/sysemble-vm.json
+            engine/vm/image/build/vmlinuz
+            engine/vm/image/build/initrd.img
+            engine/vm/image/build/build-image.log
+            engine/vm/image/build/image_test.log

@@ -263,6 +263,59 @@ jobs:
             engine/image/build/smoke/disk.qcow2
             engine/image/build/smoke/boot.log
 
+  vm-image:
+    name: VM image (arm64 build + manifest)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show runner
+        run: |
+          uname -m
+          docker info --format '{{.ServerVersion}}' || true
+
+      - name: Build the VM image
+        run: |
+          bash engine/vm/image/build-image.sh \
+            --out engine/vm/image/build
+
+      - name: Verify and test the VM image
+        shell: bash
+        run: |
+          set -o pipefail
+          bash engine/vm/image/tests/image_test.sh --docker \
+            2>&1 | tee engine/vm/image/build/image_test.log
+
+      - name: Upload VM image evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-image-evidence
+          if-no-files-found: warn
+          path: |
+            engine/vm/image/build/sysemble-vm.json
+            engine/vm/image/build/vmlinuz
+            engine/vm/image/build/initrd.img
+            engine/vm/image/build/build-image.log
+            engine/vm/image/build/image_test.log
+
+  vm-helper:
+    name: macOS VM helper (build + probe)
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and ad-hoc sign the helper
+        run: bash engine/vm/macos/build.sh
+
+      - name: Probe Virtualization.framework
+        run: ./engine/vm/macos/.build/release/sysemble-vm probe --json
+
+      - name: Static helper tests (never boots a VM)
+        run: bash engine/vm/macos/tests/vm_test.sh
+
   tui-install-smoke:
     name: TUI install smoke
     runs-on: ubuntu-latest

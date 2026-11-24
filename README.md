@@ -4,7 +4,7 @@
 
 Sysemble is a local-first desktop application for composing a complete Linux system — base, desktop, applications, a Windows VM layer, and development environments — from a declarative spec, then building and verifying it on your own machine.
 
-> **Status: P1-e2a/b (v0.0.1).** The engine builds, boots, installs, and runs a live ISO in CI. The Tauri shell validates/plans, runs and tails builds, renders a six-layer view, and reports whether real builds are possible. The engine now ships as a versioned Debian OCI image (`engine/image`) that the shell runs through Docker Desktop or podman on macOS/Windows and through the local builder on Linux; native Virtualization.framework / WSL2 engine helpers are P1-e3. See [docs/roadmap.md](docs/roadmap.md).
+> **Status: P1-e3 prototype (v0.0.1).** The engine builds, boots, installs, and runs a live ISO in CI. The Tauri shell validates/plans, runs and tails builds, renders a six-layer view, and reports whether real builds are possible. The engine ships as a versioned Debian OCI image (`engine/image`) that the shell runs through Docker Desktop or podman on macOS/Windows and through the local builder on Linux. `engine/vm` adds a Virtualization.framework prototype that boots an arm64 Debian engine VM on Apple Silicon, shares repo/out via virtiofs, and runs a real build inside the guest; it is a CLI prototype not yet wired into the shell. WSL2 and desktop integration remain future work. See [docs/roadmap.md](docs/roadmap.md).
 
 ---
 
@@ -52,8 +52,9 @@ The design borrows the useful parts of hosted builders — spec-as-truth, state 
 ```
 
 The engine always runs on Linux. On macOS it currently runs in the Linux VM
-provided by Docker Desktop or podman; on Windows in Docker Desktop/WSL2. A
-native Virtualization.framework helper is planned for P1-e3. The UI stays native.
+provided by Docker Desktop or podman; `engine/vm` is a native
+Virtualization.framework prototype (arm64 guest, CLI only, not yet in the shell).
+On Windows it runs in Docker Desktop/WSL2. The UI stays native.
 
 ## Cross-platform hosts
 
@@ -118,7 +119,7 @@ spec/          JSON Schemas for buildspec and module
 examples/      runnable example specs
 crates/        Rust workspace (plan resolver, CLI)
 builders/      Debian rootfs/disk/ISO builder and installer assets
-engine/        engine image (Dockerfile, manifest) and container entry point
+engine/        engine image (Dockerfile, manifest), container entry point, VM prototype
 apps/desktop/  Tauri 2 shell (separate cargo workspace)
 tools/         boot/install checks, schema validation
 tests/         black-box acceptance suite

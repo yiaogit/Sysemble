@@ -20,7 +20,7 @@
 
 ## P1 · 可视化（6–8 周）
 
-> **P1-a / P1-b / P1-c / P1-e1 / P1-e2 已完成（2026-11-23/24）**：Tauri 2 壳（`read_spec` / `validate` / `plan` / `inspect`；构建控制 `start_build` / `get_build` / `get_build_log` / `cancel_build`）、六层视图与 declared→resolved diff、引擎探测与显式门控；P1-e2 增加版本化 Debian 引擎镜像（`engine/image`，固定 base digest、manifest 记录 tool versions/dpkg/镜像 id）与 docker/podman 容器后端。macOS/Windows 通过 Docker Desktop/podman 的真实构建由 CI `engine-check` 在容器内完成 build + boot-check 验证；原生 Virtualization.framework / WSL2 helper 顺延 P1-e3。
+> **P1-a / P1-b / P1-c / P1-e1 / P1-e2 / P1-e3 原型已完成（2026-11-23/24）**：Tauri 2 壳（`read_spec` / `validate` / `plan` / `inspect`；构建控制 `start_build` / `get_build` / `get_build_log` / `cancel_build`）、六层视图与 declared→resolved diff、引擎探测与显式门控；P1-e2 增加版本化 Debian 引擎镜像（`engine/image`）与 docker/podman 容器后端，CI `engine-check` 在容器内完成 build + boot-check；P1-e3 增加 Apple Silicon 上的 Virtualization.framework 原型（`engine/vm`）：arm64 Debian VM + virtiofs 共享 + guest 内最小构建，CLI 形态，真实启动由开发机/用户设备验证（GitHub macOS runner 无嵌套虚拟化）。WSL2 与桌面集成顺延。
 
 
 - Tauri 2 壳 + React 画布

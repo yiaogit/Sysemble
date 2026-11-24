@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Required by Virtualization.framework. Ad-hoc signing with this
+         entitlement is enough for a locally built helper; distribution signing
+         and notarization are explicitly out of scope for P1-e3. -->
+    <key>com.apple.security.virtualization</key>
+    <true/>
+</dict>
+</plist>

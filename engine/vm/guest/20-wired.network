@@ -1,0 +1,11 @@
+# Sysemble engine VM guest network (P1-e3a).
+#
+# Installed to /etc/systemd/network/20-wired.network. The VZ configuration uses
+# virtio-net with NAT, which the kernel names "en*" (enp0s1 and friends), so a
+# wildcard match keeps the same file working across VZ versions. DHCP gives the
+# guest an address, the default route, and DNS; systemd-resolved consumes it.
+[Match]
+Name=en*
+
+[Network]
+DHCP=yes

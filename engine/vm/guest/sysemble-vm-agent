@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# Sysemble VM guest agent (P1-e3a).
+#
+# Contract (frozen): docs/plan/P1-e3-workplan.md sections 1 and 2.2.
+#
+# Runs as root inside the Debian trixie arm64 guest, started by
+# sysemble-vm-agent.service (Type=simple, WantedBy=multi-user.target):
+#
+#   1. load the virtiofs module (modules-load.d also loads it earlier)
+#   2. mount the two virtiofs shares:
+#        tag sysemble-repo -> /work    (read-only repository)
+#        tag sysemble-out  -> /export  (read-write output directory)
+#      Both mounts retry for up to 120 s: the host validates the VZ
+#      configuration before boot, but a slow virtiofs device must not make the
+#      agent fail on the first attempt.
+#   3. write /export/.sysemble-vm/ready (one line: UTC timestamp + "ready")
+#   4. poll /export/.sysemble-vm/job.sh, execute it with bash, capture the full
+#      output to /export/.sysemble-vm/log, then write the exit status to
+#      /export/.sysemble-vm/done (one integer line, written to a temporary file
+#      and renamed so the host never reads a partial file) and sync.
+#
+# The agent never powers the VM off: the macOS host owns the VM lifecycle and
+# stops the VM after it has read done/log. The file protocol is single-shot by
+# design; every run gets a freshly cloned disk.
+#
+# Every agent log line is prefixed with "sysemble-vm-agent:". The job's own
+# output is captured verbatim in log (it is the guest build log the host keeps).
+#
+# Requires bash 3.2+ (the guest ships trixie bash); no bash 4 features are used.
+
+set -u
+
+TAG_REPO="sysemble-repo"
+TAG_OUT="sysemble-out"
+WORK_DIR="/work"
+EXPORT_DIR="/export"
+STATE_DIR="$EXPORT_DIR/.sysemble-vm"
+MOUNT_TIMEOUT_SECONDS=120
+POLL_INTERVAL_SECONDS=1
+
+log() {
+  printf 'sysemble-vm-agent: %s\n' "$*"
+}
+
+warn() {
+  printf 'sysemble-vm-agent: warning: %s\n' "$*" >&2
+}
+
+fail() {
+  printf 'sysemble-vm-agent: error: %s\n' "$*" >&2
+  exit 1
+}
+
+# The kernel image ships virtiofs as a module; modules-load.d loads it during
+# boot and the agent retries here in case the service started before it.
+load_virtiofs() {
+  if ! command -v modprobe >/dev/null 2>&1; then
+    fail "modprobe not found (the guest image is missing kmod)"
+  fi
+  if modprobe virtiofs 2>/dev/null; then
+    log "loaded the virtiofs module"
+    return 0
+  fi
+  if [ -d /sys/module/virtiofs ]; then
+    log "the virtiofs module is already loaded"
+    return 0
+  fi
+  # A built-in module makes modprobe fail; the mount attempts below are the
+  # real probe, so keep going and report the mount error if it is missing.
+  warn "modprobe virtiofs returned non-zero; assuming it is built in"
+  return 0
+}
+
+# mount_share <tag> <dir> <options>
+# The options argument is intentionally word-split ("-o ro" or empty).
+# shellcheck disable=SC2086
+mount_share() {
+  local tag=$1
+  local dir=$2
+  local options=$3
+  local deadline=$((SECONDS + MOUNT_TIMEOUT_SECONDS))
+  local last_error=""
+  local error=""
+
+  mkdir -p "$dir" || fail "cannot create mount point $dir"
+
+  while :; do
+    if mountpoint -q "$dir" 2>/dev/null; then
+      log "$dir is already mounted"
+      return 0
+    fi
+    if error=$(mount -t virtiofs $options "$tag" "$dir" 2>&1); then
+      if [ -n "$options" ]; then
+        log "mounted virtiofs tag $tag on $dir ($options)"
+      else
+        log "mounted virtiofs tag $tag on $dir"
+      fi
+      return 0
+    fi
+    last_error=$error
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      fail "timed out after ${MOUNT_TIMEOUT_SECONDS}s mounting virtiofs tag '$tag' on $dir (last error: ${last_error:-unknown})"
+    fi
+    sleep 2
+  done
+}
+
+write_ready() {
+  local timestamp=""
+  local tmp="$STATE_DIR/.ready.tmp"
+
+  mkdir -p "$STATE_DIR" || fail "cannot create $STATE_DIR"
+  timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ) || fail "cannot format the UTC timestamp"
+  printf '%s ready\n' "$timestamp" >"$tmp" || fail "cannot write $tmp"
+  mv -f "$tmp" "$STATE_DIR/ready" || fail "cannot rename $tmp to ready"
+  sync
+  log "ready: $timestamp"
+}
+
+wait_and_run_job() {
+  local job="$STATE_DIR/job.sh"
+  local job_log="$STATE_DIR/log"
+  local done_file="$STATE_DIR/done"
+  local tmp="$STATE_DIR/.done.tmp"
+  local rc=0
+
+  log "waiting for $job"
+  while [ ! -f "$job" ]; do
+    sleep "$POLL_INTERVAL_SECONDS"
+  done
+
+  log "job found; executing bash $job"
+  if bash "$job" >"$job_log" 2>&1; then
+    rc=0
+  else
+    rc=$?
+  fi
+
+  printf '%s\n' "$rc" >"$tmp" || fail "cannot write $tmp"
+  mv -f "$tmp" "$done_file" || fail "cannot rename $tmp to done"
+  sync
+  log "job finished with exit code $rc"
+}
+
+main() {
+  load_virtiofs
+  mount_share "$TAG_REPO" "$WORK_DIR" "-o ro"
+  mount_share "$TAG_OUT" "$EXPORT_DIR" ""
+  write_ready
+  wait_and_run_job
+  # No poweroff: the macOS host stops the VM after reading done/log.
+  log "protocol complete; waiting for the host to stop the VM"
+  exit 0
+}
+
+main "$@"

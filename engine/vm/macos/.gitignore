@@ -1,0 +1,2 @@
+# SwiftPM build products (binary, module cache, manifest cache).
+.build/
