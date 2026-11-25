@@ -26,12 +26,14 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use sysemble_core::{load_spec, resolve_plan};
 
-use crate::engine::{self, EngineInfo, EngineProbe};
+use crate::engine::{self, EngineInfo, EngineProbe, VmHandle};
 use crate::{repo_root, resolve_path};
 
 /// Log lines returned by [`BuildManager::get_build_log`] when the caller does
@@ -51,6 +53,18 @@ const CONTAINER_PLATFORM: &str = "linux/amd64";
 /// Container entry point (v2): runs inside the image, builds on the container's
 /// case-sensitive filesystem, and exports only the top-level artifacts.
 const CONTAINER_ENTRY_SCRIPT: &str = "engine/runtime/container-entry.sh";
+
+/// Guest job timeout passed to the VM helper (P1-e3/P1-e4 workplan §2.3).
+const VM_BUILD_TIMEOUT_SECONDS: &str = "1800";
+
+/// How long a cancelled process group gets to handle SIGTERM (the macOS VM
+/// helper stops the VM and exits 143) before it is killed outright.
+#[cfg(unix)]
+const CANCEL_TERM_GRACE: Duration = Duration::from_secs(20);
+
+/// Poll interval of the SIGTERM→SIGKILL escalation watchdog.
+#[cfg(unix)]
+const CANCEL_WATCHDOG_INTERVAL: Duration = Duration::from_millis(100);
 
 static NEXT_BUILD_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -131,20 +145,27 @@ enum ExecutionBackend {
     Host,
     /// Engine image: `<runtime> run … bash <builder> …`.
     Container,
+    /// macOS Virtualization.framework: `<helper> run --image-dir … --repo …`.
+    Vm,
 }
 
 /// Pick the launch path from the probed engine.
 ///
 /// A `local` engine already means "root and the builder tools are on this
 /// host", so it keeps the P1-b host path and never needs a runtime executable.
-/// Only `container` runs inside docker/podman. `None` means no probe was taken
-/// (dry run or the `SYMBLE_BUILDER` hook) and also uses the host path.
+/// `container` runs inside docker/podman; `vm` runs through the signed
+/// Virtualization.framework helper. `None` means no probe was taken (dry run or
+/// the `SYMBLE_BUILDER` hook) and also uses the host path.
 fn execution_backend(probe: Option<&EngineProbe>) -> Result<ExecutionBackend, String> {
     match probe {
         None => Ok(ExecutionBackend::Host),
         Some(probe) => match probe.info.kind.as_str() {
             "local" => Ok(ExecutionBackend::Host),
             "container" => Ok(ExecutionBackend::Container),
+            "vm" if probe.info.available => Ok(ExecutionBackend::Vm),
+            // An unavailable engine is gated in `start_build`; keeping the
+            // readable reason here makes the helper safe to call directly.
+            "vm" => Err(unavailable_engine_error(&probe.info)),
             other => Err(format!("engine kind `{other}` cannot run execute builds")),
         },
     }
@@ -184,6 +205,13 @@ struct ContainerInvocation {
     name: String,
 }
 
+/// Everything needed to launch the macOS VM helper.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VmInvocation {
+    program: PathBuf,
+    args: Vec<OsString>,
+}
+
 /// Owns the builds started by this desktop process.
 ///
 /// The registry is an `Arc<Mutex<HashMap<...>>>` shared with the supervisor
@@ -196,8 +224,8 @@ pub struct BuildManager {
     cancel_gate: Arc<Mutex<()>>,
     /// Resolved on every execute build; dry runs never consult it.
     engine: EngineResolver,
-    /// Repository mounted at `/work` for container builds. Production uses
-    /// [`repo_root`]; tests inject a temporary repository.
+    /// Repository shared with the engine. Production uses [`repo_root`]; tests
+    /// inject a temporary repository.
     repo: PathBuf,
 }
 
@@ -287,18 +315,59 @@ impl BuildManager {
             None
         };
 
-        // A `local` engine keeps the P1-b host path; only a container engine
-        // launches a runtime, so `runtime_path` is only required there.
+        // A `local` engine keeps the P1-b host path; a container engine launches
+        // a runtime and a vm engine launches the signed helper, so each backend
+        // only requires its own host resources.
         let backend = execution_backend(engine_probe.as_ref())?;
 
-        // Container builds need the v2 entry script inside the mounted
-        // repository; validate it before writing output or spawning anything.
-        let container_repo = match backend {
-            ExecutionBackend::Container => {
+        let vm_handle: Option<VmHandle> = match backend {
+            ExecutionBackend::Vm => {
+                let handle = engine_probe
+                    .as_ref()
+                    .and_then(|probe| probe.vm.clone())
+                    .ok_or_else(|| {
+                        "the vm engine did not report a helper and image directory".to_string()
+                    })?;
+                // The probe validated both paths moments ago; re-check before
+                // any output is written so a concurrent uninstall is readable.
+                if !handle.helper.is_file() {
+                    return Err(format!(
+                        "cannot run an execute build: the VM helper `{}` is missing; re-probe the engine (build it with bash {})",
+                        handle.helper.display(),
+                        engine::VM_HELPER_SCRIPT
+                    ));
+                }
+                if !handle.image_dir.is_dir() {
+                    return Err(format!(
+                        "cannot run an execute build: the VM image directory `{}` is missing; build it with {}",
+                        handle.image_dir.display(),
+                        engine::VM_IMAGE_SCRIPT
+                    ));
+                }
+                // `--image-dir`/`--repo`/`--out` are frozen as absolute paths.
+                let handle = VmHandle {
+                    helper: fs::canonicalize(&handle.helper).unwrap_or(handle.helper),
+                    image_dir: fs::canonicalize(&handle.image_dir)
+                        .unwrap_or(handle.image_dir),
+                };
+                Some(handle)
+            }
+            ExecutionBackend::Host | ExecutionBackend::Container => None,
+        };
+
+        // Engine builds share the canonical repository root; the container also
+        // needs its v2 entry script inside that repository. Validate everything
+        // before writing output or spawning anything.
+        let repo_abs = match backend {
+            ExecutionBackend::Container | ExecutionBackend::Vm => {
                 let repo = fs::canonicalize(&self.repo).map_err(|error| {
-                    format!("cannot resolve the repository root for a container build: {error}")
+                    format!("cannot resolve the repository root for an engine build: {error}")
                 })?;
-                container_entry_script(&repo)?;
+                if backend == ExecutionBackend::Container {
+                    container_entry_script(&repo)?;
+                } else {
+                    vm_repo_inputs(&repo)?;
+                }
                 Some(repo)
             }
             ExecutionBackend::Host => None,
@@ -330,8 +399,11 @@ impl BuildManager {
         // in `--name sysemble-build-<id>`.
         let id = next_build_id();
 
-        let (mut command, container) = match (engine_probe.as_ref(), container_repo.as_deref()) {
-            (Some(probe), Some(repo)) => {
+        let (mut command, container) = match backend {
+            ExecutionBackend::Container => {
+                let probe = engine_probe.as_ref().ok_or_else(|| {
+                    "the container engine did not report a runtime executable".to_string()
+                })?;
                 let runtime = probe.runtime_path.clone().ok_or_else(|| {
                     "the container engine did not report a runtime executable".to_string()
                 })?;
@@ -340,6 +412,9 @@ impl BuildManager {
                     .image
                     .as_deref()
                     .unwrap_or(engine::DEFAULT_ENGINE_IMAGE);
+                let repo = repo_abs
+                    .as_deref()
+                    .ok_or_else(|| "the container build has no repository root".to_string())?;
                 let invocation = container_invocation(&runtime, image, &id, repo, &out_abs)?;
                 let mut command = Command::new(&invocation.program);
                 command.args(&invocation.args);
@@ -349,7 +424,21 @@ impl BuildManager {
                 };
                 (command, Some(handle))
             }
-            _ => {
+            ExecutionBackend::Vm => {
+                let vm = vm_handle
+                    .as_ref()
+                    .ok_or_else(|| "the vm build has no helper".to_string())?;
+                let repo = repo_abs
+                    .as_deref()
+                    .ok_or_else(|| "the vm build has no repository root".to_string())?;
+                // Frozen argv (P1-e4 workplan §2.3): helper stdout/stderr are
+                // the build log, and the helper exits with the guest's code.
+                let invocation = vm_invocation(&vm.helper, &vm.image_dir, repo, &out_abs);
+                let mut command = Command::new(&invocation.program);
+                command.args(&invocation.args);
+                (command, None)
+            }
+            ExecutionBackend::Host => {
                 let mut command = Command::new("bash");
                 command
                     .arg(&builder)
@@ -368,15 +457,20 @@ impl BuildManager {
             .stderr(Stdio::from(stderr_log));
         configure_process_group(&mut command);
 
-        let child = command.spawn().map_err(|error| match &container {
-            Some(handle) => format!(
-                "cannot start the container runtime `{}`: {error}",
-                handle.runtime.display()
-            ),
-            None => format!(
-                "cannot start builder `{}` with bash: {error}",
-                builder.display()
-            ),
+        let child = command.spawn().map_err(|error| {
+            if let Some(handle) = &container {
+                return format!(
+                    "cannot start the container runtime `{}`: {error}",
+                    handle.runtime.display()
+                );
+            }
+            if let Some(vm) = &vm_handle {
+                return format!(
+                    "cannot start the VM helper `{}`: {error}",
+                    vm.helper.display()
+                );
+            }
+            format!("cannot start builder `{}` with bash: {error}", builder.display())
         })?;
         let pid = child.id();
         let started_at = now_iso8601();
@@ -622,6 +716,55 @@ fn container_entry_script(repo: &Path) -> Result<PathBuf, String> {
     }
 }
 
+/// Guest-side script the VM helper's fixed job runs inside the VM.
+const VM_GUEST_SCRIPT: &str = "engine/vm/guest/minimal-build.sh";
+
+/// Require the repository inputs the VM helper needs before booting.
+///
+/// The helper shares the repository read-only at `/work` and its frozen job
+/// runs [`VM_GUEST_SCRIPT`]; failing here keeps the output directory untouched.
+fn vm_repo_inputs(repo: &Path) -> Result<(), String> {
+    for relative in ["builders/debian/build.sh", VM_GUEST_SCRIPT] {
+        let path = repo.join(relative);
+        if !path.is_file() {
+            return Err(format!(
+                "cannot find `{relative}` in the repository `{}`; VM builds share the repository read-only at /work",
+                repo.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Build the frozen VM helper argv (P1-e4 workplan §2.3).
+///
+/// `image_dir`, `repo`, and `out` must be canonical absolute host paths. The
+/// helper shares the repository read-only at `/work` and the output directory
+/// at `/export`, and only copies the plan when `--plan` names a different file;
+/// pointing it at the `<out>/plan.json` BuildManager wrote is therefore
+/// idempotent (Runner.swift).
+fn vm_invocation(helper: &Path, image_dir: &Path, repo: &Path, out: &Path) -> VmInvocation {
+    let plan = out.join("plan.json");
+    let args: Vec<OsString> = vec![
+        OsString::from("run"),
+        OsString::from("--image-dir"),
+        image_dir.as_os_str().to_os_string(),
+        OsString::from("--repo"),
+        repo.as_os_str().to_os_string(),
+        OsString::from("--out"),
+        out.as_os_str().to_os_string(),
+        OsString::from("--plan"),
+        plan.as_os_str().to_os_string(),
+        OsString::from("--timeout"),
+        OsString::from(VM_BUILD_TIMEOUT_SECONDS),
+        OsString::from("--json"),
+    ];
+    VmInvocation {
+        program: helper.to_path_buf(),
+        args,
+    }
+}
+
 /// Build the frozen v2 container argv (P1-e2 workplan §2.3).
 ///
 /// `repo` and `out` must be canonical absolute host paths. The repository is
@@ -716,8 +859,19 @@ fn configure_process_group(_command: &mut Command) {}
 
 #[cfg(unix)]
 fn terminate_process_group(pid: u32) -> Result<(), String> {
+    // The macOS VM helper catches SIGTERM, stops the Virtualization.framework
+    // VM and exits 143 (P1-e3), so SIGTERM is the graceful first step for every
+    // backend. A watchdog escalates to SIGKILL if the group ignores it, keeping
+    // P1-b's guarantee that a cancelled build cannot keep running forever.
+    signal_process_group(pid, libc::SIGTERM)?;
+    spawn_cancel_watchdog(pid);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn signal_process_group(pid: u32, signal: i32) -> Result<(), String> {
     // A negative pid signals the process group led by the builder.
-    let result = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+    let result = unsafe { libc::kill(-(pid as i32), signal) };
     if result == 0 {
         return Ok(());
     }
@@ -727,6 +881,34 @@ fn terminate_process_group(pid: u32) -> Result<(), String> {
         return Err("the builder process has already exited".to_string());
     }
     Err(error.to_string())
+}
+
+/// True while any process in the build's process group still exists.
+#[cfg(unix)]
+fn process_group_exists(pid: u32) -> bool {
+    let result = unsafe { libc::kill(-(pid as i32), 0) };
+    result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Escalate a SIGTERM cancellation to SIGKILL after [`CANCEL_TERM_GRACE`].
+///
+/// Runs on its own thread so `cancel_build` never blocks on a helper that is
+/// shutting a VM down; the group is gone long before the grace expires in the
+/// normal case.
+#[cfg(unix)]
+fn spawn_cancel_watchdog(pid: u32) {
+    let _ = thread::Builder::new()
+        .name("sysemble-cancel-kill".to_string())
+        .spawn(move || {
+            let deadline = Instant::now() + CANCEL_TERM_GRACE;
+            while process_group_exists(pid) {
+                if Instant::now() >= deadline {
+                    let _ = signal_process_group(pid, libc::SIGKILL);
+                    return;
+                }
+                thread::sleep(CANCEL_WATCHDOG_INTERVAL);
+            }
+        });
 }
 
 #[cfg(windows)]
@@ -907,6 +1089,7 @@ mod tests {
                 image_present: None,
             },
             runtime_path: None,
+            vm: None,
         }
     }
 
@@ -925,7 +1108,46 @@ mod tests {
                 image_present: Some(true),
             },
             runtime_path: Some(runtime.to_path_buf()),
+            vm: None,
         }
+    }
+
+    /// A fixed `vm` probe with the given helper and image directory.
+    fn vm_probe(helper: &Path, image_dir: &Path) -> EngineProbe {
+        EngineProbe {
+            info: EngineInfo {
+                kind: "vm".to_string(),
+                available: true,
+                platform: std::env::consts::OS.to_string(),
+                reason: "vm engine: sysemble-vm 0.1.0 · helper signed · image arm64".to_string(),
+                runtime: None,
+                image: Some("sysemble-vm:0.1.0".to_string()),
+                image_present: Some(true),
+            },
+            runtime_path: None,
+            vm: Some(VmHandle {
+                helper: helper.to_path_buf(),
+                image_dir: image_dir.to_path_buf(),
+            }),
+        }
+    }
+
+    /// A minimal repository shape with every input a VM build needs.
+    fn fake_vm_repo(tag: &str) -> (TempDir, PathBuf) {
+        let repo = TempDir::new(tag);
+        for relative in [
+            "builders/debian/build.sh",
+            VM_GUEST_SCRIPT,
+            CONTAINER_ENTRY_SCRIPT,
+        ] {
+            let path = repo.path.join(relative);
+            fs::create_dir_all(path.parent().expect("script path should have a parent"))
+                .expect("fake repository should be creatable");
+            fs::write(&path, "#!/usr/bin/env bash\nexit 0\n")
+                .expect("fake repository script should be writable");
+        }
+        let repo_abs = fs::canonicalize(&repo.path).expect("fake repository should resolve");
+        (repo, repo_abs)
     }
 
     /// Create a minimal repository shape with the v2 container entry script.
@@ -1157,6 +1379,308 @@ mod tests {
             error.contains("none"),
             "error should name the engine kind: {error}"
         );
+    }
+
+    #[test]
+    fn vm_engine_uses_the_vm_backend() {
+        let vm = vm_probe(
+            Path::new("/helpers/sysemble-vm"),
+            Path::new("/images/sysemble-vm/0.1.0"),
+        );
+        assert_eq!(execution_backend(Some(&vm)), Ok(ExecutionBackend::Vm));
+
+        let unavailable = engine_probe(
+            "vm",
+            false,
+            "vm engine unavailable: no valid VM image; build the image with engine/vm/image/build-image.sh",
+        );
+        let error = execution_backend(Some(&unavailable))
+            .expect_err("an unavailable vm must not reach a launch path");
+        assert!(
+            error.contains("vm engine unavailable"),
+            "error should carry the probe reason: {error}"
+        );
+    }
+
+    #[test]
+    fn execute_without_a_usable_vm_is_a_readable_error() {
+        let manager = BuildManager::with_engine_probe(engine_probe(
+            "vm",
+            false,
+            "vm engine unavailable: no valid VM image: disk.img is empty; build the image with engine/vm/image/build-image.sh or install the app bundle image",
+        ));
+        let temp = TempDir::new("execute-vm-unavailable");
+
+        let error = manager
+            .start_build(
+                &as_str(&example("minimal-debian.yaml")),
+                &as_str(&temp.path),
+                "execute",
+            )
+            .expect_err("execute must be gated on a usable VM engine");
+
+        assert!(
+            error.contains("vm engine unavailable"),
+            "error should carry the probe reason: {error}"
+        );
+        assert!(
+            error.contains("engine/vm/image/build-image.sh"),
+            "error should point at the VM image build script: {error}"
+        );
+        assert!(
+            error.contains("dry-run"),
+            "error should point at the still-available dry run: {error}"
+        );
+        assert!(
+            !temp.path.join("build.log").exists() && !temp.path.join("plan.json").exists(),
+            "a gated VM build must not write output"
+        );
+    }
+
+    #[test]
+    fn dry_run_does_not_probe_the_engine() {
+        let manager = BuildManager::with_engine_resolver(Arc::new(|| -> EngineProbe {
+            panic!("a dry-run build must never probe the engine")
+        }));
+        let temp = TempDir::new("dry-run-no-probe");
+
+        let started = manager
+            .start_build(
+                &as_str(&example("minimal-debian.yaml")),
+                &as_str(&temp.path),
+                "dry-run",
+            )
+            .expect("dry-run must not depend on the engine probe");
+
+        let status = wait_for_terminal(&manager, &started.id, Duration::from_secs(30));
+        assert_eq!(status.state, BuildState::Exited, "status: {status:?}");
+        assert_eq!(status.exit_code, Some(0));
+    }
+
+    #[test]
+    fn vm_argv_matches_the_frozen_contract() {
+        let temp = TempDir::new("vm-argv");
+        let helper = temp.path.join("helper dir").join("中文").join("sysemble-vm");
+        let image_dir = temp.path.join("image dir 中文");
+        let repo = temp.path.join("repo with space").join("sysemble 仓库");
+        let out = temp.path.join("out with space").join("构建");
+        for dir in [&image_dir, &repo, &out] {
+            fs::create_dir_all(dir).expect("test directory should be creatable");
+        }
+        fs::create_dir_all(helper.parent().expect("helper path should have a parent"))
+            .expect("helper directory should be creatable");
+        let helper_abs = fs::canonicalize(
+            helper
+                .parent()
+                .expect("helper path should have a parent"),
+        )
+        .expect("helper directory should resolve")
+        .join("sysemble-vm");
+        let image_abs = fs::canonicalize(&image_dir).expect("image directory should resolve");
+        let repo_abs = fs::canonicalize(&repo).expect("repository should resolve");
+        let out_abs = fs::canonicalize(&out).expect("output directory should resolve");
+
+        let invocation = vm_invocation(&helper_abs, &image_abs, &repo_abs, &out_abs);
+        let args: Vec<String> = invocation
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(invocation.program, helper_abs);
+        assert_eq!(
+            args,
+            vec![
+                "run".to_string(),
+                "--image-dir".to_string(),
+                image_abs.display().to_string(),
+                "--repo".to_string(),
+                repo_abs.display().to_string(),
+                "--out".to_string(),
+                out_abs.display().to_string(),
+                "--plan".to_string(),
+                out_abs.join("plan.json").display().to_string(),
+                "--timeout".to_string(),
+                "1800".to_string(),
+                "--json".to_string(),
+            ],
+            "the VM argv is frozen by the P1-e4 workplan §2.3"
+        );
+        assert_eq!(args.len(), 12);
+        assert!(
+            args[2].contains(' ') && args[2].contains('中'),
+            "a path with spaces and CJK characters must stay one argv token: {:?}",
+            args[2]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_runs_the_vm_helper_and_captures_the_build_log() {
+        let temp = TempDir::new("execute-vm");
+        let (_repo, repo_abs) = fake_vm_repo("execute-vm-repo");
+        let argv_log = temp.path.join("argv.txt");
+        let helper = temp.path.join("sysemble-vm");
+        let body = format!(
+            r#"#!/bin/sh
+printf '%s\n' "$@" > '{}'
+printf 'vm helper stdout\n'
+printf 'vm helper stderr\n' >&2
+exit 0
+"#,
+            argv_log.display()
+        );
+        write_runtime(&helper, &body);
+        let image_dir = temp.path.join("image");
+        fs::create_dir_all(&image_dir).expect("image directory should be creatable");
+
+        let manager =
+            BuildManager::with_engine_probe_and_repo(vm_probe(&helper, &image_dir), repo_abs);
+        let out = temp.path.join("out");
+        let started = manager
+            .start_build(
+                &as_str(&example("minimal-debian.yaml")),
+                &as_str(&out),
+                "execute",
+            )
+            .expect("vm build should start");
+
+        let status = wait_for_terminal(&manager, &started.id, Duration::from_secs(30));
+        assert_eq!(status.state, BuildState::Exited, "status: {status:?}");
+        assert_eq!(status.exit_code, Some(0));
+
+        let recorded = fs::read_to_string(&argv_log).expect("the helper argv should be recorded");
+        let args: Vec<String> = recorded.lines().map(str::to_string).collect();
+        assert_eq!(args.first().map(String::as_str), Some("run"));
+        let image_index = args
+            .iter()
+            .position(|arg| arg == "--image-dir")
+            .expect("--image-dir should be present");
+        assert_eq!(
+            args[image_index + 1],
+            as_str(&fs::canonicalize(&image_dir).expect("image directory should resolve"))
+        );
+        let plan_index = args
+            .iter()
+            .position(|arg| arg == "--plan")
+            .expect("--plan should be present");
+        assert_eq!(
+            args[plan_index + 1],
+            as_str(
+                &fs::canonicalize(&out)
+                    .expect("output directory should resolve")
+                    .join("plan.json")
+            )
+        );
+        let timeout_index = args
+            .iter()
+            .position(|arg| arg == "--timeout")
+            .expect("--timeout should be present");
+        assert_eq!(args[timeout_index + 1], "1800");
+        assert_eq!(args.last().map(String::as_str), Some("--json"));
+
+        let log = fs::read_to_string(&started.log_path).expect("the build log should be readable");
+        assert!(log.contains("vm helper stdout"), "log:\n{log}");
+        assert!(log.contains("vm helper stderr"), "log:\n{log}");
+        assert!(Path::new(&started.plan_path).is_file());
+    }
+
+    #[cfg(unix)]
+    fn process_alive(pid: i32) -> bool {
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancel_vm_build_marks_cancelled_and_leaves_no_helper_process() {
+        let temp = TempDir::new("cancel-vm");
+        let (_repo, repo_abs) = fake_vm_repo("cancel-vm-repo");
+        let pid_file = temp.path.join("pids.txt");
+        let term_file = temp.path.join("term.txt");
+        let helper = temp.path.join("sysemble-vm");
+        // SIGTERM is what the real helper catches to stop the VM; the trap
+        // records that the signal arrived while the fake helper was running.
+        let body = format!(
+            r#"#!/bin/sh
+printf '%s\n' "$$" > '{pids}'
+trap 'printf term > {term}; exit 143' TERM
+sleep 300 &
+printf '%s\n' "$!" >> '{pids}'
+wait
+"#,
+            pids = pid_file.display(),
+            term = term_file.display()
+        );
+        write_runtime(&helper, &body);
+        let image_dir = temp.path.join("image");
+        fs::create_dir_all(&image_dir).expect("image directory should be creatable");
+
+        let manager =
+            BuildManager::with_engine_probe_and_repo(vm_probe(&helper, &image_dir), repo_abs);
+        let out = temp.path.join("out");
+        let started = manager
+            .start_build(
+                &as_str(&example("minimal-debian.yaml")),
+                &as_str(&out),
+                "execute",
+            )
+            .expect("vm build should start");
+
+        // Wait until the helper recorded itself and its sleep child.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let pids: Vec<i32> = loop {
+            if let Ok(text) = fs::read_to_string(&pid_file) {
+                let pids: Vec<i32> = text
+                    .lines()
+                    .filter_map(|line| line.trim().parse().ok())
+                    .collect();
+                if pids.len() == 2 {
+                    break pids;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the fake helper never recorded its pid and child"
+            );
+            thread::sleep(Duration::from_millis(20));
+        };
+
+        manager
+            .cancel_build(&started.id)
+            .expect("a running vm build should be cancellable");
+        let status = wait_for_terminal(&manager, &started.id, Duration::from_secs(10));
+        assert_eq!(status.state, BuildState::Cancelled, "status: {status:?}");
+        assert_eq!(status.exit_code, None);
+
+        // The helper's SIGTERM handler must have run instead of being SIGKILLed.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !term_file.is_file() {
+            assert!(
+                Instant::now() < deadline,
+                "the VM helper never handled SIGTERM"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        // Neither the helper nor its child may survive the cancellation.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let alive: Vec<i32> = pids
+                .iter()
+                .copied()
+                .filter(|pid| process_alive(*pid))
+                .collect();
+            if alive.is_empty() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "residual helper processes after cancel: {alive:?}"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        assert!(Path::new(&started.log_path).is_file());
     }
 
     #[test]

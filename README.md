@@ -4,7 +4,7 @@
 
 Sysemble is a local-first desktop application for composing a complete Linux system — base, desktop, applications, a Windows VM layer, and development environments — from a declarative spec, then building and verifying it on your own machine.
 
-> **Status: P1-e3 prototype (v0.0.1).** The engine builds, boots, installs, and runs a live ISO in CI. The Tauri shell validates/plans, runs and tails builds, renders a six-layer view, and reports whether real builds are possible. The engine ships as a versioned Debian OCI image (`engine/image`) that the shell runs through Docker Desktop or podman on macOS/Windows and through the local builder on Linux. `engine/vm` adds a Virtualization.framework prototype that boots an arm64 Debian engine VM on Apple Silicon, shares repo/out via virtiofs, and runs a real build inside the guest; it is a CLI prototype not yet wired into the shell. WSL2 and desktop integration remain future work. See [docs/roadmap.md](docs/roadmap.md).
+> **Status: P1-e4 (v0.0.1).** The engine builds, boots, installs, and runs a live ISO in CI. The Tauri shell validates/plans, runs and tails builds, renders a six-layer view, and reports whether real builds are possible. On Apple Silicon the shell now detects the signed Virtualization.framework helper and VM image (`engine_info` returns `kind=vm`) and runs execute builds through the VM, with local/container fallbacks. The engine also ships as a versioned Debian OCI image (`engine/image`) for Docker Desktop/podman. The single-`.app` packaging design (bundled helper + compressed VM image, no Docker at runtime) is frozen in [ADR 0002](docs/design/0002-vm-packaging.md); the first-run installer is the next slice. See [docs/roadmap.md](docs/roadmap.md).
 
 ---
 
@@ -51,9 +51,9 @@ The design borrows the useful parts of hosted builders — spec-as-truth, state 
 └─────────────────────────────────────────────────────────────┘
 ```
 
-The engine always runs on Linux. On macOS it currently runs in the Linux VM
-provided by Docker Desktop or podman; `engine/vm` is a native
-Virtualization.framework prototype (arm64 guest, CLI only, not yet in the shell).
+The engine always runs on Linux. On macOS it runs in a native
+Virtualization.framework VM (arm64, `engine/vm`, wired into the shell) or in the
+Linux VM provided by Docker Desktop/podman for the x86_64 container backend.
 On Windows it runs in Docker Desktop/WSL2. The UI stays native.
 
 ## Cross-platform hosts
@@ -62,14 +62,16 @@ On Windows it runs in Docker Desktop/WSL2. The UI stays native.
 |---|---|---|---|
 | Windows x86_64 | Docker Desktop / WSL2 container | x86_64 | native |
 | Windows arm64 | Docker Desktop / WSL2 container | arm64 | qemu (amd64 engine, slow) |
-| macOS arm64 | Docker Desktop / podman (amd64 engine image) | arm64 | Rosetta for Linux / qemu |
+| macOS arm64 | Virtualization.framework VM (arm64) or Docker/podman | arm64 | container (x86_64); VM cross-build planned |
 | Linux x86_64 | native (root) or docker/podman | x86_64 | native |
 | Linux arm64 | native (root) or docker/podman | arm64 | qemu-user (slow) |
 
 Host support means the app runs everywhere; build targets are always Linux.
-The container engine is verified on macOS arm64 (local E2E) and Linux CI; the
-Windows path and native Virtualization.framework/WSL2 helpers (P1-e3) are
-implemented/planned but not yet verified on real hardware.
+The VM backend is verified locally on macOS arm64 (desktop E2E) but not in CI
+(GitHub macOS runners cannot nest VMs); the container engine is verified on
+macOS and Linux CI. Windows and native WSL2 remain unverified, and the VM
+currently produces arm64 artifacts only — x86_64 targets still use a container
+backend (the all-in-one packaging plan is [ADR 0002](docs/design/0002-vm-packaging.md)).
 
 ## Base spectrum
 

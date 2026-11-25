@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use sysemble_desktop_lib::build::{BuildManager, BuildState};
 #[cfg(target_os = "linux")]
 use sysemble_desktop_lib::engine;
-use sysemble_desktop_lib::engine::ENGINE_RUNTIME_ENV;
+use sysemble_desktop_lib::engine::{ENGINE_RUNTIME_ENV, VM_HELPER_ENV};
 
 /// A Linux root host with the local toolchain would satisfy the gate, so the
 /// container-specific assertions below skip there.
@@ -54,8 +54,10 @@ fn builder_override_bypasses_the_engine_gate() {
         return;
     }
 
-    // Make the probe fail deterministically without touching real docker.
+    // Make the probe fail deterministically without touching real docker or
+    // the developer Mac's signed VM helper + image.
     std::env::set_var(ENGINE_RUNTIME_ENV, dir.join("missing-runtime"));
+    std::env::set_var(VM_HELPER_ENV, dir.join("missing-sysemble-vm"));
 
     let manager = BuildManager::new();
     let spec = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -111,5 +113,6 @@ fn builder_override_bypasses_the_engine_gate() {
 
     std::env::remove_var("SYMBLE_BUILDER");
     std::env::remove_var(ENGINE_RUNTIME_ENV);
+    std::env::remove_var(VM_HELPER_ENV);
     let _ = fs::remove_dir_all(&dir);
 }

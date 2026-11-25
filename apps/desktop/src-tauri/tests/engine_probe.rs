@@ -11,7 +11,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use sysemble_desktop_lib::engine::{self, ENGINE_IMAGE_ENV, ENGINE_RUNTIME_ENV};
+use sysemble_desktop_lib::engine::{
+    self, ENGINE_IMAGE_ENV, ENGINE_RUNTIME_ENV, VM_HELPER_ENV, VM_IMAGE_DIR_ENV,
+};
 
 fn temp_dir(tag: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!("sysemble-engine-{tag}-{}", std::process::id()));
@@ -45,6 +47,8 @@ impl Drop for EnvGuard {
     fn drop(&mut self) {
         std::env::remove_var(ENGINE_IMAGE_ENV);
         std::env::remove_var(ENGINE_RUNTIME_ENV);
+        std::env::remove_var(VM_HELPER_ENV);
+        std::env::remove_var(VM_IMAGE_DIR_ENV);
     }
 }
 
@@ -53,12 +57,17 @@ fn environment_overrides_drive_the_engine_probe() {
     let _guard = EnvGuard;
     std::env::remove_var(ENGINE_IMAGE_ENV);
     std::env::remove_var(ENGINE_RUNTIME_ENV);
+    std::env::remove_var(VM_IMAGE_DIR_ENV);
     if local_engine_wins() {
         eprintln!("skipping: the local Linux engine wins on this host");
         return;
     }
 
     let temp = temp_dir("probe");
+    // This test asserts the container probe order. Point the VM helper at a
+    // missing path so a developer Mac with a signed helper and a built image
+    // still probes the container runtime instead of answering `vm`.
+    std::env::set_var(VM_HELPER_ENV, temp.join("missing-sysemble-vm"));
     let runtime = temp.join("docker");
 
     // 1. A reachable daemon with the image present.
@@ -83,6 +92,15 @@ esac
     assert!(
         info.reason.contains("9.9.9"),
         "reason should carry the runtime version: {}",
+        info.reason
+    );
+    // W1/W6: the missing VM helper degrades to the container probe and the
+    // reason keeps a readable note about it (macOS only; other hosts skip the
+    // VM probe entirely).
+    #[cfg(target_os = "macos")]
+    assert!(
+        info.reason.contains("vm: no sysemble-vm helper found"),
+        "reason should keep the VM degradation note: {}",
         info.reason
     );
 
@@ -149,6 +167,12 @@ esac
     assert!(
         info.reason.contains("start Docker Desktop"),
         "reason should keep the daemon hint: {}",
+        info.reason
+    );
+    #[cfg(target_os = "macos")]
+    assert!(
+        info.reason.contains("vm: no sysemble-vm helper found"),
+        "the all-unavailable reason should keep the VM note: {}",
         info.reason
     );
 

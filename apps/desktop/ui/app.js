@@ -111,15 +111,22 @@
     engineAvailable = Boolean(info && info.available === true);
 
     if (engineAvailable) {
-      // P1-e2: a container engine names the runtime it was probed through,
-      // e.g. `Engine: container · docker`.
-      engineSummary = kind === "container" && runtime ? `container · ${runtime}` : kind;
-      engineLabel =
-        kind === "container"
-          ? `${runtime || "container"} container`
-          : kind === "local"
-            ? "local Linux"
+      // P1-e4: the native macOS engine is `vm`; P1-e2 container engines name
+      // the runtime they were probed through, e.g. `Engine: container · docker`.
+      engineSummary =
+        kind === "vm"
+          ? "vm · arm64"
+          : kind === "container" && runtime
+            ? `container · ${runtime}`
             : kind;
+      engineLabel =
+        kind === "vm"
+          ? "Virtualization.framework"
+          : kind === "container"
+            ? `${runtime || "container"} container`
+            : kind === "local"
+              ? "local Linux"
+              : kind;
       engineReason = "";
       els.engine.textContent = `Engine: ${engineSummary}`;
       els.engine.className = "engine ok";

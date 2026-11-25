@@ -549,7 +549,7 @@ while IFS= read -r line; do
       crates/sysemble-core/* | crates/sysemble-cli/* | \
       builders/* | docs/plan/* | \
       tools/* | .github/workflows/* | examples/minimal-debian.yaml | examples/debian-xfce.yaml | examples/minimal-debian-live.yaml | \
-      apps/desktop/* | engine/* | docs/roadmap.md | \
+      apps/desktop/* | engine/* | docs/roadmap.md | docs/design/* | \
       tests/acceptance/* | docs/acceptance/*)
       ;;
     *)
@@ -563,7 +563,7 @@ if [ -z "$A10_ERR" ] && [ -z "$A10_OUTSIDE" ]; then
   note "git status entries: $(wc -l <"$A10_STATUS_END" | tr -d ' ') (unchanged before/after the run)"
   note "Cargo.lock sha256 unchanged: $LOCK_END"
   note "frozen spec/ and examples/ untouched"
-  note "allowed dirs: crates/sysemble-{core,cli}/, builders/, docs/plan/, tests/acceptance/, docs/acceptance/, apps/desktop/, engine/, Cargo.lock"
+  note "allowed dirs: crates/sysemble-{core,cli}/, builders/, docs/plan/, docs/design/, tests/acceptance/, docs/acceptance/, apps/desktop/, engine/, Cargo.lock"
 else
   fail A10 "work-tree check:$A10_ERR outside:$A10_OUTSIDE"
   diff -u "$GIT_START" "$A10_STATUS_END" 2>/dev/null | sed -n '1,30p' | sed 's/^/         | /'
