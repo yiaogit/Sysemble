@@ -1587,7 +1587,26 @@ exit 0
 
     #[cfg(unix)]
     fn process_alive(pid: i32) -> bool {
-        unsafe { libc::kill(pid, 0) == 0 }
+        #[cfg(target_os = "linux")]
+        {
+            // A zombie still answers kill(pid, 0). Busy CI runners can leave a
+            // killed grandchild as a zombie for a moment, which is not a live
+            // process; treat state Z as gone so the test measures the cancel
+            // path rather than the init reaper's timing.
+            if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) {
+                if let Some(rest) = stat.rsplit(')').next() {
+                    if rest.split_whitespace().next() == Some("Z") {
+                        return false;
+                    }
+                }
+                return true;
+            }
+            return false;
+        }
+        #[cfg(not(target_os = "linux"))]
+        unsafe {
+            libc::kill(pid, 0) == 0
+        }
     }
 
     #[cfg(unix)]
@@ -1648,7 +1667,11 @@ wait
         manager
             .cancel_build(&started.id)
             .expect("a running vm build should be cancellable");
-        let status = wait_for_terminal(&manager, &started.id, Duration::from_secs(10));
+        let status = wait_for_terminal(
+            &manager,
+            &started.id,
+            CANCEL_TERM_GRACE + Duration::from_secs(15),
+        );
         assert_eq!(status.state, BuildState::Cancelled, "status: {status:?}");
         assert_eq!(status.exit_code, None);
 
@@ -1662,8 +1685,10 @@ wait
             thread::sleep(Duration::from_millis(20));
         }
 
-        // Neither the helper nor its child may survive the cancellation.
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // Neither the helper nor its child may survive the cancellation. The
+        // watchdog escalates TERM to KILL after CANCEL_TERM_GRACE, so wait past
+        // that deadline: a fake /bin/sh helper may only die on the escalation.
+        let deadline = Instant::now() + CANCEL_TERM_GRACE + Duration::from_secs(15);
         loop {
             let alive: Vec<i32> = pids
                 .iter()
