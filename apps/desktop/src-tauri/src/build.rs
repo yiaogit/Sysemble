@@ -1592,16 +1592,19 @@ exit 0
             // A zombie still answers kill(pid, 0). Busy CI runners can leave a
             // killed grandchild as a zombie for a moment, which is not a live
             // process; treat state Z as gone so the test measures the cancel
-            // path rather than the init reaper's timing.
-            if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) {
-                if let Some(rest) = stat.rsplit(')').next() {
-                    if rest.split_whitespace().next() == Some("Z") {
-                        return false;
-                    }
+            // path rather than the init reaper's timing. An unreadable /proc
+            // entry means the process is gone; an unparsable one (unexpected)
+            // is treated as alive to avoid hiding a leak.
+            match fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Ok(stat) => {
+                    let state = stat
+                        .rsplit(')')
+                        .next()
+                        .and_then(|rest| rest.split_whitespace().next());
+                    !matches!(state, Some("Z"))
                 }
-                return true;
+                Err(_) => false,
             }
-            return false;
         }
         #[cfg(not(target_os = "linux"))]
         unsafe {
