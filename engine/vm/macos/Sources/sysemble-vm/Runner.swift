@@ -26,6 +26,10 @@ struct RunOptions {
     let readyTimeout: TimeInterval
     let timeout: TimeInterval
     let cloneDisk: Bool
+    let rosetta: Bool
+    /// `--job` override: a basename of a script in `out` (nil = frozen job).
+    let job: String?
+    let dryRun: Bool
     let json: Bool
 }
 
@@ -39,6 +43,22 @@ final class VMRunner: NSObject, VZVirtualMachineDelegate {
 
     private let options: RunOptions
     private let fileManager = FileManager.default
+
+    /// The frozen P1-e3 guest job. `--job` replaces only the command, never the
+    /// protocol: job.sh is still published atomically after `ready`.
+    static let defaultJobName = "minimal-build.sh"
+    static let defaultJobCommand =
+        "bash /work/engine/vm/guest/minimal-build.sh --plan /export/plan.json "
+        + "--out /out --export /export"
+
+    private var jobName: String { options.job ?? Self.defaultJobName }
+
+    private var jobCommand: String {
+        if let job = options.job {
+            return "bash /export/\(job)"
+        }
+        return Self.defaultJobCommand
+    }
 
     private var vm: VZVirtualMachine?
     private var serialRead: FileHandle?
@@ -56,10 +76,6 @@ final class VMRunner: NSObject, VZVirtualMachineDelegate {
     private var readySeen = false
     private var doneSeen = false
     private var runStartedAt = Date()
-
-    private let jobCommand =
-        "bash /work/engine/vm/guest/minimal-build.sh --plan /export/plan.json "
-        + "--out /out --export /export"
 
     init(options: RunOptions) {
         self.options = options
@@ -88,8 +104,17 @@ final class VMRunner: NSObject, VZVirtualMachineDelegate {
         do {
             // Usage-level resource checks happen before any path is touched.
             try VZVMBuilder.validateResources(cpus: options.cpus, memoryMB: options.memoryMB)
+            if options.rosetta {
+                try validateRosettaAvailability()
+            }
             try validateInputs()
             try prepareOutput()
+            try validateJobFile()
+
+            if options.dryRun {
+                return finishDryRun()
+            }
+
             let diskImage = try prepareDisk()
 
             if let signal = interruptedSignal {
@@ -160,6 +185,35 @@ final class VMRunner: NSObject, VZVirtualMachineDelegate {
         if let size = fileSize(options.plan.path), size == 0 {
             throw HelperError.paths("plan file is empty: \(options.plan.path)")
         }
+    }
+
+    // MARK: - Host capability and --job validation (exit 3)
+
+    /// `run --rosetta` requires VZLinuxRosettaDirectoryShare.availability to be
+    /// `installed`; the check happens before any VM object is created. It does
+    /// not need the virtualization entitlement.
+    private func validateRosettaAvailability() throws {
+        let status = RosettaStatus.detect()
+        guard status.isInstalled else {
+            throw HelperError.environment(
+                status.note ?? "Rosetta for Linux is not available on this host."
+            )
+        }
+        writeStderr("host: Rosetta for Linux: installed")
+    }
+
+    /// `--job` only names a basename inside --out; the file must already exist
+    /// there. The default (no --job) does not call this.
+    private func validateJobFile() throws {
+        guard let job = options.job else { return }
+        let url = options.out.appendingPathComponent(job)
+        guard isRegularFile(url.path) else {
+            throw HelperError.paths(
+                "--job \(job): no regular file at \(url.path). --job only accepts the "
+                    + "basename of a script placed in --out."
+            )
+        }
+        writeStderr("host: job override: /export/\(job)")
     }
 
     // MARK: - Host-side preparation (exit 3)
@@ -308,6 +362,7 @@ final class VMRunner: NSObject, VZVirtualMachineDelegate {
                 out: options.out,
                 cpus: options.cpus,
                 memoryMB: options.memoryMB,
+                rosetta: options.rosetta,
                 serialRead: readHandle,
                 serialWrite: writeHandle
             )
@@ -540,7 +595,7 @@ final class VMRunner: NSObject, VZVirtualMachineDelegate {
                 "cannot atomically publish \(jobURL.path): \(reason) (errno \(errorNumber))"
             )
         }
-        writeStderr("host: published job.sh atomically")
+        writeStderr("host: published job.sh atomically (job: \(jobName))")
     }
 
     private func readDoneCode() -> String? {
@@ -670,6 +725,43 @@ final class VMRunner: NSObject, VZVirtualMachineDelegate {
 
     // MARK: - Results
 
+    /// `--dry-run`: the host preparation is real (including the atomic job.sh
+    /// publish), but no disk is cloned and no VM is constructed.
+    private func finishDryRun() -> Int32 {
+        do {
+            try publishJob()
+        } catch let error as HelperError {
+            return finishEarly(with: error)
+        } catch {
+            return finishEarly(
+                with: HelperError(code: 1, message: "unexpected failure: \(error)")
+            )
+        }
+
+        if options.json {
+            emitDryRunResult()
+        } else {
+            print(jobCommand)
+        }
+        return 0
+    }
+
+    private func emitDryRunResult() {
+        let object: [String: Any] = [
+            "dry_run": true,
+            "job": jobName,
+            "job_path": jobURL.path,
+            "rc": 0,
+            "rosetta": options.rosetta,
+            "work_dir": workDirectory.path
+        ]
+        do {
+            try emitJSON(object)
+        } catch {
+            writeStderr("sysemble-vm: error: could not encode dry-run JSON: \(error)")
+        }
+    }
+
     private func finishEarly(with error: HelperError) -> Int32 {
         writeStderr("sysemble-vm: error: \(error.message)")
         if options.json {
@@ -749,6 +841,8 @@ final class VMRunner: NSObject, VZVirtualMachineDelegate {
             "elapsed_seconds": NSDecimalNumber(string: elapsedText),
             "ready": ready,
             "done": done,
+            "job": jobName,
+            "rosetta": options.rosetta,
             "log_path": guestLogURL.path,
             "serial_log": serialLogURL.path,
             "work_dir": workDirectory.path

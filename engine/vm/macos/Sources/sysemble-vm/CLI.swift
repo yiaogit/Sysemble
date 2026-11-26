@@ -21,7 +21,8 @@ enum CLI {
       sysemble-vm probe [--json]
       sysemble-vm run --image-dir <dir> --repo <dir> --out <dir> --plan <plan.json>
                     [--cpus 4] [--memory-mb 4096] [--ready-timeout 180]
-                    [--timeout 1800] [--no-clone] [--json]
+                    [--timeout 1800] [--no-clone] [--rosetta] [--job <name>]
+                    [--dry-run] [--json]
       sysemble-vm --help
 
     probe:
@@ -35,6 +36,13 @@ enum CLI {
       (ready -> job.sh -> done/log) and exit with the guest's exit code.
       --no-clone uses <image-dir>/disk.img in place instead of cloning it to
       <out>/vm-disk.img.
+      --rosetta attaches the Rosetta for Linux virtiofs share (tag "rosetta")
+      after checking VZLinuxRosettaDirectoryShare.availability; when Rosetta is
+      not installed the helper exits 3 with the softwareupdate hint.
+      --job <name> runs bash /export/<name> instead of the frozen minimal build.
+      <name> must be a basename of a file already present in --out.
+      --dry-run validates the inputs, prepares --out, publishes job.sh, prints
+      its exact contents, and exits before cloning a disk or starting a VM.
 
     Exit codes:
       0   success (probe: always unless arguments are invalid)
@@ -100,6 +108,8 @@ enum CLI {
     private static func runRun(_ arguments: [String]) throws -> Int32 {
         var values: [String: String] = [:]
         var noClone = false
+        var rosetta = false
+        var dryRun = false
         var json = false
 
         var index = 0
@@ -114,14 +124,19 @@ enum CLI {
                 }
                 print(usageText)
                 return 0
-            case "--json", "--no-clone":
+            case "--json", "--no-clone", "--rosetta", "--dry-run":
                 if inlineValue != nil {
                     throw HelperError.usage("\(name) does not take a value")
                 }
-                if name == "--json" { json = true } else { noClone = true }
+                switch name {
+                case "--json": json = true
+                case "--no-clone": noClone = true
+                case "--rosetta": rosetta = true
+                default: dryRun = true
+                }
                 index += 1
             case "--image-dir", "--repo", "--out", "--plan",
-                 "--cpus", "--memory-mb", "--ready-timeout", "--timeout":
+                 "--cpus", "--memory-mb", "--ready-timeout", "--timeout", "--job":
                 if let inlineValue {
                     guard !inlineValue.isEmpty else {
                         throw HelperError.usage("\(name) requires a non-empty value")
@@ -151,6 +166,10 @@ enum CLI {
             throw HelperError.usage("missing required option \(required)")
         }
 
+        if let job = values["--job"] {
+            try validateJobName(job)
+        }
+
         let cpus = try positiveInt(values, "--cpus", default: 4)
         let memoryMB = try positiveInt(values, "--memory-mb", default: 4096)
         let readyTimeout = try positiveInt(values, "--ready-timeout", default: 180)
@@ -171,6 +190,9 @@ enum CLI {
             readyTimeout: TimeInterval(readyTimeout),
             timeout: TimeInterval(timeout),
             cloneDisk: !noClone,
+            rosetta: rosetta,
+            job: values["--job"],
+            dryRun: dryRun,
             json: json
         )
         // Keep a strong reference for the whole run: the VZ completion handlers
@@ -188,6 +210,19 @@ enum CLI {
         let name = String(argument[..<separator])
         let value = String(argument[argument.index(after: separator)...])
         return (name, value)
+    }
+
+    /// `--job` is a debugging override, not a general host->guest path channel:
+    /// only a basename inside --out is accepted (P1-e6a).
+    private static func validateJobName(_ name: String) throws {
+        guard !name.contains("/") else {
+            throw HelperError.usage(
+                "--job must be a basename inside --out, not a path: '\(name)'"
+            )
+        }
+        guard name != ".", name != "..", !name.contains("..") else {
+            throw HelperError.usage("--job must not be '.' or contain '..': '\(name)'")
+        }
     }
 
     private static func positiveInt(

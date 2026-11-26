@@ -139,6 +139,11 @@ if "$BIN" probe --json >"$TMP/probe.json" 2>"$TMP/probe.err"; then
         and (.arch | type == "string" and length > 0)
         and (.macos | type == "string" and test("^[0-9]+\\.[0-9]+"))
         and (.cpus | type == "number" and . >= 1 and . == floor)
+        and (.rosetta | type == "string"
+             and test("^(installed|notInstalled|notSupported|unknown)$"))
+        and (if .rosetta == "unknown" then
+               (.rosetta_reason | type == "string" and length > 0)
+             else true end)
         and (.reason | type == "string" and length > 0);
       type_ok
     ' "$TMP/probe.json" >/dev/null 2>&1; then
@@ -169,6 +174,44 @@ if "$BIN" probe --json >"$TMP/probe.json" 2>"$TMP/probe.err"; then
     fail "probe says supported=true but entitled=false on a capable host"
   fi
 
+  ROSETTA_STATUS=$(jq -r '.rosetta' "$TMP/probe.json")
+  case "$ROSETTA_STATUS" in
+    installed | notInstalled | notSupported | unknown)
+      pass "probe reports the Rosetta for Linux availability ($ROSETTA_STATUS)"
+      ;;
+    *)
+      fail "probe rosetta has an undocumented value: '$ROSETTA_STATUS'"
+      ;;
+  esac
+
+  for forced in installed notInstalled notSupported unknown; do
+    if SYSEMBLE_VM_TEST_ROSETTA_AVAILABILITY="$forced" \
+      "$BIN" probe --json >"$TMP/rosetta-$forced.json" 2>"$TMP/rosetta-$forced.err"; then
+      if jq -e --arg status "$forced" '.rosetta == $status' \
+        "$TMP/rosetta-$forced.json" >/dev/null 2>&1; then
+        pass "probe maps a forced Rosetta availability to $forced"
+      else
+        fail "probe did not map a forced Rosetta availability to $forced"
+      fi
+    else
+      fail "probe failed with SYSEMBLE_VM_TEST_ROSETTA_AVAILABILITY=$forced"
+    fi
+  done
+
+  if SYSEMBLE_VM_TEST_ROSETTA_AVAILABILITY=bogus \
+    "$BIN" probe --json >"$TMP/rosetta-bogus.json" 2>"$TMP/rosetta-bogus.err"; then
+    if jq -e '
+        .rosetta == "unknown"
+        and (.rosetta_reason | type == "string" and length > 0)
+      ' "$TMP/rosetta-bogus.json" >/dev/null 2>&1; then
+      pass "probe maps an invalid Rosetta override to unknown with a reason"
+    else
+      fail "probe did not report unknown/reason for an invalid Rosetta override"
+    fi
+  else
+    fail "probe failed with an invalid Rosetta override"
+  fi
+
   SUPPORTED=$(jq -r '.supported' "$TMP/probe.json")
   ENTITLED=$(jq -r '.entitled' "$TMP/probe.json")
   if [ "$SUPPORTED" = "true" ]; then
@@ -184,8 +227,9 @@ expect_rc "probe exits 0 (a diagnostic, not a gate)" 0 "$BIN" probe
 if "$BIN" probe >"$TMP/probe-h.txt" 2>&1; then
   if grep -q '^  supported:' "$TMP/probe-h.txt" &&
       grep -q '^  entitled:' "$TMP/probe-h.txt" &&
+      grep -q '^  rosetta:' "$TMP/probe-h.txt" &&
       grep -q '^  reason:' "$TMP/probe-h.txt"; then
-    pass "probe human output lists supported/entitled/reason"
+    pass "probe human output lists supported/entitled/rosetta/reason"
   else
     fail "probe human output is missing fields"
   fi
@@ -289,9 +333,160 @@ else
   fail "run --json error contract mismatch (exit $RC): $(cat "$TMP/run-error.json")"
 fi
 
+# MARK: - --rosetta availability gate (no VM starts)
+
+if SYSEMBLE_VM_TEST_ROSETTA_AVAILABILITY=notInstalled \
+  "$BIN" run --image-dir "$FAKE/image" --repo "$FAKE/repo" \
+  --out "$TMP/rosetta-out" --plan "$FAKE/plan.json" \
+  --rosetta --dry-run >"$TMP/rosetta-notinstalled.out" 2>"$TMP/rosetta-notinstalled.err"; then
+  fail "run --rosetta accepted a notInstalled host"
+else
+  RC=$?
+  if [ "$RC" -eq 3 ] &&
+      grep -q 'softwareupdate --install-rosetta' "$TMP/rosetta-notinstalled.err"; then
+    pass "run --rosetta exits 3 with the softwareupdate hint when not installed"
+  else
+    fail "run --rosetta notInstalled branch mismatch (exit $RC): $(cat "$TMP/rosetta-notinstalled.err")"
+  fi
+fi
+
+if SYSEMBLE_VM_TEST_ROSETTA_AVAILABILITY=notSupported \
+  "$BIN" run --image-dir "$FAKE/image" --repo "$FAKE/repo" \
+  --out "$TMP/rosetta-out" --plan "$FAKE/plan.json" \
+  --rosetta --dry-run >"$TMP/rosetta-notsupported.out" 2>"$TMP/rosetta-notsupported.err"; then
+  fail "run --rosetta accepted a notSupported host"
+else
+  RC=$?
+  if [ "$RC" -eq 3 ] && grep -qi 'not supported' "$TMP/rosetta-notsupported.err"; then
+    pass "run --rosetta exits 3 when the host does not support Rosetta"
+  else
+    fail "run --rosetta notSupported branch mismatch (exit $RC): $(cat "$TMP/rosetta-notsupported.err")"
+  fi
+fi
+
+if SYSEMBLE_VM_TEST_ROSETTA_AVAILABILITY=bogus \
+  "$BIN" run --image-dir "$FAKE/image" --repo "$FAKE/repo" \
+  --out "$TMP/rosetta-out" --plan "$FAKE/plan.json" \
+  --rosetta --dry-run >"$TMP/rosetta-unknown.out" 2>"$TMP/rosetta-unknown.err"; then
+  fail "run --rosetta accepted an unknown Rosetta status"
+else
+  RC=$?
+  if [ "$RC" -eq 3 ] && grep -q 'could not be determined' "$TMP/rosetta-unknown.err"; then
+    pass "run --rosetta exits 3 when availability is unknown"
+  else
+    fail "run --rosetta unknown branch mismatch (exit $RC): $(cat "$TMP/rosetta-unknown.err")"
+  fi
+fi
+
+if SYSEMBLE_VM_TEST_ROSETTA_AVAILABILITY=installed \
+  "$BIN" run --image-dir "$FAKE/image" --repo "$FAKE/repo" \
+  --out "$TMP/rosetta-out" --plan "$FAKE/plan.json" \
+  --rosetta --dry-run --json >"$TMP/rosetta-installed.json" 2>"$TMP/rosetta-installed.err"; then
+  if jq -e '.dry_run == true and .rosetta == true and .rc == 0' \
+    "$TMP/rosetta-installed.json" >/dev/null 2>&1; then
+    pass "run --rosetta proceeds when availability is installed"
+  else
+    fail "run --rosetta installed branch returned an unexpected JSON object"
+  fi
+else
+  fail "run --rosetta failed with availability installed: $(cat "$TMP/rosetta-installed.err")"
+fi
+
+if SYSEMBLE_VM_TEST_ROSETTA_AVAILABILITY=notInstalled \
+  "$BIN" run --image-dir "$FAKE/image" --repo "$FAKE/repo" \
+  --out "$TMP/rosetta-default-out" --plan "$FAKE/plan.json" \
+  --dry-run >/dev/null 2>"$TMP/rosetta-default.err"; then
+  pass "run without --rosetta does not consult Rosetta availability"
+else
+  fail "run without --rosetta failed under a notInstalled override: $(cat "$TMP/rosetta-default.err")"
+fi
+
+# MARK: - --job override (no VM starts)
+
+expect_rc "run --job with a slash is a usage error" 2 \
+  "$BIN" run --image-dir "$FAKE/image" --repo "$FAKE/repo" \
+  --out "$FAKE/out" --plan "$FAKE/plan.json" --job sub/evil.sh --dry-run
+
+expect_rc "run --job .. is a usage error" 2 \
+  "$BIN" run --image-dir "$FAKE/image" --repo "$FAKE/repo" \
+  --out "$FAKE/out" --plan "$FAKE/plan.json" --job .. --dry-run
+
+expect_rc "run --job= (empty) is a usage error" 2 \
+  "$BIN" run --image-dir "$FAKE/image" --repo "$FAKE/repo" \
+  --out "$FAKE/out" --plan "$FAKE/plan.json" --job= --dry-run
+
+expect_rc "run --job pointing at a missing out file exits 3" 3 \
+  "$BIN" run --image-dir "$FAKE/image" --repo "$FAKE/repo" \
+  --out "$FAKE/out" --plan "$FAKE/plan.json" --job missing.sh --dry-run
+
+JOB_OUT="$TMP/job-out"
+mkdir -p "$JOB_OUT/dir.sh"
+printf '#!/usr/bin/env bash\necho hello\n' >"$JOB_OUT/hello.sh"
+chmod +x "$JOB_OUT/hello.sh"
+
+expect_rc "run --job pointing at a directory exits 3" 3 \
+  "$BIN" run --image-dir "$FAKE/image" --repo "$FAKE/repo" \
+  --out "$JOB_OUT" --plan "$FAKE/plan.json" --job dir.sh --dry-run
+
+if "$BIN" run --image-dir "$FAKE/image" --repo "$FAKE/repo" \
+  --out "$JOB_OUT" --plan "$FAKE/plan.json" --job hello.sh --dry-run \
+  >"$TMP/job-stdout.txt" 2>"$TMP/job-stderr.txt"; then
+  JOB_CONTENT=$(cat "$JOB_OUT/.sysemble-vm/job.sh")
+  JOB_STDOUT=$(cat "$TMP/job-stdout.txt")
+  if [ "$JOB_CONTENT" = "bash /export/hello.sh" ] &&
+      [ "$JOB_STDOUT" = "bash /export/hello.sh" ]; then
+    pass "run --job publishes and prints bash /export/<name>"
+  else
+    fail "run --job published '$JOB_CONTENT' and printed '$JOB_STDOUT'"
+  fi
+else
+  fail "run --job hello.sh --dry-run failed: $(cat "$TMP/job-stderr.txt")"
+fi
+
+if "$BIN" run --image-dir "$FAKE/image" --repo "$FAKE/repo" \
+  --out "$JOB_OUT" --plan "$FAKE/plan.json" --job hello.sh --dry-run --json \
+  >"$TMP/job.json" 2>"$TMP/job-json.err"; then
+  if jq -e '
+      .dry_run == true
+      and .rc == 0
+      and .job == "hello.sh"
+      and (.job_path | type == "string" and endswith("/.sysemble-vm/job.sh"))
+    ' "$TMP/job.json" >/dev/null 2>&1; then
+    pass "run --job --json records the override"
+  else
+    fail "run --job --json object mismatch: $(cat "$TMP/job.json")"
+  fi
+else
+  fail "run --job --dry-run --json failed: $(cat "$TMP/job-json.err")"
+fi
+
+DEFAULT_JOB='bash /work/engine/vm/guest/minimal-build.sh --plan /export/plan.json --out /out --export /export'
+DRY_OUT="$TMP/dry-default"
+mkdir -p "$DRY_OUT"
+if "$BIN" run --image-dir "$FAKE/image" --repo "$FAKE/repo" \
+  --out "$DRY_OUT" --plan "$FAKE/plan.json" --dry-run \
+  >"$TMP/default-job-stdout.txt" 2>"$TMP/default-job.err"; then
+  DEFAULT_CONTENT=$(cat "$DRY_OUT/.sysemble-vm/job.sh")
+  DEFAULT_STDOUT=$(cat "$TMP/default-job-stdout.txt")
+  if [ "$DEFAULT_CONTENT" = "$DEFAULT_JOB" ] &&
+      [ "$DEFAULT_STDOUT" = "$DEFAULT_JOB" ] &&
+      [ ! -e "$DRY_OUT/vm-disk.img" ]; then
+    pass "run --dry-run keeps the frozen default job.sh and does not clone a disk"
+  else
+    fail "default job mismatch: file '$DEFAULT_CONTENT' stdout '$DEFAULT_STDOUT'"
+  fi
+else
+  fail "run --dry-run with the default job failed: $(cat "$TMP/default-job.err")"
+fi
+
 # MARK: - Shell syntax
 
-for script in "$DIR/build.sh" "$DIR/tests/vm_test.sh"; do
+for script in "$DIR/build.sh" "$DIR/tests/vm_test.sh" \
+  "$REPO/engine/vm/spikes/rosetta-spike.sh"; do
+  if [ ! -f "$script" ]; then
+    skip "bash -n $(basename "$script") (file absent)"
+    continue
+  fi
   if bash -n "$script" 2>"$TMP/bash-n.err"; then
     pass "bash -n $(basename "$script")"
   else

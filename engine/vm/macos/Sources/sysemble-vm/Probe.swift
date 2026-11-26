@@ -23,6 +23,7 @@ struct ProbeResult {
     let architecture: String
     let macOS: String
     let cpus: Int
+    let rosetta: RosettaStatus
     let reason: String
 
     var jsonObject: [String: Any] {
@@ -31,8 +32,12 @@ struct ProbeResult {
             "arch": architecture,
             "macos": macOS,
             "cpus": cpus,
+            "rosetta": rosetta.availability.rawValue,
             "reason": reason
         ]
+        if let rosettaReason = rosetta.reason {
+            object["rosetta_reason"] = rosettaReason
+        }
         switch supported {
         case .known(let value):
             object["supported"] = value
@@ -77,6 +82,7 @@ enum Probe {
         print("  arch:      \(result.architecture)")
         print("  macos:     \(result.macOS)")
         print("  cpus:      \(result.cpus)")
+        print("  rosetta:   \(result.rosetta.availability.rawValue)")
         print("  reason:    \(result.reason)")
     }
 
@@ -84,6 +90,7 @@ enum Probe {
         let architecture = hostArchitecture()
         let macOS = macOSVersion()
         let cpus = ProcessInfo.processInfo.processorCount
+        let rosetta = RosettaStatus.detect()
         var notes: [String] = []
 
         var supported: SupportedStatus = .unknown
@@ -118,6 +125,10 @@ enum Probe {
             )
         }
 
+        if let rosettaNote = rosetta.note {
+            notes.append(rosettaNote)
+        }
+
         if notes.isEmpty {
             notes.append(
                 "ok: Virtualization.framework is supported and "
@@ -131,6 +142,7 @@ enum Probe {
             architecture: architecture,
             macOS: macOS,
             cpus: cpus,
+            rosetta: rosetta,
             reason: notes.joined(separator: " ")
         )
     }

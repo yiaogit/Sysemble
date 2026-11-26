@@ -26,6 +26,12 @@ struct HelperError: Error, CustomStringConvertible {
     static func vm(_ message: String) -> HelperError {
         HelperError(code: 4, message: message)
     }
+
+    /// A host capability that the requested mode requires is missing (exit 3).
+    /// Used by `run --rosetta` when Rosetta for Linux is not installed.
+    static func environment(_ message: String) -> HelperError {
+        HelperError(code: 3, message: message)
+    }
 }
 
 /// Expand `~`, resolve `.`/`..`, and make the path absolute without resolving

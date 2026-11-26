@@ -17,6 +17,7 @@ enum VZVMBuilder {
 
     static let repoTag = "sysemble-repo"
     static let outTag = "sysemble-out"
+    static let rosettaTag = "rosetta"
 
     /// Validate CPU/memory against the ranges Virtualization.framework reports
     /// for this host. These are usage errors (exit 2), checked before --out is
@@ -53,6 +54,7 @@ enum VZVMBuilder {
         out: URL,
         cpus: Int,
         memoryMB: Int,
+        rosetta: Bool,
         serialRead: FileHandle,
         serialWrite: FileHandle
     ) throws -> VZVirtualMachineConfiguration {
@@ -92,6 +94,28 @@ enum VZVMBuilder {
         let outDevice = VZVirtioFileSystemDeviceConfiguration(tag: outTag)
         outDevice.share = outShare
 
+        var directorySharingDevices: [VZDirectorySharingDeviceConfiguration] = [
+            repoDevice, outDevice
+        ]
+        if rosetta {
+            // VZLinuxRosettaDirectoryShare.availability was already checked as
+            // installed by Runner; init() can still fail (for example if the
+            // host policy changed between the check and here).
+            let rosettaShare: VZLinuxRosettaDirectoryShare
+            do {
+                rosettaShare = try VZLinuxRosettaDirectoryShare()
+            } catch {
+                throw HelperError.vm(
+                    "cannot attach the Rosetta for Linux directory share: "
+                        + "\(detailedErrorDescription(error)). Run "
+                        + "'softwareupdate --install-rosetta' and retry."
+                )
+            }
+            let rosettaDevice = VZVirtioFileSystemDeviceConfiguration(tag: rosettaTag)
+            rosettaDevice.share = rosettaShare
+            directorySharingDevices.append(rosettaDevice)
+        }
+
         let network = VZVirtioNetworkDeviceConfiguration()
         network.attachment = VZNATNetworkDeviceAttachment()
 
@@ -106,7 +130,7 @@ enum VZVMBuilder {
         let configuration = VZVirtualMachineConfiguration()
         configuration.bootLoader = bootLoader
         configuration.storageDevices = [blockDevice]
-        configuration.directorySharingDevices = [repoDevice, outDevice]
+        configuration.directorySharingDevices = directorySharingDevices
         configuration.networkDevices = [network]
         configuration.entropyDevices = [entropy]
         configuration.serialPorts = [serial]

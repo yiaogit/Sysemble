@@ -129,12 +129,18 @@ Sysemble.app/
 
 当前 arm64 guest 只构建 arm64 rootfs；产品主目标是 x86_64 的 qcow2/ISO（P0–P1 的 GRUB/OVMF 管线）。要真正做到“一个软件包含全部环境”，需要下列之一：
 
-### 方案 A（推荐先验证）：引擎镜像跑在 VM 内（engine-in-VM）
+### 方案 A（已通过 spike，选定）：引擎镜像跑在 VM 内（engine-in-VM）
 - arm64 guest 内装 podman（rootless/rootful）+ binfmt；把 **现有 amd64 `sysemble-engine:0.1.0` 镜像**预装进 VM 盘。
 - 用 Rosetta for Linux（VZ `VZLinuxRosettaDirectoryShare`，macOS 13+）翻译 x86_64 进程；guest 内 `podman run --platform linux/amd64` 跑同一套 builder，**不改 `builders/**`**。
 - 优点：复用 P1-e2 已验证的完整 x86_64 管线与镜像清单；宿主零 Docker；boot-check 可在 guest 内用 arm64 的 qemu-system-x86（TCG）跑。
-- 风险：Rosetta for Linux 对 Debian guest 的支持需先做 spike；无 Rosetta 时 qemu-user 慢 5–10 倍；VM 盘 + 镜像使包体增加约 300–500 MiB（压缩后）。
+- 风险：Rosetta 是宿主组件（不可随 app 分发），需在 notInstalled/MDM 时降级；VM 盘 + 镜像使包体增加约 300–500 MiB（压缩后）。
 - 包体修正：L2 app ~600–700 MiB；安装后 VM 盘 ~8–9 GiB；构建临时 2–3 GiB。
+
+**Spike 结果（2026-11-26，macOS 26.6.2 arm64）**：
+- 宿主 `VZLinuxRosettaDirectoryShare.availability = installed`；guest 挂载 tag `rosetta` 后 `update-binfmts` 注册成功，`/proc/sys/fs/binfmt_misc/rosetta` 为 enabled。
+- 静态 amd64 busybox 在 guest 内执行 `uname -m` → `x86_64`；同一 busybox 的 arm64/amd64 实现对照开销 **1.44×**（184 ms vs 265 ms），远低于 10×。
+- 与 arm64 coreutils 的“跨实现”对照为 10.63×，差异主要来自 coreutils 的 ARMv8 SHA 指令，不代表 Rosetta 开销。
+- 结论：**走方案 A**；E6b 需验证动态 amd64、podman 容器内 binfmt（F flag）、真实 x86_64 构建与 ISA 差异。
 
 ### 方案 B：guest 内交叉构建 x86_64
 - 在 arm64 guest 内装 `qemu-user-static`/binfmt + 解包 `grub-efi-amd64-bin` 模块 + 给 builder 加 `--arch amd64`；mmdebstrap 用 `--arch=amd64`。
@@ -144,7 +150,7 @@ Sysemble.app/
 ### 方案 C：继续依赖宿主机 Docker（现状）
 - 不是“一体化”，只作为 L1 的 x86_64 兜底；不满足用户目标。
 
-**建议**：L1 先交付（arm64，零外部依赖）；并行做 Rosetta for Linux on Debian arm64 的 spike（1–2 天）。验证通过走 A；否则退 B，并把 L1 的 x86_64 明确标注为“需 Docker”。
+**决策**：L1 先交付（arm64，零外部依赖）；Rosetta spike 已通过，L2 走方案 A（engine-in-VM）。E6b 验证 podman + 预装 amd64 引擎镜像 + 真实 x86_64 构建；若动态链接/系统调用不兼容，再退方案 B 或 qemu-user 兜底。
 
 ## 9. 实施切片（后续）
 
@@ -154,13 +160,13 @@ Sysemble.app/
 | E5b | Tauri 打包脚本：helper 复制/签名、app 重签、ad-hoc 开发模式；打包后 `codesign --verify` |
 | E5c | 首次启动 UI：进度、错误、磁盘预检；`engine_info` 识别已安装镜像 |
 | E5d | 干净 Mac 验收（无 Docker、无仓库）：安装 → 构建 → 产物 sha256 |
-| E6a | Rosetta for Linux spike（Debian arm64 guest + amd64 二进制） |
-| E6b | engine-in-VM：podman + 预装 amd64 镜像 + binfmt；桌面 Build 走该路径 |
-| E6c | 签名/公证流水线（需 Developer ID）与发布清单 |
+| E6a | Rosetta for Linux spike（Debian arm64 guest + amd64 二进制） | **已完成**：guest 内 x86_64 可执行，同实现开销 1.44×（`docs/plan/P1-e6a-workplan.md`） |
+| E6b | engine-in-VM：podman + 预装 amd64 镜像 + binfmt；桌面 Build 走该路径 | 下一步 |
+| E6c | 签名/公证流水线（需 Developer ID）与发布清单 | 待 |
 
 ## 10. 未决问题
 
-1. Rosetta for Linux 在 Debian trixie arm64 guest 的可用性/许可（需 spike；Apple 官方主要支持 Ubuntu）。
+1. ~~Rosetta for Linux 在 Debian trixie arm64 guest 的可用性~~：已通过 spike；剩余问题是**动态 amd64 二进制、podman 容器内 binfmt（F flag）、clone3/seccomp/AVX 等**在真实引擎中的兼容性（E6b）。
 2. Tauri 打包后签名顺序与 `Contents/Helpers` 的脚本化（需在本机用 `cargo tauri build` 验证）。
 3. 首启解压 6 GiB 稀疏盘的时间（预计 10–30 s）与中断恢复。
 4. L2 包体（600–700 MiB）与 notarization 上传时间是否可接受。

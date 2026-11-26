@@ -20,7 +20,7 @@
 
 ## P1 · 可视化（6–8 周）
 
-> **P1-a / P1-b / P1-c / P1-e1 / P1-e2 / P1-e3 / P1-e4 已完成（2026-11-23/26）**：Tauri 2 壳（`read_spec` / `validate` / `plan` / `inspect`；构建控制 `start_build` / `get_build` / `get_build_log` / `cancel_build`）、六层视图与 declared→resolved diff、引擎探测与显式门控；P1-e2 增加版本化 Debian 引擎镜像（`engine/image`）与 docker/podman 容器后端，CI `engine-check` 在容器内完成 build + boot-check；P1-e3 增加 Apple Silicon 的 Virtualization.framework VM（`engine/vm`：arm64 Debian guest + virtiofs + guest 内最小构建）；P1-e4 把 VM 接进桌面：`engine_info` 返回 `kind=vm`，execute 通过已签名 helper 运行 VM，dry-run/local/container 保留兜底。封装设计见 [ADR 0002](design/0002-vm-packaging.md)：单 `.app` 内置 helper + 压缩镜像，首启安装器与 x86_64 in-VM 路径（Rosetta/podman）是下一阶段；WSL2 待后续。
+> **P1-a / P1-b / P1-c / P1-e1 / P1-e2 / P1-e3 / P1-e4 已完成（2026-11-23/26）**：Tauri 2 壳（`read_spec` / `validate` / `plan` / `inspect`；构建控制 `start_build` / `get_build` / `get_build_log` / `cancel_build`）、六层视图与 declared→resolved diff、引擎探测与显式门控；P1-e2 增加版本化 Debian 引擎镜像（`engine/image`）与 docker/podman 容器后端，CI `engine-check` 在容器内完成 build + boot-check；P1-e3 增加 Apple Silicon 的 Virtualization.framework VM（`engine/vm`：arm64 Debian guest + virtiofs + guest 内最小构建）；P1-e4 把 VM 接进桌面：`engine_info` 返回 `kind=vm`，execute 通过已签名 helper 运行 VM，dry-run/local/container 保留兜底。封装设计见 [ADR 0002](design/0002-vm-packaging.md)：单 `.app` 内置 helper + 压缩镜像，首启安装器与 x86_64 in-VM 路径（Rosetta/podman）是下一阶段；P1-e6a Rosetta for Linux spike 通过（guest 内运行 x86_64，同实现开销 1.44×），L2 定为 VM 内 podman + 预装 amd64 引擎镜像；WSL2 待后续。
 
 
 - Tauri 2 壳 + React 画布
