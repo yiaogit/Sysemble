@@ -168,3 +168,13 @@ suite; E6b should measure the real engine workload.
   still need their libraries, and qemu-user is typically slower than Rosetta.
   This spike only records that plan; it does not measure qemu unless Rosetta
   is unavailable.
+
+## E6b: engine-in-VM (x86_64 build under Rosetta)
+
+[`e6b-engine.sh`](e6b-engine.sh) is the follow-up spike: inside the arm64 guest
+it installs podman, registers the Rosetta binfmt, loads the existing amd64
+`sysemble-engine:0.1.0` OCI archive and runs
+`engine/runtime/container-entry.sh` against a minimal x86_64 plan. It produced a
+real `disk.qcow2` whose sha256 matches `artifact.json` (rc=0). See
+[`e6b-engine.md`](e6b-engine.md) for timings, disk usage and the L2 conclusions
+(12 GiB disk, `--network host`, preload the engine image in the VM image).

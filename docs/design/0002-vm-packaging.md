@@ -142,6 +142,13 @@ Sysemble.app/
 - 与 arm64 coreutils 的“跨实现”对照为 10.63×，差异主要来自 coreutils 的 ARMv8 SHA 指令，不代表 Rosetta 开销。
 - 结论：**走方案 A**；E6b 需验证动态 amd64、podman 容器内 binfmt（F flag）、真实 x86_64 构建与 ISA 差异。
 
+**E6b 结果（2026-11-26，同机）**：
+- guest 内 **podman 5.4.2 + overlay** 可用；`docker save` 的 **114 MiB OCI archive** 直接 `podman load`（2.5 s）。
+- 用现有 amd64 引擎镜像执行 `container-entry.sh`，真实构建 minimal **x86_64**：**rc=0**；宿主 wall **435 s**（guest active 167 s，后台调度/swap 拉长了 wall），guest 内 mmdebstrap 151 s。
+- `artifact.json`：`arch=x86_64`、`boot.mode=uefi`、14 packages；`disk.qcow2` 420,937,728 B，**sha256 与 artifact 一致**；`disk.img` 4 GiB GPT。
+- 6 GiB 盘峰值 2.80 GiB（余量薄）→ **L2 镜像用 12 GiB**；`--network host` 必需（默认 bridge 缺 `nft`）；未做 boot-check。
+- 结论：**engine-in-VM 可行**。L2 持久化：VM 镜像 v2（podman + binfmt + Rosetta 挂载 + 预装镜像 + 12 GiB），桌面 VM 构建改走 engine-in-VM。
+
 ### 方案 B：guest 内交叉构建 x86_64
 - 在 arm64 guest 内装 `qemu-user-static`/binfmt + 解包 `grub-efi-amd64-bin` 模块 + 给 builder 加 `--arch amd64`；mmdebstrap 用 `--arch=amd64`。
 - 优点：不引入 podman/镜像；包体小。
@@ -150,7 +157,7 @@ Sysemble.app/
 ### 方案 C：继续依赖宿主机 Docker（现状）
 - 不是“一体化”，只作为 L1 的 x86_64 兜底；不满足用户目标。
 
-**决策**：L1 先交付（arm64，零外部依赖）；Rosetta spike 已通过，L2 走方案 A（engine-in-VM）。E6b 验证 podman + 预装 amd64 引擎镜像 + 真实 x86_64 构建；若动态链接/系统调用不兼容，再退方案 B 或 qemu-user 兜底。
+**决策**：L2 走方案 A（engine-in-VM），E6a/E6b 均已实测通过；下一步把 podman/镜像/Rosetta 持久化进 VM 镜像 v2，并接入打包（E5）。
 
 ## 9. 实施切片（后续）
 
@@ -161,12 +168,12 @@ Sysemble.app/
 | E5c | 首次启动 UI：进度、错误、磁盘预检；`engine_info` 识别已安装镜像 |
 | E5d | 干净 Mac 验收（无 Docker、无仓库）：安装 → 构建 → 产物 sha256 |
 | E6a | Rosetta for Linux spike（Debian arm64 guest + amd64 二进制） | **已完成**：guest 内 x86_64 可执行，同实现开销 1.44×（`docs/plan/P1-e6a-workplan.md`） |
-| E6b | engine-in-VM：podman + 预装 amd64 镜像 + binfmt；桌面 Build 走该路径 | 下一步 |
+| E6b | engine-in-VM：podman + 预装 amd64 镜像 + binfmt；桌面 Build 走该路径 | **spike 已完成**（rc=0，x86_64 qcow2 sha 一致）；持久化+桌面集成=下一步 |
 | E6c | 签名/公证流水线（需 Developer ID）与发布清单 | 待 |
 
 ## 10. 未决问题
 
-1. ~~Rosetta for Linux 在 Debian trixie arm64 guest 的可用性~~：已通过 spike；剩余问题是**动态 amd64 二进制、podman 容器内 binfmt（F flag）、clone3/seccomp/AVX 等**在真实引擎中的兼容性（E6b）。
+1. ~~Rosetta/Debian 兼容、动态 amd64、podman binfmt~~：E6b 真实构建已通过（rc=0，x86_64 qcow2）。剩余：**boot-check** 尚未在 L2 路径跑；后台 wall 时间受调度/swap 影响（435 s），需用 power assertion 或前台运行复核；12 GiB 镜像的压缩后体积待实测。
 2. Tauri 打包后签名顺序与 `Contents/Helpers` 的脚本化（需在本机用 `cargo tauri build` 验证）。
 3. 首启解压 6 GiB 稀疏盘的时间（预计 10–30 s）与中断恢复。
 4. L2 包体（600–700 MiB）与 notarization 上传时间是否可接受。
